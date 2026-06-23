@@ -1,0 +1,1 @@
+"""MyRetail API package."""

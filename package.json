@@ -1,0 +1,28 @@
+{
+  "name": "myretail",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "npm@11.6.2",
+  "workspaces": [
+    "apps/web"
+  ],
+  "scripts": {
+    "dev:web": "npm run dev --workspace @myretail/web",
+    "build": "npm run build --workspace @myretail/web",
+    "lint": "npm run lint --workspace @myretail/web",
+    "typecheck": "npm run typecheck --workspace @myretail/web",
+    "test:api": "python -m pytest services/api/tests",
+    "check": "npm run lint && npm run typecheck && npm run test:api"
+  },
+  "engines": {
+    "node": ">=20.9.0"
+  },
+  "devDependencies": {
+    "postcss": "8.5.15"
+  },
+  "overrides": {
+    "next": {
+      "postcss": "$postcss"
+    }
+  }
+}
