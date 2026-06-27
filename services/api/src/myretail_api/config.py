@@ -11,6 +11,9 @@ API_ROOT = Path(__file__).resolve().parents[2]
 class Settings(BaseSettings):
     environment: Literal["development", "test", "production"] = "development"
     log_level: str = "INFO"
+    tenant_slug: str = "myretail"
+    auth_secret: SecretStr | None = None
+    auth_token_ttl_seconds: int = 3600
     erpnext_base_url: str = "http://myretail.localhost:8080"
     erpnext_api_key: SecretStr | None = None
     erpnext_api_secret: SecretStr | None = None
