@@ -17,22 +17,36 @@ def anyio_backend() -> str:
 async def test_list_products_normalizes_erpnext_items() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers["Authorization"] == "token test-key:test-secret"
-        assert json.loads(request.url.params["filters"]) == [["Item", "disabled", "=", 0]]
-        return httpx.Response(
-            200,
-            json={
-                "data": [
-                    {
+        if request.url.path == "/api/resource/Item":
+            assert json.loads(request.url.params["filters"]) == [["Item", "disabled", "=", 0]]
+            return httpx.Response(
+                200,
+                json={"data": [{"name": "SKU-001", "item_name": "Milk", "disabled": 0}]},
+            )
+        if request.url.path == "/api/resource/Item/SKU-001":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
                         "name": "SKU-001",
+                        "item_code": "SKU-001",
                         "item_name": "Milk",
+                        "barcodes": [{"barcode": "4870001234567"}],
+                        "item_group": "Products",
+                        "brand": "FoodMaster",
                         "description": "One litre",
                         "stock_uom": "Nos",
                         "disabled": 0,
                         "image": "/files/milk.png",
                     }
-                ]
-            },
-        )
+                },
+            )
+        if request.url.path in {"/api/resource/Item%20Price", "/api/resource/Item Price"}:
+            filters = json.loads(request.url.params["filters"])
+            price_list = filters[1][3]
+            price = "650" if price_list == "Standard Selling" else "510"
+            return httpx.Response(200, json={"data": [{"price_list_rate": price}]})
+        return httpx.Response(404)
 
     settings = Settings(
         erpnext_base_url="http://erpnext.test",
@@ -43,13 +57,27 @@ async def test_list_products_normalizes_erpnext_items() -> None:
 
     products = await client.list_products()
 
-    assert len(products) == 1
-    assert products[0].model_dump() == {
-        "id": "SKU-001",
-        "name": "Milk",
-        "description": "One litre",
-        "unit": "Nos",
-        "image_url": "/files/milk.png",
+    assert products.model_dump() == {
+        "items": [
+            {
+                "id": "SKU-001",
+                "sku": "SKU-001",
+                "name": "Milk",
+                "barcode": "4870001234567",
+                "category": "Products",
+                "brand": "FoodMaster",
+                "unit": "Nos",
+                "sale_price": "650.00",
+                "purchase_price": "510.00",
+                "currency": "KZT",
+                "description": "One litre",
+                "image_url": "/files/milk.png",
+                "is_active": True,
+            }
+        ],
+        "count": 1,
+        "limit": 50,
+        "offset": 0,
     }
 
 

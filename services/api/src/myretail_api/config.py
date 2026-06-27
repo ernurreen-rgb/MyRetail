@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     erpnext_api_key: SecretStr | None = None
     erpnext_api_secret: SecretStr | None = None
     erpnext_timeout_seconds: float = 10.0
+    erpnext_selling_price_list: str = "Standard Selling"
+    erpnext_buying_price_list: str = "Standard Buying"
+    default_currency: str = "KZT"
 
     model_config = SettingsConfigDict(
         env_file=API_ROOT / ".env",

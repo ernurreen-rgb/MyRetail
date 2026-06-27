@@ -1,13 +1,21 @@
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any
 from urllib.parse import quote
 
 import httpx
 
 from myretail_api.config import Settings
-from myretail_api.models.products import Product
+from myretail_api.models.products import (
+    Product,
+    ProductCreate,
+    ProductList,
+    ProductOption,
+    ProductOptions,
+    ProductUpdate,
+)
 
 
 class ERPNextConfigurationError(RuntimeError):
@@ -24,6 +32,29 @@ class ERPNextUnavailableError(RuntimeError):
 
 class ERPNextUserLoginError(RuntimeError):
     """Raised when ERPNext rejects user credentials."""
+
+
+class ERPNextProductNotFoundError(RuntimeError):
+    """Raised when an ERPNext Item cannot be found."""
+
+
+class ERPNextConflictError(RuntimeError):
+    """Raised when ERPNext would violate a MyRetail uniqueness rule."""
+
+    def __init__(self, code: str, message: str, fields: dict[str, str] | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.fields = fields or {}
+
+
+class ERPNextValidationError(RuntimeError):
+    """Raised when ERPNext rejects a product payload."""
+
+    def __init__(self, message: str, fields: dict[str, str] | None = None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.fields = fields or {}
 
 
 @dataclass(frozen=True)
@@ -52,6 +83,9 @@ class ERPNextClient:
         }
         self._timeout = settings.erpnext_timeout_seconds
         self._transport = transport
+        self._selling_price_list = settings.erpnext_selling_price_list
+        self._buying_price_list = settings.erpnext_buying_price_list
+        self._currency = settings.default_currency
 
     async def authenticate_user(self, *, email: str, password: str) -> ERPNextUser:
         try:
@@ -101,22 +135,336 @@ class ERPNextClient:
             roles=self._extract_roles(data.get("roles")),
         )
 
-    async def list_products(self, *, limit: int = 100) -> list[Product]:
+    async def list_products(
+        self,
+        *,
+        q: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+        include_archived: bool = False,
+    ) -> ProductList:
+        item_codes = await self._list_product_codes(q=q, include_archived=include_archived)
+        products: list[Product] = []
+        for item_code in item_codes[offset : offset + limit]:
+            try:
+                products.append(await self.get_product(item_code))
+            except ERPNextProductNotFoundError:
+                continue
+
+        return ProductList(
+            items=products,
+            count=len(item_codes),
+            limit=limit,
+            offset=offset,
+        )
+
+    async def get_product(self, item_code: str) -> Product:
+        item = await self._get_item(item_code)
+        sale_price = await self._get_item_price(item_code, self._selling_price_list)
+        purchase_price = await self._get_item_price(item_code, self._buying_price_list)
+        return self._to_product(item, sale_price=sale_price, purchase_price=purchase_price)
+
+    async def list_product_options(self) -> ProductOptions:
+        categories = await self._list_options("Item Group")
+        brands = await self._list_options("Brand")
+        units = await self._list_options("UOM")
+        return ProductOptions(categories=categories, brands=brands, units=units)
+
+    async def create_product(self, product: ProductCreate) -> Product:
+        await self._assert_sku_available(product.sku)
+        await self._assert_barcode_available(product.barcode)
+
+        payload: dict[str, Any] = {
+            "doctype": "Item",
+            "item_code": product.sku,
+            "item_name": product.name,
+            "item_group": product.category,
+            "stock_uom": product.unit,
+            "disabled": 0,
+            "description": product.description,
+        }
+        if product.brand is not None:
+            payload["brand"] = product.brand
+        if product.barcode is not None:
+            payload["barcodes"] = [{"barcode": product.barcode}]
+
+        try:
+            await self._request_json("POST", "/api/resource/Item", json_payload=payload)
+            await self._upsert_item_price(
+                item_code=product.sku,
+                price_list=self._selling_price_list,
+                price=product.sale_price,
+                buying=False,
+            )
+            if product.purchase_price is not None:
+                await self._upsert_item_price(
+                    item_code=product.sku,
+                    price_list=self._buying_price_list,
+                    price=product.purchase_price,
+                    buying=True,
+                )
+        except (ERPNextUnavailableError, ERPNextValidationError):
+            await self._archive_partial_item(product.sku)
+            raise
+
+        return await self.get_product(product.sku)
+
+    async def update_product(self, item_code: str, product: ProductUpdate) -> Product:
+        await self._get_item(item_code)
+        if product.barcode is not None:
+            await self._assert_barcode_available(product.barcode, current_item_code=item_code)
+
+        update_fields = product.model_dump(exclude_unset=True)
+        item_payload: dict[str, Any] = {}
+
+        if "name" in update_fields:
+            item_payload["item_name"] = product.name
+        if "category" in update_fields:
+            item_payload["item_group"] = product.category
+        if "unit" in update_fields:
+            item_payload["stock_uom"] = product.unit
+        if "brand" in update_fields:
+            item_payload["brand"] = product.brand
+        if "description" in update_fields:
+            item_payload["description"] = product.description
+        if "barcode" in update_fields:
+            item_payload["barcodes"] = (
+                [{"barcode": product.barcode}] if product.barcode is not None else []
+            )
+
+        if item_payload:
+            await self._request_json(
+                "PUT",
+                f"/api/resource/Item/{quote(item_code, safe='')}",
+                json_payload=item_payload,
+            )
+
+        if "sale_price" in update_fields and product.sale_price is not None:
+            await self._upsert_item_price(
+                item_code=item_code,
+                price_list=self._selling_price_list,
+                price=product.sale_price,
+                buying=False,
+            )
+        if "purchase_price" in update_fields and product.purchase_price is not None:
+            await self._upsert_item_price(
+                item_code=item_code,
+                price_list=self._buying_price_list,
+                price=product.purchase_price,
+                buying=True,
+            )
+
+        return await self.get_product(item_code)
+
+    async def archive_product(self, item_code: str) -> None:
+        item = await self._get_item(item_code)
+        if self._is_disabled(item):
+            return
+        await self._request_json(
+            "PUT",
+            f"/api/resource/Item/{quote(item_code, safe='')}",
+            json_payload={"disabled": 1},
+        )
+
+    async def _list_product_codes(
+        self,
+        *,
+        q: str | None,
+        include_archived: bool,
+    ) -> list[str]:
         fields = [
             "name",
             "item_name",
-            "description",
-            "stock_uom",
             "disabled",
-            "image",
         ]
         params = {
             "fields": json.dumps(fields),
-            "filters": json.dumps([["Item", "disabled", "=", 0]]),
             "order_by": "item_name asc",
+            "limit_page_length": "1000",
+        }
+        if not include_archived:
+            params["filters"] = json.dumps([["Item", "disabled", "=", 0]])
+
+        payload = await self._request_json("GET", "/api/resource/Item", params=params)
+        rows = payload.get("data")
+        if not isinstance(rows, list):
+            raise ERPNextUnavailableError("ERPNext response does not contain a data list")
+
+        query = (q or "").strip().lower()
+        item_codes: list[str] = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            item_code = str(row.get("name") or "")
+            item_name = str(row.get("item_name") or item_code)
+            if not item_code:
+                continue
+            if query and query not in item_code.lower() and query not in item_name.lower():
+                try:
+                    product = await self.get_product(item_code)
+                except ERPNextProductNotFoundError:
+                    continue
+                barcode = product.barcode or ""
+                if query not in barcode.lower():
+                    continue
+            item_codes.append(item_code)
+        return item_codes
+
+    async def _get_item(self, item_code: str) -> Mapping[str, Any]:
+        payload = await self._request_json(
+            "GET",
+            f"/api/resource/Item/{quote(item_code, safe='')}",
+        )
+        data = payload.get("data")
+        if not isinstance(data, Mapping):
+            raise ERPNextUnavailableError("ERPNext Item response does not contain data")
+        return data
+
+    async def _get_item_price(self, item_code: str, price_list: str) -> str | None:
+        rows = await self._query_resource(
+            "Item Price",
+            fields=["name", "price_list_rate", "currency"],
+            filters=[
+                ["Item Price", "item_code", "=", item_code],
+                ["Item Price", "price_list", "=", price_list],
+            ],
+            limit=1,
+        )
+        if not rows:
+            return None
+        price = rows[0].get("price_list_rate")
+        return self._format_money(price) if price is not None else None
+
+    async def _upsert_item_price(
+        self,
+        *,
+        item_code: str,
+        price_list: str,
+        price: str,
+        buying: bool,
+    ) -> None:
+        existing = await self._query_resource(
+            "Item Price",
+            fields=["name"],
+            filters=[
+                ["Item Price", "item_code", "=", item_code],
+                ["Item Price", "price_list", "=", price_list],
+            ],
+            limit=1,
+        )
+        payload: dict[str, Any] = {
+            "item_code": item_code,
+            "price_list": price_list,
+            "price_list_rate": price,
+            "currency": self._currency,
+        }
+        if buying:
+            payload["buying"] = 1
+        else:
+            payload["selling"] = 1
+
+        if existing:
+            price_name = str(existing[0]["name"])
+            await self._request_json(
+                "PUT",
+                f"/api/resource/Item Price/{quote(price_name, safe='')}",
+                json_payload=payload,
+            )
+            return
+
+        payload["doctype"] = "Item Price"
+        await self._request_json("POST", "/api/resource/Item Price", json_payload=payload)
+
+    async def _query_resource(
+        self,
+        doctype: str,
+        *,
+        fields: list[str],
+        filters: list[list[Any]] | None = None,
+        limit: int = 1000,
+    ) -> list[Mapping[str, Any]]:
+        params = {
+            "fields": json.dumps(fields),
             "limit_page_length": str(limit),
         }
+        if filters is not None:
+            params["filters"] = json.dumps(filters)
 
+        payload = await self._request_json(
+            "GET",
+            f"/api/resource/{quote(doctype, safe='')}",
+            params=params,
+        )
+        rows = payload.get("data")
+        if not isinstance(rows, list):
+            raise ERPNextUnavailableError(f"ERPNext {doctype} response does not contain data")
+        return [row for row in rows if isinstance(row, Mapping)]
+
+    async def _list_options(self, doctype: str) -> list[ProductOption]:
+        rows = await self._query_resource(doctype, fields=["name"], limit=1000)
+        return [
+            ProductOption(id=str(row["name"]), name=str(row["name"]))
+            for row in rows
+            if row.get("name")
+        ]
+
+    async def _assert_sku_available(self, sku: str) -> None:
+        try:
+            await self._get_item(sku)
+        except ERPNextProductNotFoundError:
+            return
+        raise ERPNextConflictError(
+            "DUPLICATE_SKU",
+            "Товар с таким артикулом уже существует",
+            {"sku": "Артикул должен быть уникальным"},
+        )
+
+    async def _assert_barcode_available(
+        self,
+        barcode: str | None,
+        *,
+        current_item_code: str | None = None,
+    ) -> None:
+        if barcode is None:
+            return
+        rows = await self._query_resource(
+            "Item Barcode",
+            fields=["parent", "barcode"],
+            filters=[["Item Barcode", "barcode", "=", barcode]],
+            limit=2,
+        )
+        for row in rows:
+            parent = str(row.get("parent") or "")
+            if parent and parent != current_item_code:
+                raise ERPNextConflictError(
+                    "DUPLICATE_BARCODE",
+                    "Товар с таким штрихкодом уже существует",
+                    {"barcode": "Штрихкод должен быть уникальным"},
+                )
+
+    async def _archive_partial_item(self, item_code: str) -> None:
+        try:
+            await self._request_json(
+                "PUT",
+                f"/api/resource/Item/{quote(item_code, safe='')}",
+                json_payload={"disabled": 1},
+            )
+        except (
+            ERPNextAuthenticationError,
+            ERPNextProductNotFoundError,
+            ERPNextUnavailableError,
+            ERPNextValidationError,
+        ):
+            return
+
+    async def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, str] | None = None,
+        json_payload: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
         try:
             async with httpx.AsyncClient(
                 base_url=self._base_url,
@@ -124,35 +472,92 @@ class ERPNextClient:
                 timeout=self._timeout,
                 transport=self._transport,
             ) as client:
-                response = await client.get("/api/resource/Item", params=params)
+                response = await client.request(
+                    method,
+                    path,
+                    params=params,
+                    json=json_payload,
+                )
         except httpx.RequestError as exc:
             raise ERPNextUnavailableError("ERPNext request failed") from exc
 
         if response.status_code in {401, 403}:
             raise ERPNextAuthenticationError("ERPNext rejected the API credentials")
+        if response.status_code == 404:
+            raise ERPNextProductNotFoundError("ERPNext Item was not found")
+        if response.status_code >= 500:
+            raise ERPNextUnavailableError("ERPNext returned a server error")
 
         try:
             response.raise_for_status()
             payload = response.json()
-        except (httpx.HTTPStatusError, ValueError) as exc:
+        except httpx.HTTPStatusError as exc:
+            message = self._extract_error_message(response)
+            raise ERPNextValidationError(message) from exc
+        except ValueError as exc:
             raise ERPNextUnavailableError("ERPNext returned an invalid response") from exc
 
-        rows = payload.get("data")
-        if not isinstance(rows, list):
-            raise ERPNextUnavailableError("ERPNext response does not contain a data list")
+        if not isinstance(payload, Mapping):
+            raise ERPNextUnavailableError("ERPNext response is not a JSON object")
+        return payload
 
-        return [self._to_product(row) for row in rows if isinstance(row, Mapping)]
-
-    @staticmethod
-    def _to_product(row: Mapping[str, Any]) -> Product:
-        item_code = str(row.get("name") or "")
+    def _to_product(
+        self,
+        row: Mapping[str, Any],
+        *,
+        sale_price: str | None,
+        purchase_price: str | None,
+    ) -> Product:
+        item_code = str(row.get("item_code") or row.get("name") or "")
         return Product(
             id=item_code,
+            sku=item_code,
             name=str(row.get("item_name") or item_code),
-            description=row.get("description") or None,
+            barcode=self._first_barcode(row.get("barcodes")),
+            category=str(row.get("item_group") or ""),
+            brand=row.get("brand") or None,
             unit=str(row.get("stock_uom") or ""),
+            sale_price=sale_price or "0.00",
+            purchase_price=purchase_price,
+            currency=self._currency,
+            description=row.get("description") or None,
             image_url=row.get("image") or None,
+            is_active=not self._is_disabled(row),
         )
+
+    @staticmethod
+    def _first_barcode(raw_barcodes: Any) -> str | None:
+        if not isinstance(raw_barcodes, list):
+            return None
+        for row in raw_barcodes:
+            if isinstance(row, Mapping) and row.get("barcode"):
+                return str(row["barcode"])
+        return None
+
+    @staticmethod
+    def _is_disabled(row: Mapping[str, Any]) -> bool:
+        return bool(row.get("disabled"))
+
+    @staticmethod
+    def _format_money(raw_value: Any) -> str:
+        try:
+            amount = Decimal(str(raw_value))
+        except (InvalidOperation, ValueError) as exc:
+            raise ERPNextUnavailableError("ERPNext returned an invalid price") from exc
+        return f"{amount.quantize(Decimal('0.01')):.2f}"
+
+    @staticmethod
+    def _extract_error_message(response: httpx.Response) -> str:
+        try:
+            payload = response.json()
+        except ValueError:
+            return "ERPNext отклонил данные товара"
+
+        if isinstance(payload, Mapping):
+            message = payload.get("message") or payload.get("exception")
+            if isinstance(message, str) and message:
+                return message
+        return "ERPNext отклонил данные товара"
 
     @staticmethod
     def _extract_roles(raw_roles: Any) -> list[str]:
