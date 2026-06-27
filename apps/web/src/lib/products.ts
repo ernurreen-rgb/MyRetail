@@ -1,3 +1,4 @@
+import type { AuthSession } from "@/lib/auth";
 import { getApiBaseUrl } from "@/lib/config";
 
 export type Product = {
@@ -65,18 +66,30 @@ function toErrorMessage(error: unknown) {
   return "неизвестная ошибка";
 }
 
-export async function getProducts(): Promise<ProductsState> {
+function toProductsErrorMessage(status: number) {
+  if (status === 401 || status === 403) {
+    return "Сессия истекла или у пользователя нет доступа к товарам. Выйдите и войдите снова.";
+  }
+
+  return `API вернул HTTP ${status}`;
+}
+
+export async function getProducts(session: AuthSession): Promise<ProductsState> {
   const apiBaseUrl = getApiBaseUrl().replace(/\/+$/, "");
 
   try {
     const response = await fetch(`${apiBaseUrl}/products`, {
       cache: "no-store",
+      headers: {
+        Authorization: `Bearer ${session.accessToken}`,
+        "X-MyRetail-Tenant": session.tenant,
+      },
     });
 
     if (!response.ok) {
       return {
         status: "error",
-        message: `API вернул HTTP ${response.status}`,
+        message: toProductsErrorMessage(response.status),
       };
     }
 
