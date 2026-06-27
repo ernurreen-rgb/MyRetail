@@ -1,4 +1,7 @@
+import { redirect } from "next/navigation";
+
 import { getProducts } from "@/lib/products";
+import { getAuthSession } from "@/lib/session";
 
 export const dynamic = "force-dynamic";
 
@@ -29,8 +32,15 @@ function statusToneClass(tone: "ready" | "waiting" | "neutral" | "error") {
 }
 
 export default async function Home() {
-  const products = await getProducts();
+  const session = await getAuthSession();
+
+  if (!session) {
+    redirect("/login");
+  }
+
+  const products = await getProducts(session);
   const productsReady = products.status === "ready";
+  const productsCount = productsReady ? products.data.count : 0;
 
   const services = [
     {
@@ -42,31 +52,31 @@ export default async function Home() {
     {
       name: "MyRetail API",
       detail: productsReady
-        ? "FastAPI-шлюз читает товары из ERPNext"
-        : "FastAPI-шлюз настроен, но сейчас не вернул товары",
+        ? "FastAPI-шлюз принял авторизованный запрос и вернул товары"
+        : "FastAPI-шлюз должен принять Authorization и X-MyRetail-Tenant",
       status: productsReady ? "Готово" : "Проверить",
       tone: productsReady ? "ready" : "error",
     },
     {
-      name: "ERPNext",
-      detail: productsReady
-        ? `Локальная база доступна, товаров: ${products.data.count}`
-        : "Локальная база поднята, требуется проверка API",
-      status: productsReady ? "Готово" : "Проверить",
+      name: "Tenant context",
+      detail: `Активный tenant: ${session.tenant}`,
+      status: "Проверяется API",
       tone: productsReady ? "ready" : "waiting",
     },
     {
-      name: "Кассовое приложение",
-      detail: "Tauri после стабилизации API и web-компонентов",
-      status: "Запланировано",
-      tone: "neutral",
+      name: "ERPNext",
+      detail: productsReady
+        ? `Локальная база доступна, товаров: ${productsCount}`
+        : "Доступ к данным идёт только через MyRetail API",
+      status: productsReady ? "Готово" : "Проверить",
+      tone: productsReady ? "ready" : "waiting",
     },
   ] as const;
 
   return (
     <main className="flex-1 px-5 py-6 sm:px-8 lg:px-12 lg:py-10">
       <div className="mx-auto flex w-full max-w-6xl flex-col gap-8">
-        <header className="flex items-center justify-between border-b border-[var(--border)] pb-5">
+        <header className="flex flex-col gap-4 border-b border-[var(--border)] pb-5 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex items-center gap-3">
             <div
               aria-hidden="true"
@@ -76,27 +86,36 @@ export default async function Home() {
             </div>
             <div>
               <p className="text-lg font-semibold tracking-tight">MyRetail</p>
-              <p className="text-sm text-[var(--muted)]">Основа проекта</p>
+              <p className="text-sm text-[var(--muted)]">Защищённая рабочая область</p>
             </div>
           </div>
-          <span className="rounded-full bg-[var(--accent-soft)] px-3 py-1.5 text-xs font-semibold text-[var(--accent)]">
-            Sprint 1
-          </span>
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="rounded-full bg-[var(--accent-soft)] px-3 py-1.5 text-xs font-semibold text-[var(--accent)]">
+              Sprint 1
+            </span>
+            <form action="/api/auth/logout" method="post">
+              <button
+                type="submit"
+                className="rounded-full border border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-sm font-semibold transition hover:border-[var(--accent)] hover:text-[var(--accent)]"
+              >
+                Выйти
+              </button>
+            </form>
+          </div>
         </header>
 
         <section className="grid gap-6 lg:grid-cols-[1.25fr_0.75fr] lg:items-end">
           <div>
             <p className="mb-3 font-mono text-xs font-semibold uppercase tracking-[0.18em] text-[var(--accent)]">
-              Розничные операции без лишней сложности
+              Розничные операции под защитой MyRetail API
             </p>
             <h1 className="max-w-3xl text-4xl font-semibold tracking-[-0.04em] sm:text-5xl lg:text-6xl">
-              Первый рабочий контур MyRetail уже читает товары из ERPNext.
+              Рабочий контур MyRetail открывается только после входа.
             </h1>
           </div>
           <p className="max-w-xl text-base leading-7 text-[var(--muted)] lg:pb-1">
-            Веб-страница обращается только к MyRetail API. Backend получает данные из ERPNext
-            через сервисного пользователя с ограниченными правами, поэтому внутренние ключи и
-            модели ERPNext не попадают в браузер.
+            Веб-приложение не получает ключи ERPNext и не обращается к нему напрямую. Серверная
+            страница передаёт в MyRetail API только токен сессии и проверенный tenant context.
           </p>
         </section>
 
@@ -138,7 +157,7 @@ export default async function Home() {
         >
           <div className="mb-5 flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
             <div>
-              <p className="text-sm text-[var(--muted)]">Данные из ERPNext</p>
+              <p className="text-sm text-[var(--muted)]">Данные из ERPNext через MyRetail API</p>
               <h2 id="products-heading" className="text-2xl font-semibold tracking-tight">
                 Товары
               </h2>
@@ -173,8 +192,8 @@ export default async function Home() {
               </div>
             ) : (
               <div className="rounded-xl border border-dashed border-[var(--border)] bg-[var(--surface-muted)] p-5 text-sm leading-6 text-[var(--muted)]">
-                ERPNext доступен, но активных товаров пока нет. Следующий шаг — наполнить
-                каталог тестовыми позициями для сценариев продаж и склада.
+                ERPNext доступен, но активных товаров пока нет. Следующий шаг — наполнить каталог
+                тестовыми позициями для сценариев продаж и склада.
               </div>
             )
           ) : (
