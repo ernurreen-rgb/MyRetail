@@ -5,29 +5,21 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from myretail_api.clients.erpnext import (
     ERPNextAuthenticationError,
     ERPNextClient,
-    ERPNextConfigurationError,
     ERPNextUnavailableError,
 )
-from myretail_api.config import Settings, get_settings
+from myretail_api.dependencies import get_erpnext_client, require_tenant_context
+from myretail_api.models.auth import TenantContext
 from myretail_api.models.products import ProductList
 
 router = APIRouter(prefix="/products", tags=["products"])
 
 
-def get_erpnext_client(settings: Annotated[Settings, Depends(get_settings)]) -> ERPNextClient:
-    try:
-        return ERPNextClient(settings)
-    except ERPNextConfigurationError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="ERPNext integration is not configured",
-        ) from exc
-
-
 @router.get("", response_model=ProductList)
 async def list_products(
     client: Annotated[ERPNextClient, Depends(get_erpnext_client)],
+    tenant_context: Annotated[TenantContext, Depends(require_tenant_context)],
 ) -> ProductList:
+    _ = tenant_context
     try:
         products = await client.list_products()
     except ERPNextAuthenticationError as exc:
