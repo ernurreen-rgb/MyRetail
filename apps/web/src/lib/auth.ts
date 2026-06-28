@@ -25,6 +25,11 @@ export type LoginResponse = {
   user: AuthUser;
 };
 
+export type SessionResponse = {
+  tenant: string;
+  user: AuthUser;
+};
+
 export type AuthSession = {
   accessToken: string;
   tenant: string;
@@ -70,9 +75,22 @@ export function isLoginResponse(value: unknown): value is LoginResponse {
 
   return (
     typeof value.access_token === "string" &&
-    typeof value.token_type === "string" &&
+    value.access_token.length > 0 &&
+    value.token_type === "bearer" &&
     typeof value.expires_in === "number" &&
+    Number.isFinite(value.expires_in) &&
+    value.expires_in > 0 &&
     typeof value.tenant === "string" &&
+    value.tenant.length > 0 &&
+    isAuthUser(value.user)
+  );
+}
+
+export function isSessionResponse(value: unknown): value is SessionResponse {
+  return (
+    isRecord(value) &&
+    typeof value.tenant === "string" &&
+    value.tenant.length > 0 &&
     isAuthUser(value.user)
   );
 }

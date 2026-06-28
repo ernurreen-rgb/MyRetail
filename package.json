@@ -10,9 +10,10 @@
     "dev:web": "npm run dev --workspace @myretail/web",
     "build": "npm run build --workspace @myretail/web",
     "lint": "npm run lint --workspace @myretail/web",
+    "test": "npm run test --workspace @myretail/web",
     "typecheck": "npm run typecheck --workspace @myretail/web",
     "test:api": "python -m pytest services/api/tests",
-    "check": "npm run lint && npm run typecheck && npm run test:api"
+    "check": "npm run lint && npm run typecheck && npm run test && npm run test:api"
   },
   "engines": {
     "node": ">=20.9.0"
