@@ -211,14 +211,14 @@ export function productToFormValues(product: Product): ProductFormValues {
   };
 }
 
-export function emptyProductFormValues(options?: ProductOptions): ProductFormValues {
+export function emptyProductFormValues(): ProductFormValues {
   return {
     sku: "",
     name: "",
     barcode: "",
-    category: options?.categories[0]?.id ?? "",
+    category: "",
     brand: "",
-    unit: options?.units[0]?.id ?? "",
+    unit: "",
     sale_price: "",
     purchase_price: "",
     description: "",
@@ -235,13 +235,7 @@ function optionalText(value: string) {
 }
 
 function normalizeMoneyInput(value: string) {
-  const normalized = normalizeText(value).replace(",", ".");
-  if (!normalized) {
-    return normalized;
-  }
-
-  const amount = Number(normalized);
-  return Number.isFinite(amount) ? amount.toFixed(2) : normalized;
+  return normalizeText(value).replace(",", ".");
 }
 
 export function toProductCreatePayload(values: ProductFormValues): ProductCreatePayload {

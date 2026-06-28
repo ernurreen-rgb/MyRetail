@@ -4,7 +4,9 @@ import { cookies } from "next/headers";
 import {
   AUTH_COOKIE_NAMES,
   type AuthSession,
+  type AuthSessionCredentials,
   type LoginResponse,
+  type SessionResponse,
   isSessionResponse,
 } from "@/lib/auth";
 import { getApiBaseUrl } from "@/lib/config";
@@ -40,15 +42,23 @@ export async function getAuthSession(): Promise<AuthSession | null> {
     return null;
   }
 
-  const session = {
+  const credentials = {
     accessToken,
     tenant,
   };
+  const context = await fetchSessionContext(credentials);
 
-  return (await verifyAuthSession(session)) ? session : null;
+  return context
+    ? {
+        ...credentials,
+        user: context.user,
+      }
+    : null;
 }
 
-export async function verifyAuthSession(session: AuthSession) {
+async function fetchSessionContext(
+  session: AuthSessionCredentials,
+): Promise<SessionResponse | null> {
   const apiBaseUrl = getApiBaseUrl().replace(/\/+$/, "");
 
   try {
@@ -62,14 +72,18 @@ export async function verifyAuthSession(session: AuthSession) {
     });
 
     if (!response.ok) {
-      return false;
+      return null;
     }
 
     const payload: unknown = await response.json();
-    return isSessionResponse(payload) && payload.tenant === session.tenant;
+    return isSessionResponse(payload) && payload.tenant === session.tenant ? payload : null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+export async function verifyAuthSession(session: AuthSessionCredentials) {
+  return Boolean(await fetchSessionContext(session));
 }
 
 export function setAuthCookies(response: NextResponse, login: LoginResponse) {

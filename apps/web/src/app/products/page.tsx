@@ -2,6 +2,7 @@ import Link from "next/link";
 import { redirect } from "next/navigation";
 
 import { ProductManager } from "@/app/products/product-manager";
+import { canManageProducts } from "@/lib/auth";
 import { getAuthSession } from "@/lib/session";
 
 export const dynamic = "force-dynamic";
@@ -52,7 +53,7 @@ export default async function ProductsPage() {
           </div>
         </header>
 
-        <ProductManager />
+        <ProductManager canManage={canManageProducts(session.user.roles)} />
       </div>
     </main>
   );

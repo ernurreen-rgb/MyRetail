@@ -1,6 +1,6 @@
 "use client";
 
-import { type FormEvent, useEffect, useMemo, useState } from "react";
+import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   archiveProduct,
@@ -23,6 +23,8 @@ const secondaryButtonClass =
 
 const primaryButtonClass =
   "rounded-xl bg-[var(--accent)] px-4 py-2.5 text-sm font-semibold text-white transition hover:brightness-95 disabled:cursor-not-allowed disabled:opacity-60";
+
+const PAGE_SIZE = 50;
 
 const emptyOptions: ProductOptions = {
   categories: [],
@@ -81,9 +83,10 @@ function FieldError({ message }: { message?: string }) {
   );
 }
 
-export function ProductManager() {
+export function ProductManager({ canManage }: { canManage: boolean }) {
   const [products, setProducts] = useState<Product[]>([]);
   const [totalCount, setTotalCount] = useState(0);
+  const [offset, setOffset] = useState(0);
   const [query, setQuery] = useState("");
   const [appliedQuery, setAppliedQuery] = useState("");
   const [includeArchived, setIncludeArchived] = useState(false);
@@ -100,6 +103,7 @@ export function ProductManager() {
   const [isSaving, setIsSaving] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [archivingId, setArchivingId] = useState<string | null>(null);
+  const productsRequestId = useRef(0);
 
   const canSubmitForm = hasFormDictionaries(options);
   const isFormOpen = formState !== null;
@@ -108,10 +112,20 @@ export function ProductManager() {
     () => products.filter((product) => product.is_active).length,
     [products],
   );
+  const currentPage = Math.floor(offset / PAGE_SIZE) + 1;
+  const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE));
+  const hasPreviousPage = offset > 0;
+  const hasNextPage = offset + products.length < totalCount;
 
-  async function refreshProducts(next?: { q?: string; includeArchived?: boolean }) {
+  async function refreshProducts(next?: {
+    q?: string;
+    includeArchived?: boolean;
+    offset?: number;
+  }) {
     const nextQuery = next?.q ?? appliedQuery;
     const nextIncludeArchived = next?.includeArchived ?? includeArchived;
+    const nextOffset = next?.offset ?? offset;
+    const requestId = ++productsRequestId.current;
 
     setIsLoadingProducts(true);
     setProductsError(null);
@@ -119,13 +133,18 @@ export function ProductManager() {
     const result = await listProducts({
       q: nextQuery,
       includeArchived: nextIncludeArchived,
-      limit: 100,
-      offset: 0,
+      limit: PAGE_SIZE,
+      offset: nextOffset,
     });
+
+    if (requestId !== productsRequestId.current) {
+      return;
+    }
 
     if (result.status === "success") {
       setProducts(result.data.items);
       setTotalCount(result.data.count);
+      setOffset(result.data.offset);
     } else {
       setProductsError(result.error.message);
     }
@@ -150,10 +169,11 @@ export function ProductManager() {
 
   useEffect(() => {
     let ignore = false;
+    const requestId = ++productsRequestId.current;
 
     async function loadInitialData() {
       const [productsResult, optionsResult] = await Promise.all([
-        listProducts({ limit: 100, offset: 0 }),
+        listProducts({ limit: PAGE_SIZE, offset: 0 }),
         getProductOptions(),
       ]);
 
@@ -161,10 +181,17 @@ export function ProductManager() {
         return;
       }
 
-      if (productsResult.status === "success") {
+      if (
+        requestId === productsRequestId.current &&
+        productsResult.status === "success"
+      ) {
         setProducts(productsResult.data.items);
         setTotalCount(productsResult.data.count);
-      } else {
+        setOffset(productsResult.data.offset);
+      } else if (
+        requestId === productsRequestId.current &&
+        productsResult.status === "error"
+      ) {
         setProductsError(productsResult.error.message);
       }
 
@@ -174,7 +201,9 @@ export function ProductManager() {
         setOptionsError(optionsResult.error.message);
       }
 
-      setIsLoadingProducts(false);
+      if (requestId === productsRequestId.current) {
+        setIsLoadingProducts(false);
+      }
       setIsLoadingOptions(false);
     }
 
@@ -189,12 +218,12 @@ export function ProductManager() {
     event.preventDefault();
     const normalizedQuery = query.trim();
     setAppliedQuery(normalizedQuery);
-    await refreshProducts({ q: normalizedQuery });
+    await refreshProducts({ q: normalizedQuery, offset: 0 });
   }
 
   async function handleArchivedToggle(nextValue: boolean) {
     setIncludeArchived(nextValue);
-    await refreshProducts({ includeArchived: nextValue });
+    await refreshProducts({ includeArchived: nextValue, offset: 0 });
   }
 
   function openCreateForm() {
@@ -203,7 +232,7 @@ export function ProductManager() {
     setNotice(null);
     setFormState({
       mode: "create",
-      values: emptyProductFormValues(options ?? undefined),
+      values: emptyProductFormValues(),
     });
   }
 
@@ -297,7 +326,11 @@ export function ProductManager() {
 
     if (result.status === "success") {
       setNotice(`Товар «${product.name}» архивирован.`);
-      await refreshProducts();
+      const nextOffset =
+        !includeArchived && products.length === 1 && offset > 0
+          ? Math.max(0, offset - PAGE_SIZE)
+          : offset;
+      await refreshProducts({ offset: nextOffset });
     } else {
       setProductsError(result.error.message);
     }
@@ -306,7 +339,13 @@ export function ProductManager() {
   }
 
   return (
-    <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_420px] xl:items-start">
+    <div
+      className={
+        canManage
+          ? "grid gap-6 xl:grid-cols-[minmax(0,1fr)_420px] xl:items-start"
+          : "grid gap-6"
+      }
+    >
       <section
         aria-labelledby="products-list-heading"
         className="rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5 shadow-[0_12px_36px_rgba(20,32,24,0.04)] sm:p-6"
@@ -321,15 +360,22 @@ export function ProductManager() {
               Показано {products.length} из {totalCount}. Активных в текущей выдаче:{" "}
               {activeProductsCount}.
             </p>
+            {!canManage ? (
+              <p className="mt-2 text-sm font-semibold text-[var(--warning)]">
+                Режим просмотра: ваша роль не разрешает изменять товары.
+              </p>
+            ) : null}
           </div>
-          <button
-            type="button"
-            onClick={openCreateForm}
-            className={primaryButtonClass}
-            disabled={isLoadingOptions || !canSubmitForm}
-          >
-            Добавить товар
-          </button>
+          {canManage ? (
+            <button
+              type="button"
+              onClick={openCreateForm}
+              className={primaryButtonClass}
+              disabled={isLoadingOptions || !canSubmitForm}
+            >
+              Добавить товар
+            </button>
+          ) : null}
         </div>
 
         <form onSubmit={handleSearch} className="mb-4 grid gap-3 lg:grid-cols-[1fr_auto]">
@@ -354,7 +400,7 @@ export function ProductManager() {
               onClick={() => {
                 setQuery("");
                 setAppliedQuery("");
-                void refreshProducts({ q: "" });
+                void refreshProducts({ q: "", offset: 0 });
               }}
             >
               Сбросить
@@ -401,14 +447,16 @@ export function ProductManager() {
               Создайте первую позицию каталога. После сохранения она появится в списке и будет
               доступна через MyRetail API.
             </p>
-            <button
-              type="button"
-              onClick={openCreateForm}
-              className={`${primaryButtonClass} mt-5`}
-              disabled={isLoadingOptions || !canSubmitForm}
-            >
-              Добавить товар
-            </button>
+            {canManage ? (
+              <button
+                type="button"
+                onClick={openCreateForm}
+                className={`${primaryButtonClass} mt-5`}
+                disabled={isLoadingOptions || !canSubmitForm}
+              >
+                Добавить товар
+              </button>
+            ) : null}
           </div>
         ) : (
           <div className="overflow-x-auto rounded-xl border border-[var(--border)]">
@@ -430,9 +478,11 @@ export function ProductManager() {
                   <th scope="col" className="px-4 py-3 font-semibold">
                     Статус
                   </th>
-                  <th scope="col" className="px-4 py-3 font-semibold">
-                    Действия
-                  </th>
+                  {canManage ? (
+                    <th scope="col" className="px-4 py-3 font-semibold">
+                      Действия
+                    </th>
+                  ) : null}
                 </tr>
               </thead>
               <tbody>
@@ -477,34 +527,64 @@ export function ProductManager() {
                         {statusLabel(product)}
                       </span>
                     </td>
-                    <td className="px-4 py-4">
-                      <div className="flex flex-col gap-2">
-                        <button
-                          type="button"
-                          className={secondaryButtonClass}
-                          onClick={() => openEditForm(product)}
-                        >
-                          Редактировать
-                        </button>
-                        <button
-                          type="button"
-                          className="rounded-xl border border-red-200 bg-red-50 px-4 py-2.5 text-sm font-semibold text-red-700 transition hover:bg-red-100 disabled:cursor-not-allowed disabled:opacity-60 dark:border-red-900 dark:bg-red-950 dark:text-red-300"
-                          onClick={() => void handleArchive(product)}
-                          disabled={!product.is_active || archivingId === product.id}
-                        >
-                          {archivingId === product.id ? "Архивируем…" : "Архивировать"}
-                        </button>
-                      </div>
-                    </td>
+                    {canManage ? (
+                      <td className="px-4 py-4">
+                        <div className="flex flex-col gap-2">
+                          <button
+                            type="button"
+                            className={secondaryButtonClass}
+                            onClick={() => openEditForm(product)}
+                          >
+                            Редактировать
+                          </button>
+                          <button
+                            type="button"
+                            className="rounded-xl border border-red-200 bg-red-50 px-4 py-2.5 text-sm font-semibold text-red-700 transition hover:bg-red-100 disabled:cursor-not-allowed disabled:opacity-60 dark:border-red-900 dark:bg-red-950 dark:text-red-300"
+                            onClick={() => void handleArchive(product)}
+                            disabled={!product.is_active || archivingId === product.id}
+                          >
+                            {archivingId === product.id
+                              ? "Архивируем…"
+                              : "Архивировать"}
+                          </button>
+                        </div>
+                      </td>
+                    ) : null}
                   </tr>
                 ))}
               </tbody>
             </table>
+            <div className="flex flex-col gap-3 border-t border-[var(--border)] bg-[var(--surface-muted)] px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+              <p className="text-sm text-[var(--muted)]">
+                Страница {currentPage} из {totalPages}
+              </p>
+              <div className="flex gap-3">
+                <button
+                  type="button"
+                  className={secondaryButtonClass}
+                  disabled={!hasPreviousPage || isLoadingProducts}
+                  onClick={() =>
+                    void refreshProducts({ offset: Math.max(0, offset - PAGE_SIZE) })
+                  }
+                >
+                  Назад
+                </button>
+                <button
+                  type="button"
+                  className={secondaryButtonClass}
+                  disabled={!hasNextPage || isLoadingProducts}
+                  onClick={() => void refreshProducts({ offset: offset + PAGE_SIZE })}
+                >
+                  Далее
+                </button>
+              </div>
+            </div>
           </div>
         )}
       </section>
 
-      <aside className="rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5 shadow-[0_12px_36px_rgba(20,32,24,0.04)] sm:p-6">
+      {canManage ? (
+        <aside className="rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5 shadow-[0_12px_36px_rgba(20,32,24,0.04)] sm:p-6">
         <div className="mb-5">
           <p className="text-sm text-[var(--muted)]">Форма товара</p>
           <h2 className="text-2xl font-semibold tracking-tight">
@@ -549,7 +629,8 @@ export function ProductManager() {
             onSubmit={handleSave}
           />
         )}
-      </aside>
+        </aside>
+      ) : null}
     </div>
   );
 }
@@ -765,7 +846,9 @@ function ProductSelect({
         disabled={disabled}
         required={required}
       >
-        {emptyLabel ? <option value="">{emptyLabel}</option> : null}
+        {emptyLabel || required ? (
+          <option value="">{emptyLabel ?? "Выберите значение"}</option>
+        ) : null}
         {options.map((option) => (
           <option key={option.id} value={option.id}>
             {option.name}
