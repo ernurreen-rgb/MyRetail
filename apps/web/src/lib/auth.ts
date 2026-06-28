@@ -30,9 +30,13 @@ export type SessionResponse = {
   user: AuthUser;
 };
 
-export type AuthSession = {
+export type AuthSessionCredentials = {
   accessToken: string;
   tenant: string;
+};
+
+export type AuthSession = AuthSessionCredentials & {
+  user: AuthUser;
 };
 
 export type LoginClientResult =
@@ -93,6 +97,10 @@ export function isSessionResponse(value: unknown): value is SessionResponse {
     value.tenant.length > 0 &&
     isAuthUser(value.user)
   );
+}
+
+export function canManageProducts(roles: string[]) {
+  return roles.some((role) => role === "Owner" || role === "Admin");
 }
 
 function getMessageFromPayload(value: unknown): string | null {
