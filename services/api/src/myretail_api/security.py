@@ -27,10 +27,10 @@ def map_erpnext_roles(erpnext_roles: list[str]) -> list[str]:
     manager_roles = {"Sales Manager", "Stock Manager", "Accounts Manager", "Item Manager"}
     if role_set.intersection(manager_roles):
         mapped.add("Admin")
-    if role_set.intersection({"Sales User", "Stock User", "Accounts User", "All"}):
+    if role_set.intersection({"Sales User", "Stock User", "Accounts User"}):
         mapped.add("Cashier")
 
-    return sorted(mapped or {"Cashier"})
+    return sorted(mapped)
 
 
 def create_access_token(

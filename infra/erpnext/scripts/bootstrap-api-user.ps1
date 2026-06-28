@@ -32,7 +32,7 @@ function Read-DotEnv {
 
 function Invoke-ErpRequest {
     param(
-        [Parameter(Mandatory)][ValidateSet("Get", "Post")][string]$Method,
+        [Parameter(Mandatory)][ValidateSet("Get", "Post", "Put")][string]$Method,
         [Parameter(Mandatory)][string]$Uri,
         [Parameter(Mandatory)][Microsoft.PowerShell.Commands.WebRequestSession]$Session,
         [object]$Body
@@ -55,6 +55,10 @@ $root = (Resolve-Path (Join-Path $PSScriptRoot "../../..")).Path
 $erpEnvPath = Join-Path $root $ErpEnvFile
 $apiEnvPath = Join-Path $root $ApiEnvFile
 $erpEnv = Read-DotEnv -Path $erpEnvPath
+$existingApiEnv = @{}
+if (Test-Path -LiteralPath $apiEnvPath) {
+    $existingApiEnv = Read-DotEnv -Path $apiEnvPath
+}
 
 foreach ($required in @("SITE_NAME", "HTTP_PORT", "ADMIN_PASSWORD")) {
     if (-not $erpEnv.ContainsKey($required) -or -not $erpEnv[$required]) {
@@ -86,25 +90,67 @@ catch {
     } | Out-Null
 }
 
-$permissionFilters = [Uri]::EscapeDataString((@{
-    parent = "Item"
-    role = $serviceRole
-    permlevel = 0
-} | ConvertTo-Json -Compress))
 $permissionFields = [Uri]::EscapeDataString('["name"]')
-$permissions = Invoke-ErpRequest `
-    -Method Get `
-    -Uri "$baseUrl/api/resource/Custom%20DocPerm?filters=$permissionFilters&fields=$permissionFields&limit_page_length=1" `
-    -Session $session
-
-if (-not $permissions.data -or $permissions.data.Count -eq 0) {
-    Invoke-ErpRequest -Method Post -Uri "$baseUrl/api/resource/Custom%20DocPerm" -Session $session -Body @{
+$permissionDefinitions = @(
+    @{
         parent = "Item"
-        role = $serviceRole
-        permlevel = 0
         read = 1
         select = 1
-    } | Out-Null
+        create = 1
+        write = 1
+    },
+    @{
+        parent = "Item Price"
+        read = 1
+        select = 1
+        create = 1
+        write = 1
+        delete = 1
+    }
+)
+
+foreach ($definition in $permissionDefinitions) {
+    $permissionFilters = [Uri]::EscapeDataString((@{
+        parent = $definition.parent
+        role = $serviceRole
+        permlevel = 0
+    } | ConvertTo-Json -Compress))
+    $permissions = Invoke-ErpRequest `
+        -Method Get `
+        -Uri "$baseUrl/api/resource/Custom%20DocPerm?filters=$permissionFilters&fields=$permissionFields&limit_page_length=1" `
+        -Session $session
+
+    $permissionBody = @{
+        parent = $definition.parent
+        role = $serviceRole
+        permlevel = 0
+        read = $definition.read
+        select = $definition.select
+        create = 0
+        write = 0
+        delete = 0
+    }
+    foreach ($permissionFlag in @("create", "write", "delete")) {
+        if ($definition.ContainsKey($permissionFlag)) {
+            $permissionBody[$permissionFlag] = $definition[$permissionFlag]
+        }
+    }
+
+    if (-not $permissions.data -or $permissions.data.Count -eq 0) {
+        Invoke-ErpRequest `
+            -Method Post `
+            -Uri "$baseUrl/api/resource/Custom%20DocPerm" `
+            -Session $session `
+            -Body $permissionBody | Out-Null
+        continue
+    }
+
+    $encodedPermission = [Uri]::EscapeDataString($permissions.data[0].name)
+    Invoke-ErpRequest `
+        -Method Put `
+        -Uri "$baseUrl/api/resource/Custom%20DocPerm/$encodedPermission" `
+        -Session $session `
+        -Body $permissionBody | Out-Null
 }
 
 $encodedUser = [Uri]::EscapeDataString($serviceUser)
@@ -134,13 +180,46 @@ if (-not $keys.message.api_key -or -not $keys.message.api_secret) {
     throw "ERPNext did not return service user API keys"
 }
 
+$authSecret = $existingApiEnv["MYRETAIL_AUTH_SECRET"]
+if (-not $authSecret) {
+    $secretBytes = New-Object byte[] 32
+    $random = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $random.GetBytes($secretBytes)
+    }
+    finally {
+        $random.Dispose()
+    }
+    $authSecret = -join ($secretBytes | ForEach-Object { $_.ToString("x2") })
+}
+
+function Get-ApiSetting {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Default
+    )
+
+    if ($existingApiEnv.ContainsKey($Name) -and $existingApiEnv[$Name]) {
+        return $existingApiEnv[$Name]
+    }
+    return $Default
+}
+
 $apiEnv = @(
-    "MYRETAIL_ENVIRONMENT=development"
-    "MYRETAIL_LOG_LEVEL=INFO"
+    "MYRETAIL_ENVIRONMENT=$(Get-ApiSetting -Name 'MYRETAIL_ENVIRONMENT' -Default 'development')"
+    "MYRETAIL_LOG_LEVEL=$(Get-ApiSetting -Name 'MYRETAIL_LOG_LEVEL' -Default 'INFO')"
+    "MYRETAIL_TENANT_SLUG=$(Get-ApiSetting -Name 'MYRETAIL_TENANT_SLUG' -Default 'myretail')"
+    "MYRETAIL_AUTH_SECRET=$authSecret"
+    "MYRETAIL_AUTH_TOKEN_TTL_SECONDS=$(Get-ApiSetting -Name 'MYRETAIL_AUTH_TOKEN_TTL_SECONDS' -Default '3600')"
+    "MYRETAIL_AUTH_RATE_LIMIT_ATTEMPTS=$(Get-ApiSetting -Name 'MYRETAIL_AUTH_RATE_LIMIT_ATTEMPTS' -Default '5')"
+    "MYRETAIL_AUTH_RATE_LIMIT_WINDOW_SECONDS=$(Get-ApiSetting -Name 'MYRETAIL_AUTH_RATE_LIMIT_WINDOW_SECONDS' -Default '300')"
     "MYRETAIL_ERPNEXT_BASE_URL=$baseUrl"
     "MYRETAIL_ERPNEXT_API_KEY=$($keys.message.api_key)"
     "MYRETAIL_ERPNEXT_API_SECRET=$($keys.message.api_secret)"
-    "MYRETAIL_ERPNEXT_TIMEOUT_SECONDS=10"
+    "MYRETAIL_ERPNEXT_TIMEOUT_SECONDS=$(Get-ApiSetting -Name 'MYRETAIL_ERPNEXT_TIMEOUT_SECONDS' -Default '10')"
+    "MYRETAIL_ERPNEXT_SELLING_PRICE_LIST=$(Get-ApiSetting -Name 'MYRETAIL_ERPNEXT_SELLING_PRICE_LIST' -Default 'Standard Selling')"
+    "MYRETAIL_ERPNEXT_BUYING_PRICE_LIST=$(Get-ApiSetting -Name 'MYRETAIL_ERPNEXT_BUYING_PRICE_LIST' -Default 'Standard Buying')"
+    "MYRETAIL_DEFAULT_CURRENCY=$(Get-ApiSetting -Name 'MYRETAIL_DEFAULT_CURRENCY' -Default 'KZT')"
 ) -join [Environment]::NewLine
 
 $apiEnvDirectory = Split-Path -Parent $apiEnvPath

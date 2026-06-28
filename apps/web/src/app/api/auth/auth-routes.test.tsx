@@ -106,6 +106,25 @@ describe("POST /api/auth/login", () => {
       message: "Backend не ответил вовремя. Попробуйте ещё раз.",
     });
   });
+
+  it("returns a clear message when login attempts are rate limited", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        Response.json(
+          { detail: "Too many login attempts" },
+          { status: 429, headers: { "Retry-After": "120" } },
+        ),
+      ),
+    );
+
+    const response = await login(loginRequest());
+
+    expect(response.status).toBe(429);
+    await expect(response.json()).resolves.toEqual({
+      message: "Слишком много попыток входа. Подождите несколько минут и попробуйте снова.",
+    });
+  });
 });
 
 describe("POST /api/auth/logout", () => {
