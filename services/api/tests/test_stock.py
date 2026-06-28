@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -288,6 +289,25 @@ class TimeoutStockClient(StubStockERPNextClient):
         raise ERPNextTimeoutError("timeout")
 
 
+class BlockingCreateStockClient(StubStockERPNextClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.create_calls = 0
+
+    async def create_stock_movement(
+        self,
+        movement: StockMovementCreate,
+        *,
+        actor: AuthenticatedUser,
+    ) -> StockMovement:
+        self.create_calls += 1
+        self.started.set()
+        await self.release.wait()
+        return await super().create_stock_movement(movement, actor=actor)
+
+
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
@@ -402,6 +422,45 @@ async def test_stock_create_receipt_is_idempotent(tmp_path: Path) -> None:
     assert second_response.status_code == 201
     assert first_response.json()["id"] == second_response.json()["id"]
     assert balances_response.json()["items"][0]["on_hand"] == "11.500"
+
+
+@pytest.mark.anyio
+async def test_stock_create_receipt_is_concurrently_idempotent(tmp_path: Path) -> None:
+    erpnext_client = BlockingCreateStockClient()
+    app = make_app(erpnext_client, tmp_path)
+    transport = httpx.ASGITransport(app=app)
+    key = str(uuid4())
+    payload = {
+        "type": "receipt",
+        "warehouse_id": "Stores - MR",
+        "lines": [{"product_id": "SKU-001", "quantity": "1.500"}],
+    }
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first_task = asyncio.create_task(
+            client.post(
+                "/stock/movements",
+                headers=auth_headers(tmp_path, idempotency_key=key),
+                json=payload,
+            )
+        )
+        await erpnext_client.started.wait()
+        second_task = asyncio.create_task(
+            client.post(
+                "/stock/movements",
+                headers=auth_headers(tmp_path, idempotency_key=key),
+                json=payload,
+            )
+        )
+        await asyncio.sleep(0.1)
+        erpnext_client.release.set()
+        first_response, second_response = await asyncio.gather(first_task, second_task)
+
+    assert first_response.status_code == 201
+    assert second_response.status_code == 201
+    assert first_response.json()["id"] == second_response.json()["id"]
+    assert erpnext_client.create_calls == 1
+    assert erpnext_client.balances[("SKU-001", "Stores - MR")] == Decimal("11.500")
 
 
 @pytest.mark.anyio

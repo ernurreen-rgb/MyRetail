@@ -1,6 +1,7 @@
+import asyncio
 import hashlib
 import json
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from datetime import date
 from typing import Annotated, TypeVar
 from uuid import UUID
@@ -23,7 +24,12 @@ from myretail_api.dependencies import (
     get_stock_idempotency_store,
     require_tenant_context,
 )
-from myretail_api.idempotency import IdempotencyConflictError, StockIdempotencyStore
+from myretail_api.idempotency import (
+    IdempotencyBeginResult,
+    IdempotencyConflictError,
+    IdempotencyRecord,
+    StockIdempotencyStore,
+)
 from myretail_api.models.auth import TenantContext
 from myretail_api.models.stock import (
     StockBalanceList,
@@ -148,20 +154,14 @@ async def create_stock_movement(
     key = _require_idempotency_key(idempotency_key)
     _validate_movement_request(movement)
     request_hash = _request_hash("create_stock_movement", movement.model_dump(mode="json"))
-    stored = _load_idempotency_record(store, tenant_context.tenant, key, request_hash)
-    if stored is not None:
-        return JSONResponse(status_code=stored.status_code, content=stored.response_body)
-
-    result = await _call_erpnext(client.create_stock_movement(movement, actor=tenant_context.user))
-    response_body = jsonable_encoder(result)
-    store.save(
+    return await _idempotent_stock_response(
+        store=store,
         tenant=tenant_context.tenant,
         key=key,
         request_hash=request_hash,
         status_code=status.HTTP_201_CREATED,
-        response_body=response_body,
+        execute=lambda: client.create_stock_movement(movement, actor=tenant_context.user),
     )
-    return JSONResponse(status_code=status.HTTP_201_CREATED, content=response_body)
 
 
 @router.post(
@@ -181,22 +181,18 @@ async def cancel_stock_movement(
         "cancel_stock_movement",
         {"movement_id": movement_id, **request.model_dump(mode="json")},
     )
-    stored = _load_idempotency_record(store, tenant_context.tenant, key, request_hash)
-    if stored is not None:
-        return JSONResponse(status_code=stored.status_code, content=stored.response_body)
-
-    result = await _call_erpnext(
-        client.cancel_stock_movement(movement_id, request, actor=tenant_context.user)
-    )
-    response_body = jsonable_encoder(result)
-    store.save(
+    return await _idempotent_stock_response(
+        store=store,
         tenant=tenant_context.tenant,
         key=key,
         request_hash=request_hash,
         status_code=status.HTTP_200_OK,
-        response_body=response_body,
+        execute=lambda: client.cancel_stock_movement(
+            movement_id,
+            request,
+            actor=tenant_context.user,
+        ),
     )
-    return JSONResponse(status_code=status.HTTP_200_OK, content=response_body)
 
 
 async def _call_erpnext(call: Awaitable[T]) -> T:
@@ -306,6 +302,88 @@ def _require_idempotency_key(idempotency_key: str | None) -> str:
     return idempotency_key
 
 
+async def _idempotent_stock_response(
+    store: StockIdempotencyStore,
+    *,
+    tenant: str,
+    key: str,
+    request_hash: str,
+    status_code: int,
+    execute: Callable[[], Awaitable[T]],
+) -> JSONResponse:
+    begin = _begin_idempotency(store, tenant=tenant, key=key, request_hash=request_hash)
+    if begin.record is not None:
+        return JSONResponse(
+            status_code=begin.record.status_code,
+            content=begin.record.response_body,
+        )
+
+    if not begin.acquired:
+        record = await _wait_idempotency(store, tenant=tenant, key=key, request_hash=request_hash)
+        if record is not None:
+            return JSONResponse(status_code=record.status_code, content=record.response_body)
+        raise _api_error(
+            status.HTTP_409_CONFLICT,
+            "IDEMPOTENCY_CONFLICT",
+            "Запрос с этим Idempotency-Key ещё выполняется",
+        )
+
+    try:
+        result = await _call_erpnext(execute())
+    except Exception:
+        store.release(tenant=tenant, key=key, request_hash=request_hash)
+        raise
+
+    response_body = jsonable_encoder(result)
+    store.complete(
+        tenant=tenant,
+        key=key,
+        request_hash=request_hash,
+        status_code=status_code,
+        response_body=response_body,
+    )
+    return JSONResponse(status_code=status_code, content=response_body)
+
+
+def _begin_idempotency(
+    store: StockIdempotencyStore,
+    *,
+    tenant: str,
+    key: str,
+    request_hash: str,
+) -> IdempotencyBeginResult:
+    try:
+        return store.begin(tenant=tenant, key=key, request_hash=request_hash)
+    except IdempotencyConflictError as exc:
+        raise _api_error(
+            status.HTTP_409_CONFLICT,
+            "IDEMPOTENCY_CONFLICT",
+            "Idempotency-Key СѓР¶Рµ РёСЃРїРѕР»СЊР·РѕРІР°РЅ РґР»СЏ РґСЂСѓРіРѕРіРѕ Р·Р°РїСЂРѕСЃР°",
+        ) from exc
+
+
+async def _wait_idempotency(
+    store: StockIdempotencyStore,
+    *,
+    tenant: str,
+    key: str,
+    request_hash: str,
+) -> IdempotencyRecord | None:
+    try:
+        return await asyncio.to_thread(
+            store.wait_for_completed,
+            tenant=tenant,
+            key=key,
+            request_hash=request_hash,
+        )
+    except IdempotencyConflictError as exc:
+        raise _api_error(
+            status.HTTP_409_CONFLICT,
+            "IDEMPOTENCY_CONFLICT",
+            "Idempotency-Key СѓР¶Рµ РёСЃРїРѕР»СЊР·РѕРІР°РЅ РґР»СЏ РґСЂСѓРіРѕРіРѕ Р·Р°РїСЂРѕСЃР°",
+        ) from exc
+
+
 def _load_idempotency_record(
     store: StockIdempotencyStore,
     tenant: str,
@@ -313,7 +391,8 @@ def _load_idempotency_record(
     request_hash: str,
 ) -> object | None:
     try:
-        return store.get(tenant=tenant, key=key, request_hash=request_hash)
+        begin = store.begin(tenant=tenant, key=key, request_hash=request_hash)
+        return begin.record
     except IdempotencyConflictError as exc:
         raise _api_error(
             status.HTTP_409_CONFLICT,

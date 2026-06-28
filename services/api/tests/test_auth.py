@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import httpx
 import pytest
 from pydantic import SecretStr
@@ -26,25 +28,32 @@ class FailingAuthClient:
         raise ERPNextUserLoginError("bad credentials")
 
 
+class UnmappedRoleAuthClient:
+    async def authenticate_user(self, *, email: str, password: str) -> ERPNextUser:
+        return ERPNextUser(email=email, full_name=None, roles=["Website User", "All"])
+
+
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
 
 
-def make_test_settings() -> Settings:
+def make_test_settings(rate_limit_path: Path | None = None) -> Settings:
     return Settings(
         tenant_slug="myretail",
         auth_secret=SecretStr("test-auth-secret"),
         auth_token_ttl_seconds=900,
         erpnext_api_key=SecretStr("test-key"),
         erpnext_api_secret=SecretStr("test-secret"),
+        auth_rate_limit_db_path=rate_limit_path or Path("test-rate-limit.sqlite3"),
     )
 
 
 @pytest.mark.anyio
-async def test_login_returns_myretail_token() -> None:
+async def test_login_returns_myretail_token(tmp_path: Path) -> None:
+    settings = make_test_settings(tmp_path / "rate-limit.sqlite3")
     app = create_app()
-    app.dependency_overrides[get_settings] = make_test_settings
+    app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_erpnext_client] = SuccessfulAuthClient
     transport = httpx.ASGITransport(app=app)
 
@@ -72,9 +81,10 @@ async def test_login_returns_myretail_token() -> None:
 
 
 @pytest.mark.anyio
-async def test_login_rejects_invalid_password() -> None:
+async def test_login_rejects_invalid_password(tmp_path: Path) -> None:
+    settings = make_test_settings(tmp_path / "rate-limit.sqlite3")
     app = create_app()
-    app.dependency_overrides[get_settings] = make_test_settings
+    app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_erpnext_client] = FailingAuthClient
     transport = httpx.ASGITransport(app=app)
 
@@ -93,9 +103,10 @@ async def test_login_rejects_invalid_password() -> None:
 
 
 @pytest.mark.anyio
-async def test_login_rejects_unknown_tenant() -> None:
+async def test_login_rejects_unknown_tenant(tmp_path: Path) -> None:
+    settings = make_test_settings(tmp_path / "rate-limit.sqlite3")
     app = create_app()
-    app.dependency_overrides[get_settings] = make_test_settings
+    app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_erpnext_client] = SuccessfulAuthClient
     transport = httpx.ASGITransport(app=app)
 
@@ -109,8 +120,55 @@ async def test_login_rejects_unknown_tenant() -> None:
             },
         )
 
-    assert response.status_code == 404
-    assert response.json() == {"detail": "Tenant is not configured"}
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Invalid email or password"}
+
+
+@pytest.mark.anyio
+async def test_login_rejects_user_without_mapped_role(tmp_path: Path) -> None:
+    settings = make_test_settings(tmp_path / "rate-limit.sqlite3")
+    app = create_app()
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_erpnext_client] = UnmappedRoleAuthClient
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/auth/login",
+            json={
+                "tenant": "myretail",
+                "email": "website@example.com",
+                "password": "correct-password",
+            },
+        )
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "User does not have a MyRetail role"}
+
+
+@pytest.mark.anyio
+async def test_login_rate_limit_blocks_repeated_failures(tmp_path: Path) -> None:
+    settings = make_test_settings(tmp_path / "rate-limit.sqlite3")
+    settings.auth_rate_limit_attempts = 2
+    app = create_app()
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_erpnext_client] = FailingAuthClient
+    transport = httpx.ASGITransport(app=app, client=("192.0.2.10", 1234))
+    payload = {
+        "tenant": "myretail",
+        "email": "damir@example.com",
+        "password": "wrong-password",
+    }
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first = await client.post("/auth/login", json=payload)
+        second = await client.post("/auth/login", json=payload)
+        blocked = await client.post("/auth/login", json=payload)
+
+    assert first.status_code == 401
+    assert second.status_code == 401
+    assert blocked.status_code == 429
+    assert int(blocked.headers["Retry-After"]) > 0
 
 
 def auth_headers(
@@ -135,8 +193,9 @@ def auth_headers(
 
 @pytest.mark.anyio
 async def test_current_session_returns_verified_token_context() -> None:
+    settings = make_test_settings()
     app = create_app()
-    app.dependency_overrides[get_settings] = make_test_settings
+    app.dependency_overrides[get_settings] = lambda: settings
     transport = httpx.ASGITransport(app=app)
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -155,8 +214,9 @@ async def test_current_session_returns_verified_token_context() -> None:
 
 @pytest.mark.anyio
 async def test_current_session_rejects_invalid_token() -> None:
+    settings = make_test_settings()
     app = create_app()
-    app.dependency_overrides[get_settings] = make_test_settings
+    app.dependency_overrides[get_settings] = lambda: settings
     transport = httpx.ASGITransport(app=app)
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -173,8 +233,9 @@ async def test_current_session_rejects_invalid_token() -> None:
 
 @pytest.mark.anyio
 async def test_current_session_rejects_tenant_mismatch() -> None:
+    settings = make_test_settings()
     app = create_app()
-    app.dependency_overrides[get_settings] = make_test_settings
+    app.dependency_overrides[get_settings] = lambda: settings
     transport = httpx.ASGITransport(app=app)
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:

@@ -1,15 +1,17 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from myretail_api.clients.erpnext import (
     ERPNextClient,
+    ERPNextRoleVerificationError,
     ERPNextUnavailableError,
     ERPNextUserLoginError,
 )
 from myretail_api.config import Settings, get_settings
 from myretail_api.dependencies import get_erpnext_client, require_tenant_context
 from myretail_api.models.auth import AuthenticatedUser, LoginRequest, LoginResponse, TenantContext
+from myretail_api.rate_limit import LoginRateLimiter, get_login_rate_limiter
 from myretail_api.security import AuthConfigurationError, create_access_token, map_erpnext_roles
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -24,38 +26,55 @@ async def get_current_session(
 
 @router.post("/login", response_model=LoginResponse)
 async def login(
+    http_request: Request,
     request: LoginRequest,
     settings: Annotated[Settings, Depends(get_settings)],
     client: Annotated[ERPNextClient, Depends(get_erpnext_client)],
+    rate_limiter: Annotated[LoginRateLimiter, Depends(get_login_rate_limiter)],
 ) -> LoginResponse:
     tenant = request.tenant.strip()
-    if tenant != settings.tenant_slug:
+    email = request.email.strip()
+    client_ip = http_request.client.host if http_request.client else "unknown"
+    retry_after = rate_limiter.check_and_record(
+        tenant=tenant,
+        client_ip=client_ip,
+        login=email,
+    )
+    if retry_after is not None:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Tenant is not configured",
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many login attempts",
+            headers={"Retry-After": str(retry_after)},
         )
+
+    if tenant != settings.tenant_slug:
+        raise _invalid_credentials()
 
     try:
         erpnext_user = await client.authenticate_user(
-            email=request.email.strip(),
+            email=email,
             password=request.password,
         )
     except ERPNextUserLoginError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        ) from exc
-    except ERPNextUnavailableError as exc:
+        raise _invalid_credentials() from exc
+    except (ERPNextRoleVerificationError, ERPNextUnavailableError) as exc:
+        rate_limiter.clear(tenant=tenant, client_ip=client_ip, login=email)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="ERPNext is unavailable",
+            detail="ERPNext authentication is unavailable",
         ) from exc
+
+    roles = map_erpnext_roles(erpnext_user.roles)
+    if not roles:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User does not have a MyRetail role",
+        )
 
     user = AuthenticatedUser(
         email=erpnext_user.email,
         full_name=erpnext_user.full_name,
-        roles=map_erpnext_roles(erpnext_user.roles),
+        roles=roles,
     )
 
     try:
@@ -65,14 +84,24 @@ async def login(
             user=user,
         )
     except AuthConfigurationError as exc:
+        rate_limiter.clear(tenant=tenant, client_ip=client_ip, login=email)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Auth integration is not configured",
         ) from exc
 
+    rate_limiter.clear(tenant=tenant, client_ip=client_ip, login=email)
     return LoginResponse(
         access_token=access_token,
         expires_in=expires_in,
         tenant=settings.tenant_slug,
         user=user,
+    )
+
+
+def _invalid_credentials() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid email or password",
+        headers={"WWW-Authenticate": "Bearer"},
     )
