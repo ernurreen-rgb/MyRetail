@@ -4,6 +4,7 @@ from fastapi import Depends, Header, HTTPException, status
 
 from myretail_api.clients.erpnext import ERPNextClient, ERPNextConfigurationError
 from myretail_api.config import Settings, get_settings
+from myretail_api.idempotency import StockIdempotencyStore
 from myretail_api.models.auth import TenantContext
 from myretail_api.security import AuthConfigurationError, TokenValidationError, parse_access_token
 
@@ -16,6 +17,12 @@ def get_erpnext_client(settings: Annotated[Settings, Depends(get_settings)]) -> 
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="ERPNext integration is not configured",
         ) from exc
+
+
+def get_stock_idempotency_store(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> StockIdempotencyStore:
+    return StockIdempotencyStore(settings.stock_idempotency_db_path)
 
 
 def require_tenant_context(

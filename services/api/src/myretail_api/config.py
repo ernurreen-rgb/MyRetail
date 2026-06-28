@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     erpnext_selling_price_list: str = "Standard Selling"
     erpnext_buying_price_list: str = "Standard Buying"
     default_currency: str = "KZT"
+    stock_idempotency_db_path: Path = API_ROOT / "tmp" / "stock_idempotency.sqlite3"
 
     model_config = SettingsConfigDict(
         env_file=API_ROOT / ".env",

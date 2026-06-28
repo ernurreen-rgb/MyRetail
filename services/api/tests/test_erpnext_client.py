@@ -1,4 +1,5 @@
 import json
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -6,6 +7,8 @@ from pydantic import SecretStr
 
 from myretail_api.clients.erpnext import ERPNextClient, ERPNextUserLoginError
 from myretail_api.config import Settings
+from myretail_api.models.auth import AuthenticatedUser
+from myretail_api.models.stock import StockMovementCreate
 
 
 @pytest.fixture
@@ -79,6 +82,131 @@ async def test_list_products_normalizes_erpnext_items() -> None:
         "limit": 50,
         "offset": 0,
     }
+
+
+@pytest.mark.anyio
+async def test_list_stock_balances_normalizes_erpnext_bins() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/resource/Bin":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "item_code": "SKU-001",
+                            "warehouse": "Stores - MR",
+                            "actual_qty": "10.5",
+                            "reserved_qty": "2",
+                            "modified": "2026-06-29T08:00:00Z",
+                        }
+                    ]
+                },
+            )
+        if request.url.path == "/api/resource/Warehouse":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "name": "Stores - MR",
+                            "warehouse_name": "Основной склад",
+                            "disabled": 0,
+                            "is_group": 0,
+                        }
+                    ]
+                },
+            )
+        if request.url.path == "/api/resource/Item/SKU-001":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "item_code": "SKU-001",
+                        "item_name": "Milk",
+                        "stock_uom": "Nos",
+                        "barcodes": [{"barcode": "4870001234567"}],
+                    }
+                },
+            )
+        return httpx.Response(404)
+
+    settings = Settings(
+        erpnext_base_url="http://erpnext.test",
+        erpnext_api_key=SecretStr("test-key"),
+        erpnext_api_secret=SecretStr("test-secret"),
+    )
+    client = ERPNextClient(settings, transport=httpx.MockTransport(handler))
+
+    balances = await client.list_stock_balances(q="487000")
+
+    assert balances.model_dump() == {
+        "items": [
+            {
+                "product_id": "SKU-001",
+                "sku": "SKU-001",
+                "name": "Milk",
+                "unit": "Nos",
+                "warehouse": {"id": "Stores - MR", "name": "Основной склад"},
+                "on_hand": "10.500",
+                "reserved": "2.000",
+                "available": "8.500",
+                "updated_at": datetime(2026, 6, 29, 8, 0, tzinfo=UTC),
+            }
+        ],
+        "count": 1,
+        "limit": 50,
+        "offset": 0,
+    }
+
+
+@pytest.mark.anyio
+async def test_create_stock_movement_posts_stock_entry_payload() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/api/resource/Bin":
+            return httpx.Response(200, json={"data": [{"actual_qty": "10.000"}]})
+        if request.url.path in {"/api/resource/Stock%20Entry", "/api/resource/Stock Entry"}:
+            payload = json.loads(request.content)
+            assert payload["docstatus"] == 1
+            assert payload["stock_entry_type"] == "Material Issue"
+            assert payload["items"] == [
+                {
+                    "item_code": "SKU-001",
+                    "qty": "2.000",
+                    "s_warehouse": "Stores - MR",
+                }
+            ]
+            metadata = json.loads(payload["remarks"])["myretail"]
+            assert metadata["type"] == "write_off"
+            assert metadata["lines"][0]["before_quantity"] == "10.000"
+            assert metadata["lines"][0]["after_quantity"] == "8.000"
+            return httpx.Response(200, json={"data": {"name": "MAT-STE-2026-00001"}})
+        return httpx.Response(404)
+
+    settings = Settings(
+        erpnext_base_url="http://erpnext.test",
+        erpnext_api_key=SecretStr("test-key"),
+        erpnext_api_secret=SecretStr("test-secret"),
+    )
+    client = ERPNextClient(settings, transport=httpx.MockTransport(handler))
+
+    movement = await client.create_stock_movement(
+        StockMovementCreate(
+            type="write_off",
+            warehouse_id="Stores - MR",
+            reason_code="damage",
+            comment="Повреждение упаковки",
+            lines=[{"product_id": "SKU-001", "quantity": "2.000"}],
+        ),
+        actor=AuthenticatedUser(email="owner@example.com", full_name="Owner", roles=["Owner"]),
+    )
+
+    assert movement.id == "MAT-STE-2026-00001"
+    assert movement.lines[0].before_quantity == "10.000"
+    assert movement.lines[0].after_quantity == "8.000"
+    assert [request.method for request in requests] == ["GET", "POST"]
 
 
 @pytest.mark.anyio
