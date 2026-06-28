@@ -2,18 +2,16 @@ import { NextResponse } from "next/server";
 
 import { DEFAULT_TENANT, isLoginResponse, type LoginFormValues } from "@/lib/auth";
 import { getApiBaseUrl } from "@/lib/config";
+import { isSameOriginMutation } from "@/lib/request-security";
 import { setAuthCookies } from "@/lib/session";
 
 export const dynamic = "force-dynamic";
+const LOGIN_TIMEOUT_MS = 10_000;
 
 type ValidatedLoginValues = LoginFormValues;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
-}
-
-function getStringField(value: FormDataEntryValue | null) {
-  return typeof value === "string" ? value : "";
 }
 
 function normalizeLoginValues(value: unknown): ValidatedLoginValues | null {
@@ -39,28 +37,15 @@ function normalizeLoginValues(value: unknown): ValidatedLoginValues | null {
 async function readLoginValues(request: Request): Promise<ValidatedLoginValues | null> {
   const contentType = request.headers.get("content-type") ?? "";
 
-  if (contentType.includes("application/json")) {
-    try {
-      return normalizeLoginValues(await request.json());
-    } catch {
-      return null;
-    }
+  if (!contentType.includes("application/json")) {
+    return null;
   }
 
-  if (
-    contentType.includes("application/x-www-form-urlencoded") ||
-    contentType.includes("multipart/form-data")
-  ) {
-    const formData = await request.formData();
-
-    return normalizeLoginValues({
-      tenant: getStringField(formData.get("tenant")),
-      email: getStringField(formData.get("email")),
-      password: getStringField(formData.get("password")),
-    });
+  try {
+    return normalizeLoginValues(await request.json());
+  } catch {
+    return null;
   }
-
-  return null;
 }
 
 async function readJson(response: Response): Promise<unknown> {
@@ -91,7 +76,26 @@ function loginErrorMessage(status: number) {
   return "Не удалось войти. Попробуйте ещё раз.";
 }
 
+function isTimeoutError(error: unknown) {
+  return error instanceof Error && ["AbortError", "TimeoutError"].includes(error.name);
+}
+
 export async function POST(request: Request) {
+  if (!isSameOriginMutation(request)) {
+    return NextResponse.json(
+      { message: "Запрос входа отклонён проверкой безопасности." },
+      { status: 403 },
+    );
+  }
+
+  const contentType = request.headers.get("content-type") ?? "";
+  if (!contentType.includes("application/json")) {
+    return NextResponse.json(
+      { message: "Поддерживается только JSON-формат запроса." },
+      { status: 415 },
+    );
+  }
+
   const values = await readLoginValues(request);
 
   if (!values) {
@@ -112,11 +116,17 @@ export async function POST(request: Request) {
       },
       body: JSON.stringify(values),
       cache: "no-store",
+      signal: AbortSignal.timeout(LOGIN_TIMEOUT_MS),
     });
-  } catch {
+  } catch (error) {
+    const timedOut = isTimeoutError(error);
     return NextResponse.json(
-      { message: "Backend недоступен. Проверьте, что MyRetail API запущен." },
-      { status: 503 },
+      {
+        message: timedOut
+          ? "Backend не ответил вовремя. Попробуйте ещё раз."
+          : "Backend недоступен. Проверьте, что MyRetail API запущен.",
+      },
+      { status: timedOut ? 504 : 503 },
     );
   }
 

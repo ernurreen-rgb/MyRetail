@@ -8,11 +8,18 @@ from myretail_api.clients.erpnext import (
     ERPNextUserLoginError,
 )
 from myretail_api.config import Settings, get_settings
-from myretail_api.dependencies import get_erpnext_client
-from myretail_api.models.auth import AuthenticatedUser, LoginRequest, LoginResponse
+from myretail_api.dependencies import get_erpnext_client, require_tenant_context
+from myretail_api.models.auth import AuthenticatedUser, LoginRequest, LoginResponse, TenantContext
 from myretail_api.security import AuthConfigurationError, create_access_token, map_erpnext_roles
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+@router.get("/me", response_model=TenantContext)
+async def get_current_session(
+    tenant_context: Annotated[TenantContext, Depends(require_tenant_context)],
+) -> TenantContext:
+    return tenant_context
 
 
 @router.post("/login", response_model=LoginResponse)

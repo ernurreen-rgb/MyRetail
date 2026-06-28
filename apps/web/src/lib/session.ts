@@ -5,10 +5,13 @@ import {
   AUTH_COOKIE_NAMES,
   type AuthSession,
   type LoginResponse,
+  isSessionResponse,
 } from "@/lib/auth";
+import { getApiBaseUrl } from "@/lib/config";
 
 const MIN_SESSION_SECONDS = 60;
 const MAX_SESSION_SECONDS = 60 * 60 * 8;
+const SESSION_VERIFY_TIMEOUT_MS = 5_000;
 
 function clampSessionMaxAge(expiresIn: number) {
   if (!Number.isFinite(expiresIn)) {
@@ -37,10 +40,36 @@ export async function getAuthSession(): Promise<AuthSession | null> {
     return null;
   }
 
-  return {
+  const session = {
     accessToken,
     tenant,
   };
+
+  return (await verifyAuthSession(session)) ? session : null;
+}
+
+export async function verifyAuthSession(session: AuthSession) {
+  const apiBaseUrl = getApiBaseUrl().replace(/\/+$/, "");
+
+  try {
+    const response = await fetch(`${apiBaseUrl}/auth/me`, {
+      cache: "no-store",
+      headers: {
+        Authorization: `Bearer ${session.accessToken}`,
+        "X-MyRetail-Tenant": session.tenant,
+      },
+      signal: AbortSignal.timeout(SESSION_VERIFY_TIMEOUT_MS),
+    });
+
+    if (!response.ok) {
+      return false;
+    }
+
+    const payload: unknown = await response.json();
+    return isSessionResponse(payload) && payload.tenant === session.tenant;
+  } catch {
+    return false;
+  }
 }
 
 export function setAuthCookies(response: NextResponse, login: LoginResponse) {

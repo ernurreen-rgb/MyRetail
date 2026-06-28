@@ -6,6 +6,8 @@ from myretail_api.clients.erpnext import ERPNextUser, ERPNextUserLoginError
 from myretail_api.config import Settings, get_settings
 from myretail_api.dependencies import get_erpnext_client
 from myretail_api.main import create_app
+from myretail_api.models.auth import AuthenticatedUser
+from myretail_api.security import create_access_token
 
 
 class SuccessfulAuthClient:
@@ -109,3 +111,76 @@ async def test_login_rejects_unknown_tenant() -> None:
 
     assert response.status_code == 404
     assert response.json() == {"detail": "Tenant is not configured"}
+
+
+def auth_headers(
+    *,
+    tenant: str = "myretail",
+    header_tenant: str = "myretail",
+) -> dict[str, str]:
+    token, _ = create_access_token(
+        settings=make_test_settings(),
+        tenant=tenant,
+        user=AuthenticatedUser(
+            email="damir@example.com",
+            full_name="Damir",
+            roles=["Owner"],
+        ),
+    )
+    return {
+        "Authorization": f"Bearer {token}",
+        "X-MyRetail-Tenant": header_tenant,
+    }
+
+
+@pytest.mark.anyio
+async def test_current_session_returns_verified_token_context() -> None:
+    app = create_app()
+    app.dependency_overrides[get_settings] = make_test_settings
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/auth/me", headers=auth_headers())
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "tenant": "myretail",
+        "user": {
+            "email": "damir@example.com",
+            "full_name": "Damir",
+            "roles": ["Owner"],
+        },
+    }
+
+
+@pytest.mark.anyio
+async def test_current_session_rejects_invalid_token() -> None:
+    app = create_app()
+    app.dependency_overrides[get_settings] = make_test_settings
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/auth/me",
+            headers={
+                "Authorization": "Bearer invalid-token",
+                "X-MyRetail-Tenant": "myretail",
+            },
+        )
+
+    assert response.status_code == 401
+
+
+@pytest.mark.anyio
+async def test_current_session_rejects_tenant_mismatch() -> None:
+    app = create_app()
+    app.dependency_overrides[get_settings] = make_test_settings
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/auth/me",
+            headers=auth_headers(header_tenant="other-tenant"),
+        )
+
+    assert response.status_code == 403

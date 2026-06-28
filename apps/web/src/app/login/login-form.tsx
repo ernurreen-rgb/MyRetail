@@ -31,7 +31,13 @@ export function LoginForm() {
   }
 
   return (
-    <form onSubmit={handleSubmit} className="space-y-5" noValidate>
+    <form
+      action="/api/auth/login"
+      method="post"
+      onSubmit={handleSubmit}
+      className="space-y-5"
+      noValidate
+    >
       <div>
         <label htmlFor="tenant" className="text-sm font-semibold text-[var(--foreground)]">
           Код tenant
@@ -48,7 +54,7 @@ export function LoginForm() {
           required
         />
         <p className="mt-2 text-sm leading-6 text-[var(--muted)]">
-          Для локального контура используйте значение `myretail`.
+          Для локального контура используйте значение myretail.
         </p>
       </div>
 
@@ -85,7 +91,7 @@ export function LoginForm() {
           required
         />
         <p className="mt-2 text-sm leading-6 text-[var(--muted)]">
-          Пароль отправляется только в MyRetail API и не сохраняется в браузере.
+          Пароль безопасно передаётся через сервер MyRetail и не сохраняется в браузере.
         </p>
       </div>
 
