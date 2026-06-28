@@ -34,6 +34,10 @@ class ERPNextUserLoginError(RuntimeError):
     """Raised when ERPNext rejects user credentials."""
 
 
+class ERPNextRoleVerificationError(RuntimeError):
+    """Raised when ERPNext cannot verify a logged-in user's roles."""
+
+
 class ERPNextProductNotFoundError(RuntimeError):
     """Raised when an ERPNext Item cannot be found."""
 
@@ -106,12 +110,15 @@ class ERPNextClient:
                 user_response.raise_for_status()
                 user_email = user_response.json().get("message") or email
 
-                encoded_email = quote(str(user_email), safe="")
-                profile_response = await client.get(f"/api/resource/User/{encoded_email}")
-                if profile_response.status_code in {401, 403, 404}:
-                    return ERPNextUser(email=str(user_email), full_name=None, roles=[])
-                profile_response.raise_for_status()
+                roles_response = await client.get(
+                    "/api/method/frappe.core.doctype.user.user.get_roles"
+                )
+                if roles_response.status_code in {401, 403, 404}:
+                    raise ERPNextRoleVerificationError("ERPNext did not return trusted roles")
+                roles_response.raise_for_status()
         except ERPNextUserLoginError:
+            raise
+        except ERPNextRoleVerificationError:
             raise
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code in {401, 403}:
@@ -121,18 +128,18 @@ class ERPNextClient:
             raise ERPNextUnavailableError("ERPNext auth request failed") from exc
 
         try:
-            payload = profile_response.json()
+            payload = roles_response.json()
         except ValueError as exc:
-            raise ERPNextUnavailableError("ERPNext returned an invalid user response") from exc
+            raise ERPNextRoleVerificationError("ERPNext returned invalid role data") from exc
 
-        data = payload.get("data")
-        if not isinstance(data, Mapping):
-            raise ERPNextUnavailableError("ERPNext user response does not contain a data object")
+        roles = payload.get("message")
+        if not isinstance(roles, list) or not all(isinstance(role, str) for role in roles):
+            raise ERPNextRoleVerificationError("ERPNext returned invalid role data")
 
         return ERPNextUser(
-            email=str(data.get("email") or user_email),
-            full_name=data.get("full_name") if isinstance(data.get("full_name"), str) else None,
-            roles=self._extract_roles(data.get("roles")),
+            email=str(user_email),
+            full_name=None,
+            roles=roles,
         )
 
     async def list_products(
@@ -143,17 +150,29 @@ class ERPNextClient:
         offset: int = 0,
         include_archived: bool = False,
     ) -> ProductList:
-        item_codes = await self._list_product_codes(q=q, include_archived=include_archived)
-        products: list[Product] = []
-        for item_code in item_codes[offset : offset + limit]:
-            try:
-                products.append(await self.get_product(item_code))
-            except ERPNextProductNotFoundError:
-                continue
+        rows, count = await self._list_product_rows(
+            q=q,
+            limit=limit,
+            offset=offset,
+            include_archived=include_archived,
+        )
+        item_codes = [str(row.get("name") or "") for row in rows if row.get("name")]
+        barcodes = await self._get_item_barcodes(item_codes)
+        prices = await self._get_item_prices(item_codes)
+        products = [
+            self._to_product(
+                row,
+                barcode=barcodes.get(item_code),
+                sale_price=prices.get((item_code, self._selling_price_list)),
+                purchase_price=prices.get((item_code, self._buying_price_list)),
+            )
+            for row in rows
+            if (item_code := str(row.get("name") or ""))
+        ]
 
         return ProductList(
             items=products,
-            count=len(item_codes),
+            count=count,
             limit=limit,
             offset=offset,
         )
@@ -162,7 +181,12 @@ class ERPNextClient:
         item = await self._get_item(item_code)
         sale_price = await self._get_item_price(item_code, self._selling_price_list)
         purchase_price = await self._get_item_price(item_code, self._buying_price_list)
-        return self._to_product(item, sale_price=sale_price, purchase_price=purchase_price)
+        return self._to_product(
+            item,
+            barcode=self._first_barcode(item.get("barcodes")),
+            sale_price=sale_price,
+            purchase_price=purchase_price,
+        )
 
     async def list_product_options(self) -> ProductOptions:
         categories = await self._list_options("Item Group")
@@ -188,29 +212,34 @@ class ERPNextClient:
         if product.barcode is not None:
             payload["barcodes"] = [{"barcode": product.barcode}]
 
-        try:
-            await self._request_json("POST", "/api/resource/Item", json_payload=payload)
-            await self._upsert_item_price(
+        documents = [
+            payload,
+            self._item_price_payload(
                 item_code=product.sku,
                 price_list=self._selling_price_list,
                 price=product.sale_price,
                 buying=False,
-            )
-            if product.purchase_price is not None:
-                await self._upsert_item_price(
+            ),
+        ]
+        if product.purchase_price is not None:
+            documents.append(
+                self._item_price_payload(
                     item_code=product.sku,
                     price_list=self._buying_price_list,
                     price=product.purchase_price,
                     buying=True,
                 )
-        except (ERPNextUnavailableError, ERPNextValidationError):
-            await self._archive_partial_item(product.sku)
-            raise
+            )
+        await self._request_json(
+            "POST",
+            "/api/method/frappe.client.insert_many",
+            json_payload={"docs": documents},
+        )
 
         return await self.get_product(product.sku)
 
     async def update_product(self, item_code: str, product: ProductUpdate) -> Product:
-        await self._get_item(item_code)
+        item = await self._get_item(item_code)
         if product.barcode is not None:
             await self._assert_barcode_available(product.barcode, current_item_code=item_code)
 
@@ -232,27 +261,48 @@ class ERPNextClient:
                 [{"barcode": product.barcode}] if product.barcode is not None else []
             )
 
-        if item_payload:
-            await self._request_json(
-                "PUT",
-                f"/api/resource/Item/{quote(item_code, safe='')}",
-                json_payload=item_payload,
+        price_snapshots: dict[tuple[str, bool], Mapping[str, Any] | None] = {}
+        if "sale_price" in update_fields:
+            price_snapshots[(self._selling_price_list, False)] = (
+                await self._get_item_price_record(item_code, self._selling_price_list)
+            )
+        if "purchase_price" in update_fields:
+            price_snapshots[(self._buying_price_list, True)] = (
+                await self._get_item_price_record(item_code, self._buying_price_list)
             )
 
-        if "sale_price" in update_fields and product.sale_price is not None:
-            await self._upsert_item_price(
+        try:
+            if "sale_price" in update_fields and product.sale_price is not None:
+                await self._upsert_item_price(
+                    item_code=item_code,
+                    price_list=self._selling_price_list,
+                    price=product.sale_price,
+                    buying=False,
+                )
+            if "purchase_price" in update_fields:
+                if product.purchase_price is None:
+                    await self._delete_item_price(item_code, self._buying_price_list)
+                else:
+                    await self._upsert_item_price(
+                        item_code=item_code,
+                        price_list=self._buying_price_list,
+                        price=product.purchase_price,
+                        buying=True,
+                    )
+            if item_payload:
+                await self._request_json(
+                    "PUT",
+                    f"/api/resource/Item/{quote(item_code, safe='')}",
+                    json_payload=item_payload,
+                )
+        except (ERPNextUnavailableError, ERPNextValidationError):
+            await self._rollback_product_update(
                 item_code=item_code,
-                price_list=self._selling_price_list,
-                price=product.sale_price,
-                buying=False,
+                original_item=item,
+                item_fields=set(item_payload),
+                price_snapshots=price_snapshots,
             )
-        if "purchase_price" in update_fields and product.purchase_price is not None:
-            await self._upsert_item_price(
-                item_code=item_code,
-                price_list=self._buying_price_list,
-                price=product.purchase_price,
-                buying=True,
-            )
+            raise
 
         return await self.get_product(item_code)
 
@@ -266,49 +316,57 @@ class ERPNextClient:
             json_payload={"disabled": 1},
         )
 
-    async def _list_product_codes(
+    async def _list_product_rows(
         self,
         *,
         q: str | None,
+        limit: int,
+        offset: int,
         include_archived: bool,
-    ) -> list[str]:
+    ) -> tuple[list[Mapping[str, Any]], int]:
         fields = [
             "name",
             "item_name",
+            "item_group",
+            "brand",
+            "stock_uom",
+            "description",
+            "image",
             "disabled",
         ]
-        params = {
-            "fields": json.dumps(fields),
-            "order_by": "item_name asc",
-            "limit_page_length": "1000",
-        }
+        filters: list[list[Any]] = []
         if not include_archived:
-            params["filters"] = json.dumps([["Item", "disabled", "=", 0]])
+            filters.append(["Item", "disabled", "=", 0])
 
-        payload = await self._request_json("GET", "/api/resource/Item", params=params)
-        rows = payload.get("data")
-        if not isinstance(rows, list):
-            raise ERPNextUnavailableError("ERPNext response does not contain a data list")
+        query = (q or "").strip()
+        if not query:
+            count = await self._count_resource("Item", filters=filters)
+            rows = await self._query_resource(
+                "Item",
+                fields=fields,
+                filters=filters or None,
+                limit=limit,
+                offset=offset,
+                order_by="item_name asc",
+            )
+            return rows, count
 
-        query = (q or "").strip().lower()
-        item_codes: list[str] = []
-        for row in rows:
-            if not isinstance(row, Mapping):
-                continue
-            item_code = str(row.get("name") or "")
-            item_name = str(row.get("item_name") or item_code)
-            if not item_code:
-                continue
-            if query and query not in item_code.lower() and query not in item_name.lower():
-                try:
-                    product = await self.get_product(item_code)
-                except ERPNextProductNotFoundError:
-                    continue
-                barcode = product.barcode or ""
-                if query not in barcode.lower():
-                    continue
-            item_codes.append(item_code)
-        return item_codes
+        barcode_parents = await self._find_barcode_parents(query)
+        or_filters: list[list[Any]] = [
+            ["Item", "name", "like", f"%{query}%"],
+            ["Item", "item_name", "like", f"%{query}%"],
+        ]
+        if barcode_parents:
+            or_filters.append(["Item", "name", "in", barcode_parents])
+
+        matching_rows = await self._query_resource_all(
+            "Item",
+            fields=fields,
+            filters=filters or None,
+            or_filters=or_filters,
+            order_by="item_name asc",
+        )
+        return matching_rows[offset : offset + limit], len(matching_rows)
 
     async def _get_item(self, item_code: str) -> Mapping[str, Any]:
         payload = await self._request_json(
@@ -321,19 +379,73 @@ class ERPNextClient:
         return data
 
     async def _get_item_price(self, item_code: str, price_list: str) -> str | None:
+        row = await self._get_item_price_record(item_code, price_list)
+        if row is None:
+            return None
+        price = row.get("price_list_rate")
+        return self._format_money(price) if price is not None else None
+
+    async def _get_item_price_record(
+        self,
+        item_code: str,
+        price_list: str,
+    ) -> Mapping[str, Any] | None:
         rows = await self._query_resource(
             "Item Price",
-            fields=["name", "price_list_rate", "currency"],
+            fields=["name", "item_code", "price_list", "price_list_rate", "currency"],
             filters=[
                 ["Item Price", "item_code", "=", item_code],
                 ["Item Price", "price_list", "=", price_list],
             ],
             limit=1,
         )
-        if not rows:
-            return None
-        price = rows[0].get("price_list_rate")
-        return self._format_money(price) if price is not None else None
+        return rows[0] if rows else None
+
+    async def _get_item_barcodes(self, item_codes: list[str]) -> dict[str, str]:
+        if not item_codes:
+            return {}
+        rows = await self._query_resource_all(
+            "Item Barcode",
+            fields=["parent", "barcode", "idx"],
+            filters=[["Item Barcode", "parent", "in", item_codes]],
+            order_by="parent asc, idx asc",
+            parent_doctype="Item",
+        )
+        barcodes: dict[str, str] = {}
+        for row in rows:
+            parent = row.get("parent")
+            barcode = row.get("barcode")
+            if isinstance(parent, str) and isinstance(barcode, str):
+                barcodes.setdefault(parent, barcode)
+        return barcodes
+
+    async def _get_item_prices(
+        self,
+        item_codes: list[str],
+    ) -> dict[tuple[str, str], str]:
+        if not item_codes:
+            return {}
+        rows = await self._query_resource_all(
+            "Item Price",
+            fields=["item_code", "price_list", "price_list_rate"],
+            filters=[
+                ["Item Price", "item_code", "in", item_codes],
+                [
+                    "Item Price",
+                    "price_list",
+                    "in",
+                    [self._selling_price_list, self._buying_price_list],
+                ],
+            ],
+        )
+        prices: dict[tuple[str, str], str] = {}
+        for row in rows:
+            item_code = row.get("item_code")
+            price_list = row.get("price_list")
+            price = row.get("price_list_rate")
+            if isinstance(item_code, str) and isinstance(price_list, str) and price is not None:
+                prices.setdefault((item_code, price_list), self._format_money(price))
+        return prices
 
     async def _upsert_item_price(
         self,
@@ -352,16 +464,13 @@ class ERPNextClient:
             ],
             limit=1,
         )
-        payload: dict[str, Any] = {
-            "item_code": item_code,
-            "price_list": price_list,
-            "price_list_rate": price,
-            "currency": self._currency,
-        }
-        if buying:
-            payload["buying"] = 1
-        else:
-            payload["selling"] = 1
+        payload = self._item_price_payload(
+            item_code=item_code,
+            price_list=price_list,
+            price=price,
+            buying=buying,
+        )
+        payload.pop("doctype")
 
         if existing:
             price_name = str(existing[0]["name"])
@@ -375,6 +484,37 @@ class ERPNextClient:
         payload["doctype"] = "Item Price"
         await self._request_json("POST", "/api/resource/Item Price", json_payload=payload)
 
+    def _item_price_payload(
+        self,
+        *,
+        item_code: str,
+        price_list: str,
+        price: str,
+        buying: bool,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "doctype": "Item Price",
+            "item_code": item_code,
+            "price_list": price_list,
+            "price_list_rate": price,
+            "currency": self._currency,
+        }
+        if buying:
+            payload["buying"] = 1
+        else:
+            payload["selling"] = 1
+        return payload
+
+    async def _delete_item_price(self, item_code: str, price_list: str) -> None:
+        existing = await self._get_item_price_record(item_code, price_list)
+        if existing is None:
+            return
+        price_name = str(existing["name"])
+        await self._request_json(
+            "DELETE",
+            f"/api/resource/Item Price/{quote(price_name, safe='')}",
+        )
+
     async def _query_resource(
         self,
         doctype: str,
@@ -382,13 +522,24 @@ class ERPNextClient:
         fields: list[str],
         filters: list[list[Any]] | None = None,
         limit: int = 1000,
+        offset: int = 0,
+        or_filters: list[list[Any]] | None = None,
+        order_by: str | None = None,
+        parent_doctype: str | None = None,
     ) -> list[Mapping[str, Any]]:
         params = {
             "fields": json.dumps(fields),
             "limit_page_length": str(limit),
+            "limit_start": str(offset),
         }
         if filters is not None:
             params["filters"] = json.dumps(filters)
+        if or_filters is not None:
+            params["or_filters"] = json.dumps(or_filters)
+        if order_by is not None:
+            params["order_by"] = order_by
+        if parent_doctype is not None:
+            params["parent"] = parent_doctype
 
         payload = await self._request_json(
             "GET",
@@ -399,6 +550,69 @@ class ERPNextClient:
         if not isinstance(rows, list):
             raise ERPNextUnavailableError(f"ERPNext {doctype} response does not contain data")
         return [row for row in rows if isinstance(row, Mapping)]
+
+    async def _query_resource_all(
+        self,
+        doctype: str,
+        *,
+        fields: list[str],
+        filters: list[list[Any]] | None = None,
+        or_filters: list[list[Any]] | None = None,
+        order_by: str | None = None,
+        parent_doctype: str | None = None,
+    ) -> list[Mapping[str, Any]]:
+        batch_size = 500
+        offset = 0
+        rows: list[Mapping[str, Any]] = []
+        while True:
+            batch = await self._query_resource(
+                doctype,
+                fields=fields,
+                filters=filters,
+                or_filters=or_filters,
+                limit=batch_size,
+                offset=offset,
+                order_by=order_by,
+                parent_doctype=parent_doctype,
+            )
+            rows.extend(batch)
+            if len(batch) < batch_size:
+                return rows
+            offset += batch_size
+
+    async def _count_resource(
+        self,
+        doctype: str,
+        *,
+        filters: list[list[Any]],
+    ) -> int:
+        payload = await self._request_json(
+            "GET",
+            "/api/method/frappe.client.get_count",
+            params={
+                "doctype": doctype,
+                "filters": json.dumps(filters),
+            },
+        )
+        count = payload.get("message")
+        if not isinstance(count, int):
+            raise ERPNextUnavailableError(f"ERPNext {doctype} count is invalid")
+        return count
+
+    async def _find_barcode_parents(self, query: str) -> list[str]:
+        rows = await self._query_resource_all(
+            "Item Barcode",
+            fields=["parent"],
+            filters=[["Item Barcode", "barcode", "like", f"%{query}%"]],
+            parent_doctype="Item",
+        )
+        return sorted(
+            {
+                parent
+                for row in rows
+                if isinstance((parent := row.get("parent")), str) and parent
+            }
+        )
 
     async def _list_options(self, doctype: str) -> list[ProductOption]:
         rows = await self._query_resource(doctype, fields=["name"], limit=1000)
@@ -432,6 +646,7 @@ class ERPNextClient:
             fields=["parent", "barcode"],
             filters=[["Item Barcode", "barcode", "=", barcode]],
             limit=2,
+            parent_doctype="Item",
         )
         for row in rows:
             parent = str(row.get("parent") or "")
@@ -442,20 +657,64 @@ class ERPNextClient:
                     {"barcode": "Штрихкод должен быть уникальным"},
                 )
 
-    async def _archive_partial_item(self, item_code: str) -> None:
+    async def _rollback_product_update(
+        self,
+        *,
+        item_code: str,
+        original_item: Mapping[str, Any],
+        item_fields: set[str],
+        price_snapshots: dict[tuple[str, bool], Mapping[str, Any] | None],
+    ) -> None:
         try:
-            await self._request_json(
-                "PUT",
-                f"/api/resource/Item/{quote(item_code, safe='')}",
-                json_payload={"disabled": 1},
-            )
+            for (price_list, buying), snapshot in price_snapshots.items():
+                if snapshot is None:
+                    await self._delete_item_price(item_code, price_list)
+                    continue
+                price = snapshot.get("price_list_rate")
+                if price is None:
+                    raise ERPNextUnavailableError("Original ERPNext price is invalid")
+                await self._upsert_item_price(
+                    item_code=item_code,
+                    price_list=price_list,
+                    price=str(price),
+                    buying=buying,
+                )
+
+            if item_fields:
+                restore_payload = self._original_item_payload(original_item, item_fields)
+                await self._request_json(
+                    "PUT",
+                    f"/api/resource/Item/{quote(item_code, safe='')}",
+                    json_payload=restore_payload,
+                )
         except (
             ERPNextAuthenticationError,
             ERPNextProductNotFoundError,
             ERPNextUnavailableError,
             ERPNextValidationError,
-        ):
-            return
+        ) as rollback_error:
+            raise ERPNextUnavailableError(
+                "ERPNext product update failed and rollback could not restore the product"
+            ) from rollback_error
+
+    @staticmethod
+    def _original_item_payload(
+        original_item: Mapping[str, Any],
+        fields: set[str],
+    ) -> dict[str, Any]:
+        field_sources = {
+            "item_name": "item_name",
+            "item_group": "item_group",
+            "stock_uom": "stock_uom",
+            "brand": "brand",
+            "description": "description",
+            "barcodes": "barcodes",
+        }
+        return {
+            field: original_item.get(source)
+            for field, source in field_sources.items()
+            if field in fields
+        }
 
     async def _request_json(
         self,
@@ -505,6 +764,7 @@ class ERPNextClient:
         self,
         row: Mapping[str, Any],
         *,
+        barcode: str | None,
         sale_price: str | None,
         purchase_price: str | None,
     ) -> Product:
@@ -513,7 +773,7 @@ class ERPNextClient:
             id=item_code,
             sku=item_code,
             name=str(row.get("item_name") or item_code),
-            barcode=self._first_barcode(row.get("barcodes")),
+            barcode=barcode,
             category=str(row.get("item_group") or ""),
             brand=row.get("brand") or None,
             unit=str(row.get("stock_uom") or ""),

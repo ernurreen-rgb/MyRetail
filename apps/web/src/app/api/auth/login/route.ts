@@ -72,6 +72,9 @@ function loginErrorMessage(status: number) {
   if (status === 503 || status === 504) {
     return "Backend временно недоступен. Попробуйте позже.";
   }
+  if (status === 429) {
+    return "Слишком много попыток входа. Подождите несколько минут и попробуйте снова.";
+  }
 
   return "Не удалось войти. Попробуйте ещё раз.";
 }

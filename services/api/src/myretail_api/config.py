@@ -2,7 +2,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 API_ROOT = Path(__file__).resolve().parents[2]
@@ -13,7 +13,10 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     tenant_slug: str = "myretail"
     auth_secret: SecretStr | None = None
-    auth_token_ttl_seconds: int = 3600
+    auth_token_ttl_seconds: int = Field(default=3600, gt=0, le=86_400)
+    auth_rate_limit_attempts: int = Field(default=5, ge=1, le=100)
+    auth_rate_limit_window_seconds: int = Field(default=300, ge=1, le=86_400)
+    auth_rate_limit_db_path: Path = API_ROOT / ".data" / "login-rate-limit.sqlite3"
     erpnext_base_url: str = "http://myretail.localhost:8080"
     erpnext_api_key: SecretStr | None = None
     erpnext_api_secret: SecretStr | None = None
