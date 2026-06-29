@@ -103,6 +103,10 @@ export function canManageProducts(roles: string[]) {
   return roles.some((role) => role === "Owner" || role === "Admin");
 }
 
+export function canManageStock(roles: string[]) {
+  return roles.some((role) => role === "Owner" || role === "Admin");
+}
+
 function getMessageFromPayload(value: unknown): string | null {
   if (!isRecord(value) || typeof value.message !== "string") {
     return null;
