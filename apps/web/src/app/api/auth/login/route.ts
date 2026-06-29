@@ -2,13 +2,18 @@ import { NextResponse } from "next/server";
 
 import { DEFAULT_TENANT, isLoginResponse, type LoginFormValues } from "@/lib/auth";
 import { getApiBaseUrl } from "@/lib/config";
-import { isSameOriginMutation } from "@/lib/request-security";
+import {
+  getExpectedOrigin,
+  getVerifiedRequestOrigin,
+  isSameOriginMutation,
+} from "@/lib/request-security";
 import { setAuthCookies } from "@/lib/session";
 
 export const dynamic = "force-dynamic";
 const LOGIN_TIMEOUT_MS = 10_000;
 
 type ValidatedLoginValues = LoginFormValues;
+type LoginRequestFormat = "json" | "form" | "unsupported";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -34,15 +39,35 @@ function normalizeLoginValues(value: unknown): ValidatedLoginValues | null {
   };
 }
 
-async function readLoginValues(request: Request): Promise<ValidatedLoginValues | null> {
+function getLoginRequestFormat(request: Request): LoginRequestFormat {
   const contentType = request.headers.get("content-type") ?? "";
 
-  if (!contentType.includes("application/json")) {
-    return null;
+  if (contentType.includes("application/json")) {
+    return "json";
   }
 
+  if (contentType.includes("application/x-www-form-urlencoded")) {
+    return "form";
+  }
+
+  return "unsupported";
+}
+
+async function readLoginValues(
+  request: Request,
+  format: Exclude<LoginRequestFormat, "unsupported">,
+): Promise<ValidatedLoginValues | null> {
   try {
-    return normalizeLoginValues(await request.json());
+    if (format === "json") {
+      return normalizeLoginValues(await request.json());
+    }
+
+    const formData = await request.formData();
+    return normalizeLoginValues({
+      tenant: formData.get("tenant"),
+      email: formData.get("email"),
+      password: formData.get("password"),
+    });
   } catch {
     return null;
   }
@@ -83,6 +108,50 @@ function isTimeoutError(error: unknown) {
   return error instanceof Error && ["AbortError", "TimeoutError"].includes(error.name);
 }
 
+function loginErrorCode(status: number) {
+  if (status === 401 || status === 403) {
+    return "invalid_credentials";
+  }
+
+  if (status === 404) {
+    return "tenant_not_found";
+  }
+
+  if (status === 400 || status === 422) {
+    return "invalid_request";
+  }
+
+  if (status === 429) {
+    return "rate_limited";
+  }
+
+  return "unavailable";
+}
+
+function formRedirect(request: Request, error?: string) {
+  const redirectOrigin =
+    getVerifiedRequestOrigin(request) ?? getExpectedOrigin(request) ?? request.url;
+  const url = new URL(error ? "/login" : "/", redirectOrigin);
+  if (error) {
+    url.searchParams.set("error", error);
+  }
+
+  return NextResponse.redirect(url, 303);
+}
+
+function loginFailureResponse(
+  request: Request,
+  format: Exclude<LoginRequestFormat, "unsupported">,
+  status: number,
+  message: string,
+) {
+  if (format === "form") {
+    return formRedirect(request, loginErrorCode(status));
+  }
+
+  return NextResponse.json({ message }, { status });
+}
+
 export async function POST(request: Request) {
   if (!isSameOriginMutation(request)) {
     return NextResponse.json(
@@ -91,20 +160,22 @@ export async function POST(request: Request) {
     );
   }
 
-  const contentType = request.headers.get("content-type") ?? "";
-  if (!contentType.includes("application/json")) {
+  const format = getLoginRequestFormat(request);
+  if (format === "unsupported") {
     return NextResponse.json(
-      { message: "Поддерживается только JSON-формат запроса." },
+      { message: "Поддерживаются JSON и стандартная HTML-форма." },
       { status: 415 },
     );
   }
 
-  const values = await readLoginValues(request);
+  const values = await readLoginValues(request, format);
 
   if (!values) {
-    return NextResponse.json(
-      { message: "Укажите tenant, email и пароль." },
-      { status: 400 },
+    return loginFailureResponse(
+      request,
+      format,
+      400,
+      "Укажите tenant, email и пароль.",
     );
   }
 
@@ -123,33 +194,40 @@ export async function POST(request: Request) {
     });
   } catch (error) {
     const timedOut = isTimeoutError(error);
-    return NextResponse.json(
-      {
-        message: timedOut
-          ? "Backend не ответил вовремя. Попробуйте ещё раз."
-          : "Backend недоступен. Проверьте, что MyRetail API запущен.",
-      },
-      { status: timedOut ? 504 : 503 },
+    return loginFailureResponse(
+      request,
+      format,
+      timedOut ? 504 : 503,
+      timedOut
+        ? "Backend не ответил вовремя. Попробуйте ещё раз."
+        : "Backend недоступен. Проверьте, что MyRetail API запущен.",
     );
   }
 
   const payload = await readJson(apiResponse);
 
   if (!apiResponse.ok) {
-    return NextResponse.json(
-      { message: loginErrorMessage(apiResponse.status) },
-      { status: apiResponse.status >= 400 && apiResponse.status <= 599 ? apiResponse.status : 502 },
+    const responseStatus =
+      apiResponse.status >= 400 && apiResponse.status <= 599 ? apiResponse.status : 502;
+    return loginFailureResponse(
+      request,
+      format,
+      responseStatus,
+      loginErrorMessage(apiResponse.status),
     );
   }
 
   if (!isLoginResponse(payload)) {
-    return NextResponse.json(
-      { message: "Backend вернул неожиданный формат ответа входа." },
-      { status: 502 },
+    return loginFailureResponse(
+      request,
+      format,
+      502,
+      "Backend вернул неожиданный формат ответа входа.",
     );
   }
 
-  const response = NextResponse.json({ ok: true });
+  const response =
+    format === "form" ? formRedirect(request) : NextResponse.json({ ok: true });
   setAuthCookies(response, payload);
 
   return response;

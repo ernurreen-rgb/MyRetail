@@ -1,6 +1,10 @@
 import { NextResponse } from "next/server";
 
-import { getExpectedOrigin, isSameOriginMutation } from "@/lib/request-security";
+import {
+  getExpectedOrigin,
+  getVerifiedRequestOrigin,
+  isSameOriginMutation,
+} from "@/lib/request-security";
 import { clearAuthCookies } from "@/lib/session";
 
 export const dynamic = "force-dynamic";
@@ -19,8 +23,10 @@ export async function POST(request: Request) {
     );
   }
 
+  const redirectOrigin =
+    getVerifiedRequestOrigin(request) ?? getExpectedOrigin(request) ?? request.url;
   const response = wantsHtmlRedirect(request)
-    ? NextResponse.redirect(new URL("/login", getExpectedOrigin(request) ?? request.url), {
+    ? NextResponse.redirect(new URL("/login", redirectOrigin), {
         status: 303,
       })
     : NextResponse.json({ ok: true });

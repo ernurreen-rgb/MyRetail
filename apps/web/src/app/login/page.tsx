@@ -12,12 +12,30 @@ export const metadata: Metadata = {
   description: "Вход в защищённый интерфейс MyRetail.",
 };
 
-export default async function LoginPage() {
+const LOGIN_ERROR_MESSAGES: Record<string, string> = {
+  invalid_credentials: "Неверный email или пароль.",
+  tenant_not_found: "Тенант не найден. Проверьте код компании.",
+  invalid_request: "Укажите tenant, email и пароль.",
+  rate_limited: "Слишком много попыток входа. Подождите несколько минут и попробуйте снова.",
+  unavailable: "Сервис входа временно недоступен. Попробуйте позже.",
+};
+
+type LoginPageProps = {
+  searchParams: Promise<{
+    error?: string | string[];
+  }>;
+};
+
+export default async function LoginPage({ searchParams }: LoginPageProps) {
   const session = await getAuthSession();
 
   if (session) {
     redirect("/");
   }
+
+  const params = await searchParams;
+  const errorCode = Array.isArray(params.error) ? params.error[0] : params.error;
+  const initialError = errorCode ? LOGIN_ERROR_MESSAGES[errorCode] ?? null : null;
 
   return (
     <main className="flex min-h-screen flex-1 items-center justify-center px-5 py-8 sm:px-8">
@@ -55,7 +73,7 @@ export default async function LoginPage() {
             </p>
           </div>
 
-          <LoginForm />
+          <LoginForm initialError={initialError} />
         </section>
       </div>
     </main>
