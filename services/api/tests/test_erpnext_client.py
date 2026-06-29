@@ -695,8 +695,9 @@ async def test_stock_movement_checks_available_quantity_with_reserved_stock(
         )
 
     assert exc_info.value.code == "INSUFFICIENT_STOCK"
+    assert exc_info.value.message == "Недостаточно доступного остатка."
     assert set(exc_info.value.fields) == {"lines.0.quantity"}
-    assert exc_info.value.fields["lines.0.quantity"].endswith("8.000")
+    assert exc_info.value.fields["lines.0.quantity"] == "Доступно 8.000"
     assert [request.method for request in requests] == ["GET"]
 
 
@@ -733,8 +734,9 @@ async def test_adjustment_decrease_checks_available_quantity_with_reserved_stock
         )
 
     assert exc_info.value.code == "INSUFFICIENT_STOCK"
+    assert exc_info.value.message == "Недостаточно доступного остатка."
     assert set(exc_info.value.fields) == {"lines.0.counted_quantity"}
-    assert exc_info.value.fields["lines.0.counted_quantity"].endswith("8.000")
+    assert exc_info.value.fields["lines.0.counted_quantity"] == "Доступно 8.000"
     assert [request.method for request in requests] == ["GET"]
 
 
@@ -759,7 +761,7 @@ async def test_adjustment_rejects_mixed_increase_and_decrease_directions() -> No
 
     client = ERPNextClient(make_settings(), transport=httpx.MockTransport(handler))
 
-    with pytest.raises(ERPNextValidationError):
+    with pytest.raises(ERPNextValidationError) as exc_info:
         await client.create_stock_movement(
             StockMovementCreate(
                 type="adjustment",
@@ -781,6 +783,14 @@ async def test_adjustment_rejects_mixed_increase_and_decrease_directions() -> No
             actor=AuthenticatedUser(email="owner@example.com", full_name="Owner", roles=["Owner"]),
         )
 
+    assert exc_info.value.message == (
+        "Корректировка не должна смешивать увеличение и уменьшение остатка"
+    )
+    assert exc_info.value.fields == {
+        "lines.1.counted_quantity": (
+            "Оформите увеличение и уменьшение отдельными документами"
+        )
+    }
     assert post_attempted is False
 
 

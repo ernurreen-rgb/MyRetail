@@ -1128,13 +1128,12 @@ class ERPNextClient:
                 elif adjustment_direction != direction:
                     raise ERPNextValidationError(
                         (
-                            "РљРѕСЂСЂРµРєС‚РёСЂРѕРІРєР° РЅРµ РґРѕР»Р¶РЅР° СЃРјРµС€РёРІР°С‚СЊ "
-                            "СѓРІРµР»РёС‡РµРЅРёРµ Рё СѓРјРµРЅСЊС€РµРЅРёРµ РѕСЃС‚Р°С‚РєР°"
+                            "Корректировка не должна смешивать "
+                            "увеличение и уменьшение остатка"
                         ),
                         {
                             f"lines.{index}.counted_quantity": (
-                                "РћС„РѕСЂРјРёС‚Рµ СѓРІРµР»РёС‡РµРЅРёРµ Рё СѓРјРµРЅСЊС€РµРЅРёРµ "
-                                "РѕС‚РґРµР»СЊРЅС‹РјРё РґРѕРєСѓРјРµРЅС‚Р°РјРё"
+                                "Оформите увеличение и уменьшение отдельными документами"
                             )
                         },
                     )
@@ -1608,11 +1607,9 @@ class ERPNextClient:
         if requested > available:
             raise ERPNextConflictError(
                 "INSUFFICIENT_STOCK",
-                "РќРµРґРѕСЃС‚Р°С‚РѕС‡РЅРѕ РґРѕСЃС‚СѓРїРЅРѕРіРѕ РѕСЃС‚Р°С‚РєР°.",
+                "Недостаточно доступного остатка.",
                 {
-                    f"lines.{index}.{field_name}": (
-                        f"Р”РѕСЃС‚СѓРїРЅРѕ {format_quantity(available)}"
-                    )
+                    f"lines.{index}.{field_name}": f"Доступно {format_quantity(available)}"
                 },
             )
 

@@ -287,7 +287,7 @@ def _validate_movement_request(movement: StockMovementCreate) -> None:
                 raise _validation_error(
                     {
                         f"lines.{index}.counted_quantity": (
-                            "РЈРєР°Р¶РёС‚Рµ РЅРѕРІРѕРµ Р·РЅР°С‡РµРЅРёРµ РѕСЃС‚Р°С‚РєР°"
+                            "Укажите новое значение остатка"
                         )
                     }
                 )
@@ -297,9 +297,8 @@ def _validate_movement_request(movement: StockMovementCreate) -> None:
                 raise _validation_error(
                     {
                         f"lines.{index}.counted_quantity": (
-                            "РќРµ СЃРјРµС€РёРІР°Р№С‚Рµ СѓРІРµР»РёС‡РµРЅРёРµ "
-                            "Рё СѓРјРµРЅСЊС€РµРЅРёРµ "
-                            "РѕСЃС‚Р°С‚РєР° РІ РѕРґРЅРѕР№ РєРѕСЂСЂРµРєС‚РёСЂРѕРІРєРµ"
+                            "Не смешивайте увеличение и уменьшение "
+                            "остатка в одной корректировке"
                         )
                     }
                 )
@@ -396,7 +395,7 @@ def _begin_idempotency(
         raise _api_error(
             status.HTTP_409_CONFLICT,
             "IDEMPOTENCY_CONFLICT",
-            "Idempotency-Key СѓР¶Рµ РёСЃРїРѕР»СЊР·РѕРІР°РЅ РґР»СЏ РґСЂСѓРіРѕРіРѕ Р·Р°РїСЂРѕСЃР°",
+            "Idempotency-Key уже использован для другого запроса",
         ) from exc
 
 
@@ -418,7 +417,7 @@ async def _wait_idempotency(
         raise _api_error(
             status.HTTP_409_CONFLICT,
             "IDEMPOTENCY_CONFLICT",
-            "Idempotency-Key СѓР¶Рµ РёСЃРїРѕР»СЊР·РѕРІР°РЅ РґР»СЏ РґСЂСѓРіРѕРіРѕ Р·Р°РїСЂРѕСЃР°",
+            "Idempotency-Key уже использован для другого запроса",
         ) from exc
 
 

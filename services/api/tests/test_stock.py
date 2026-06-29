@@ -490,6 +490,9 @@ async def test_stock_idempotency_key_rejects_different_body(tmp_path: Path) -> N
     assert first_response.status_code == 201
     assert conflict_response.status_code == 409
     assert conflict_response.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert conflict_response.json()["error"]["message"] == (
+        "Idempotency-Key уже использован для другого запроса"
+    )
 
 
 @pytest.mark.anyio
@@ -605,7 +608,11 @@ async def test_stock_rejects_invalid_lines_and_transfer_rules(tmp_path: Path) ->
     assert duplicate_response.json()["error"]["fields"]["lines.0.product_id"]
     assert transfer_response.status_code == 422
     assert mixed_adjustment_response.status_code == 422
-    assert "lines.1.counted_quantity" in mixed_adjustment_response.json()["error"]["fields"]
+    assert mixed_adjustment_response.json()["error"]["fields"] == {
+        "lines.1.counted_quantity": (
+            "Не смешивайте увеличение и уменьшение остатка в одной корректировке"
+        )
+    }
     assert transfer_response.json()["error"]["fields"] == {
         "destination_warehouse_id": "Склад назначения должен отличаться от источника"
     }
