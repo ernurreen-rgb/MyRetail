@@ -808,16 +808,7 @@ export function StockManager({
                             <div className="flex flex-wrap gap-2">
                               <button
                                 type="button"
-                                onMouseDown={(event) => {
-                                  event.preventDefault();
-                                  void handleSelectBalance(balance);
-                                }}
-                                onKeyDown={(event) => {
-                                  if (event.key === "Enter" || event.key === " ") {
-                                    event.preventDefault();
-                                    void handleSelectBalance(balance);
-                                  }
-                                }}
+                                onClick={() => void handleSelectBalance(balance)}
                                 className={secondaryButtonClass}
                               >
                                 Открыть
@@ -825,16 +816,7 @@ export function StockManager({
                               {canManage ? (
                                 <button
                                   type="button"
-                                  onMouseDown={(event) => {
-                                    event.preventDefault();
-                                    openMovementForm("receipt", balance);
-                                  }}
-                                  onKeyDown={(event) => {
-                                    if (event.key === "Enter" || event.key === " ") {
-                                      event.preventDefault();
-                                      openMovementForm("receipt", balance);
-                                    }
-                                  }}
+                                  onClick={() => openMovementForm("receipt", balance)}
                                   className={secondaryButtonClass}
                                   disabled={isLoadingOptions}
                                 >
@@ -1171,26 +1153,28 @@ export function StockManager({
           </div>
 
           <div className="mb-4 flex flex-wrap gap-2">
-            {(Object.keys(movementTypeLabels) as MovementType[]).map((type) => (
-              <button
-                key={type}
-                type="button"
-                onClick={() => openMovementForm(type)}
-                className={
-                  formValues.type === type && isFormOpen
-                    ? primaryButtonClass
-                    : secondaryButtonClass
-                }
-                disabled={type === "transfer" ? !canTransfer : activeWarehouses.length === 0}
-              >
-                {movementTypeLabels[type]}
-              </button>
-            ))}
+            {(Object.keys(movementTypeLabels) as MovementType[])
+              .filter((type) => type !== "transfer" || canTransfer)
+              .map((type) => (
+                <button
+                  key={type}
+                  type="button"
+                  onClick={() => openMovementForm(type)}
+                  className={
+                    formValues.type === type && isFormOpen
+                      ? primaryButtonClass
+                      : secondaryButtonClass
+                  }
+                  disabled={activeWarehouses.length === 0}
+                >
+                  {movementTypeLabels[type]}
+                </button>
+              ))}
           </div>
 
-          {!canTransfer ? (
+          {!isLoadingOptions && options && !canTransfer ? (
             <div className="mb-4 rounded-xl border border-[var(--warning)] bg-[var(--warning-soft)] px-4 py-3 text-sm leading-6 text-[var(--warning)]">
-              Перемещение скрыто от отправки: нужен минимум второй активный склад.
+              Перемещение недоступно: нужен минимум второй активный склад.
             </div>
           ) : null}
 
@@ -1206,11 +1190,13 @@ export function StockManager({
                   className={inputClass}
                   disabled={isSaving}
                 >
-                  {(Object.keys(movementTypeLabels) as MovementType[]).map((type) => (
-                    <option key={type} value={type} disabled={type === "transfer" && !canTransfer}>
-                      {movementTypeLabels[type]}
-                    </option>
-                  ))}
+                  {(Object.keys(movementTypeLabels) as MovementType[])
+                    .filter((type) => type !== "transfer" || canTransfer)
+                    .map((type) => (
+                      <option key={type} value={type}>
+                        {movementTypeLabels[type]}
+                      </option>
+                    ))}
                 </select>
               </label>
 

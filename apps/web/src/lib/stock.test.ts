@@ -1,8 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { canManageStock } from "@/lib/auth";
 import {
   emptyStockMovementFormValues,
+  createIdempotencyKey,
   isStockBalanceList,
   isStockMovement,
   isStockMovementCancelResponse,
@@ -97,6 +98,17 @@ describe("stock permissions", () => {
 });
 
 describe("stock payloads", () => {
+  it("creates a valid UUID when randomUUID is unavailable", () => {
+    vi.stubGlobal("crypto", {
+      getRandomValues(bytes: Uint8Array) {
+        bytes.fill(0xab);
+        return bytes;
+      },
+    });
+
+    expect(createIdempotencyKey()).toBe("abababab-abab-4bab-abab-abababababab");
+  });
+
   it("normalizes quantity text without converting through Number", () => {
     const payload = toStockMovementPayload(
       emptyStockMovementFormValues({
