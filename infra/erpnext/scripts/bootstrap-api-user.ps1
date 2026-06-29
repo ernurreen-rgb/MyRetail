@@ -93,11 +93,24 @@ catch {
 $permissionFields = [Uri]::EscapeDataString('["name"]')
 $permissionDefinitions = @(
     @{
+        parent = "Warehouse"
+        read = 1
+        select = 1
+    },
+    @{
         parent = "Item"
         read = 1
         select = 1
         create = 1
         write = 1
+    },
+    @{
+        parent = "Item Barcode"
+        read = 1
+        select = 1
+        create = 1
+        write = 1
+        delete = 1
     },
     @{
         parent = "Item Price"
@@ -106,6 +119,32 @@ $permissionDefinitions = @(
         create = 1
         write = 1
         delete = 1
+    },
+    @{
+        parent = "Bin"
+        read = 1
+        select = 1
+    },
+    @{
+        parent = "Stock Entry"
+        read = 1
+        select = 1
+        create = 1
+        write = 1
+        submit = 1
+    },
+    @{
+        parent = "Stock Entry Detail"
+        read = 1
+        select = 1
+        create = 1
+        write = 1
+    },
+    @{
+        parent = "Comment"
+        read = 1
+        select = 1
+        create = 1
     }
 )
 
@@ -130,7 +169,7 @@ foreach ($definition in $permissionDefinitions) {
         write = 0
         delete = 0
     }
-    foreach ($permissionFlag in @("create", "write", "delete")) {
+    foreach ($permissionFlag in @("create", "write", "delete", "submit")) {
         if ($definition.ContainsKey($permissionFlag)) {
             $permissionBody[$permissionFlag] = $definition[$permissionFlag]
         }

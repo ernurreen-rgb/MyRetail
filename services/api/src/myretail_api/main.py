@@ -9,6 +9,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from myretail_api.routers.auth import router as auth_router
 from myretail_api.routers.health import router as health_router
 from myretail_api.routers.products import router as products_router
+from myretail_api.routers.stock import router as stock_router
 
 
 def create_app() -> FastAPI:
@@ -22,6 +23,7 @@ def create_app() -> FastAPI:
     app.include_router(auth_router)
     app.include_router(health_router)
     app.include_router(products_router)
+    app.include_router(stock_router)
     return app
 
 
@@ -29,7 +31,7 @@ async def product_http_exception_handler(
     request: Request,
     exc: StarletteHTTPException,
 ) -> Response:
-    if not request.url.path.startswith("/products"):
+    if not _uses_api_error_contract(request.url.path):
         return await http_exception_handler(request, exc)
 
     detail = exc.detail
@@ -39,6 +41,8 @@ async def product_http_exception_handler(
             "message": str(detail["message"]),
             "fields": detail.get("fields") if isinstance(detail.get("fields"), dict) else {},
         }
+    elif request.url.path.startswith("/stock"):
+        error = _default_stock_error(exc.status_code)
     else:
         error = _default_product_error(exc.status_code)
 
@@ -53,7 +57,7 @@ async def product_validation_exception_handler(
     request: Request,
     exc: RequestValidationError,
 ) -> Response:
-    if not request.url.path.startswith("/products"):
+    if not _uses_api_error_contract(request.url.path):
         return await request_validation_exception_handler(request, exc)
 
     fields: dict[str, str] = {}
@@ -71,11 +75,21 @@ async def product_validation_exception_handler(
         content={
             "error": {
                 "code": "VALIDATION_ERROR",
-                "message": "Проверьте поля товара",
+                "message": _validation_message(request.url.path),
                 "fields": fields,
             }
         },
     )
+
+
+def _uses_api_error_contract(path: str) -> bool:
+    return path.startswith("/products") or path.startswith("/stock")
+
+
+def _validation_message(path: str) -> str:
+    if path.startswith("/stock"):
+        return "Проверьте поля складской операции"
+    return "Проверьте поля товара"
 
 
 def _default_product_error(status_code: int) -> dict[str, Any]:
@@ -93,6 +107,26 @@ def _default_product_error(status_code: int) -> dict[str, Any]:
         }
     return {
         "code": "REQUEST_ERROR",
+        "message": "Запрос не может быть обработан",
+        "fields": {},
+    }
+
+
+def _default_stock_error(status_code: int) -> dict[str, Any]:
+    if status_code == status.HTTP_401_UNAUTHORIZED:
+        return {
+            "code": "AUTH_REQUIRED",
+            "message": "Нужно войти в систему",
+            "fields": {},
+        }
+    if status_code == status.HTTP_403_FORBIDDEN:
+        return {
+            "code": "FORBIDDEN",
+            "message": "Недостаточно прав или неверный контекст тенанта",
+            "fields": {},
+        }
+    return {
+        "code": "INVALID_REQUEST",
         "message": "Запрос не может быть обработан",
         "fields": {},
     }
