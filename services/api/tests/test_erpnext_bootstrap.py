@@ -30,16 +30,23 @@ def test_bootstrap_api_user_grants_minimal_stock_permissions() -> None:
     assert '"submit"' in script
 
 
-def test_stock_qa_data_script_seeds_item_bin_and_stock_entry() -> None:
+def test_stock_qa_data_scripts_seed_balances_and_reservation() -> None:
     root = Path(__file__).resolve().parents[3]
-    script = (root / "infra/erpnext/scripts/setup-stock-qa-data.ps1").read_text(
+    scripts_dir = root / "infra/erpnext/scripts"
+    wrapper = (scripts_dir / "setup-stock-qa-data.ps1").read_text(
+        encoding="utf-8"
+    )
+    implementation = (scripts_dir / "setup-stock-qa-data.py").read_text(
         encoding="utf-8"
     )
 
+    assert "setup-stock-qa-data.py" in wrapper
+    assert "--env-file" in wrapper
+
     for item_code in ["QA-MILK-001", "QA-BREAD-001", "QA-CHEESE-001", "QA-ZERO-001"]:
-        assert item_code in script
-    assert "Bin" in script
-    assert "Stock%20Entry" in script
-    assert "Sales%20Order" in script
-    assert "MYRETAIL-QA-RESERVATION" in script
-    assert "Material Receipt" in script
+        assert item_code in implementation
+    assert '"Bin"' in implementation
+    assert '"Stock Reconciliation"' in implementation
+    assert '"Sales Order"' in implementation
+    assert "MYRETAIL-QA-RESERVATION" in implementation
+    assert '"DELETE"' not in implementation

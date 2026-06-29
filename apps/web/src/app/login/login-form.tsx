@@ -7,11 +7,15 @@ import { DEFAULT_TENANT, login } from "@/lib/auth";
 const inputClass =
   "mt-2 w-full rounded-xl border border-[var(--border)] bg-[var(--surface)] px-4 py-3 text-base outline-none transition focus:border-[var(--accent)] focus:ring-4 focus:ring-[var(--accent-soft)] disabled:cursor-not-allowed disabled:opacity-70";
 
-export function LoginForm() {
+type LoginFormProps = {
+  initialError?: string | null;
+};
+
+export function LoginForm({ initialError = null }: LoginFormProps) {
   const [tenant, setTenant] = useState(DEFAULT_TENANT);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(initialError);
   const [isLoading, setIsLoading] = useState(false);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
