@@ -11,6 +11,7 @@ from myretail_api.clients.erpnext import (
     ERPNextRoleVerificationError,
     ERPNextUnavailableError,
     ERPNextUserLoginError,
+    ERPNextValidationError,
 )
 from myretail_api.config import Settings
 from myretail_api.models.auth import AuthenticatedUser
@@ -584,8 +585,10 @@ async def test_list_stock_movements_filters_receipts_by_destination_warehouse() 
                             "remarks": json.dumps(metadata, separators=(",", ":")),
                         }
                     ]
-                },
-            )
+                    },
+                )
+        if request.url.path == "/api/resource/Comment":
+            return httpx.Response(200, json={"data": []})
         return httpx.Response(404)
 
     client = ERPNextClient(make_settings(), transport=httpx.MockTransport(handler))
@@ -659,9 +662,132 @@ async def test_create_stock_movement_posts_stock_entry_payload() -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("movement_type", ["write_off", "transfer"])
+async def test_stock_movement_checks_available_quantity_with_reserved_stock(
+    movement_type: str,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/api/resource/Bin":
+            return httpx.Response(
+                200,
+                json={"data": [{"actual_qty": "10.000", "reserved_qty": "2.000"}]},
+            )
+        if request.url.path in {"/api/resource/Stock%20Entry", "/api/resource/Stock Entry"}:
+            return httpx.Response(200, json={"data": {"name": "MAT-STE-2026-00001"}})
+        return httpx.Response(404)
+
+    client = ERPNextClient(make_settings(), transport=httpx.MockTransport(handler))
+    payload = {
+        "type": movement_type,
+        "warehouse_id": "Stores - MR",
+        "reason_code": "damage" if movement_type == "write_off" else None,
+        "destination_warehouse_id": "Reserve - MR" if movement_type == "transfer" else None,
+        "lines": [{"product_id": "SKU-001", "quantity": "9.000"}],
+    }
+
+    with pytest.raises(ERPNextConflictError) as exc_info:
+        await client.create_stock_movement(
+            StockMovementCreate(**payload),
+            actor=AuthenticatedUser(email="owner@example.com", full_name="Owner", roles=["Owner"]),
+        )
+
+    assert exc_info.value.code == "INSUFFICIENT_STOCK"
+    assert set(exc_info.value.fields) == {"lines.0.quantity"}
+    assert exc_info.value.fields["lines.0.quantity"].endswith("8.000")
+    assert [request.method for request in requests] == ["GET"]
+
+
+@pytest.mark.anyio
+async def test_adjustment_decrease_checks_available_quantity_with_reserved_stock() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/api/resource/Bin":
+            return httpx.Response(
+                200,
+                json={"data": [{"actual_qty": "10.000", "reserved_qty": "2.000"}]},
+            )
+        return httpx.Response(404)
+
+    client = ERPNextClient(make_settings(), transport=httpx.MockTransport(handler))
+
+    with pytest.raises(ERPNextConflictError) as exc_info:
+        await client.create_stock_movement(
+            StockMovementCreate(
+                type="adjustment",
+                warehouse_id="Stores - MR",
+                reason_code="manual_count",
+                lines=[
+                    {
+                        "product_id": "SKU-001",
+                        "expected_quantity": "10.000",
+                        "counted_quantity": "1.000",
+                    }
+                ],
+            ),
+            actor=AuthenticatedUser(email="owner@example.com", full_name="Owner", roles=["Owner"]),
+        )
+
+    assert exc_info.value.code == "INSUFFICIENT_STOCK"
+    assert set(exc_info.value.fields) == {"lines.0.counted_quantity"}
+    assert exc_info.value.fields["lines.0.counted_quantity"].endswith("8.000")
+    assert [request.method for request in requests] == ["GET"]
+
+
+@pytest.mark.anyio
+async def test_adjustment_rejects_mixed_increase_and_decrease_directions() -> None:
+    post_attempted = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal post_attempted
+        if request.url.path == "/api/resource/Bin":
+            filters = json.loads(request.url.params["filters"])
+            item_code = filters[0][3]
+            actual = "10.000" if item_code == "SKU-001" else "5.000"
+            return httpx.Response(
+                200,
+                json={"data": [{"actual_qty": actual, "reserved_qty": "0.000"}]},
+            )
+        if request.url.path in {"/api/resource/Stock%20Entry", "/api/resource/Stock Entry"}:
+            post_attempted = True
+            return httpx.Response(200, json={"data": {"name": "MAT-STE-2026-00001"}})
+        return httpx.Response(404)
+
+    client = ERPNextClient(make_settings(), transport=httpx.MockTransport(handler))
+
+    with pytest.raises(ERPNextValidationError):
+        await client.create_stock_movement(
+            StockMovementCreate(
+                type="adjustment",
+                warehouse_id="Stores - MR",
+                reason_code="manual_count",
+                lines=[
+                    {
+                        "product_id": "SKU-001",
+                        "expected_quantity": "10.000",
+                        "counted_quantity": "11.000",
+                    },
+                    {
+                        "product_id": "SKU-002",
+                        "expected_quantity": "5.000",
+                        "counted_quantity": "4.000",
+                    },
+                ],
+            ),
+            actor=AuthenticatedUser(email="owner@example.com", full_name="Owner", roles=["Owner"]),
+        )
+
+    assert post_attempted is False
+
+
+@pytest.mark.anyio
 async def test_cancel_stock_movement_persists_status_and_blocks_repeat_cancel() -> None:
-    persisted_remarks: str | None = None
     reversal_posts = 0
+    cancellation_events: list[str] = []
     original_metadata = {
         "myretail": {
             "type": "receipt",
@@ -684,40 +810,62 @@ async def test_cancel_stock_movement_persists_status_and_blocks_repeat_cancel() 
     }
 
     def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal persisted_remarks, reversal_posts
+        nonlocal reversal_posts
         if request.url.path in {
             "/api/resource/Stock%20Entry/MAT-STE-2026-00001",
             "/api/resource/Stock Entry/MAT-STE-2026-00001",
-        }:
+        } and request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "name": "MAT-STE-2026-00001",
+                        "stock_entry_type": "Material Receipt",
+                        "docstatus": 1,
+                        "from_warehouse": None,
+                        "to_warehouse": "Stores - MR",
+                        "owner": "owner@example.com",
+                        "modified": "2026-06-29T08:00:00Z",
+                        "remarks": json.dumps(original_metadata, separators=(",", ":")),
+                    }
+                },
+            )
+        if request.url.path == "/api/resource/Comment":
             if request.method == "GET":
                 return httpx.Response(
                     200,
                     json={
-                        "data": {
-                            "name": "MAT-STE-2026-00001",
-                            "stock_entry_type": "Material Receipt",
-                            "docstatus": 1,
-                            "from_warehouse": None,
-                            "to_warehouse": "Stores - MR",
-                            "owner": "owner@example.com",
-                            "modified": "2026-06-29T08:00:00Z",
-                            "remarks": persisted_remarks
-                            or json.dumps(original_metadata, separators=(",", ":")),
-                        }
+                        "data": [
+                            {
+                                "reference_name": "MAT-STE-2026-00001",
+                                "content": content,
+                                "creation": f"2026-06-29 08:00:0{index}",
+                            }
+                            for index, content in enumerate(cancellation_events, start=1)
+                        ]
                     },
                 )
-            if request.method == "PUT":
-                persisted_remarks = json.loads(request.content)["remarks"]
-                metadata = json.loads(persisted_remarks)["myretail"]
+            payload = json.loads(request.content)
+            metadata = json.loads(payload["content"])["myretail_cancellation"]
+            cancellation_events.append(payload["content"])
+            if metadata["status"] == "cancellation_pending":
+                assert "reversal_movement_id" not in metadata
+            else:
                 assert metadata["status"] == "cancelled"
                 assert metadata["reversal_movement_id"] == "MAT-STE-2026-00002"
                 assert metadata["cancelled_by"] == {
                     "email": "owner@example.com",
                     "full_name": "Owner",
                 }
-                return httpx.Response(200, json={"data": {}})
+            return httpx.Response(
+                200,
+                json={"data": {"name": f"COMMENT-{len(cancellation_events)}"}},
+            )
         if request.url.path == "/api/resource/Bin":
-            return httpx.Response(200, json={"data": [{"actual_qty": "5.000"}]})
+            return httpx.Response(
+                200,
+                json={"data": [{"actual_qty": "5.000", "reserved_qty": "0.000"}]},
+            )
         if request.url.path in {"/api/resource/Stock%20Entry", "/api/resource/Stock Entry"}:
             reversal_posts += 1
             payload = json.loads(request.content)
@@ -736,7 +884,10 @@ async def test_cancel_stock_movement_persists_status_and_blocks_repeat_cancel() 
 
     assert response.movement.status == "cancelled"
     assert response.movement.reversal_movement_id == "MAT-STE-2026-00002"
-    assert persisted_remarks is not None
+    assert [
+        json.loads(content)["myretail_cancellation"]["status"]
+        for content in cancellation_events
+    ] == ["cancellation_pending", "cancelled"]
     with pytest.raises(ERPNextConflictError):
         await client.cancel_stock_movement(
             "MAT-STE-2026-00001",
@@ -744,6 +895,105 @@ async def test_cancel_stock_movement_persists_status_and_blocks_repeat_cancel() 
             actor=actor,
         )
     assert reversal_posts == 1
+
+
+@pytest.mark.anyio
+async def test_cancel_stock_movement_blocks_repeat_when_final_mark_fails() -> None:
+    cancellation_events: list[str] = []
+    reversal_posts = 0
+    comment_post_calls = 0
+    original_metadata = {
+        "myretail": {
+            "type": "receipt",
+            "status": "posted",
+            "warehouse_id": "Stores - MR",
+            "destination_warehouse_id": None,
+            "reason_code": None,
+            "comment": "Delivery",
+            "created_by": {"email": "owner@example.com", "full_name": "Owner"},
+            "created_at": "2026-06-29T08:00:00Z",
+            "lines": [
+                {
+                    "product_id": "SKU-001",
+                    "quantity": "2.000",
+                    "before_quantity": "0.000",
+                    "after_quantity": "2.000",
+                }
+            ],
+        }
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal reversal_posts, comment_post_calls
+        if request.url.path in {
+            "/api/resource/Stock%20Entry/MAT-STE-2026-00001",
+            "/api/resource/Stock Entry/MAT-STE-2026-00001",
+        } and request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "name": "MAT-STE-2026-00001",
+                        "stock_entry_type": "Material Receipt",
+                        "docstatus": 1,
+                        "to_warehouse": "Stores - MR",
+                        "owner": "owner@example.com",
+                        "modified": "2026-06-29T08:00:00Z",
+                        "remarks": json.dumps(original_metadata, separators=(",", ":")),
+                    }
+                },
+            )
+        if request.url.path == "/api/resource/Comment":
+            if request.method == "GET":
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            {
+                                "reference_name": "MAT-STE-2026-00001",
+                                "content": content,
+                                "creation": f"2026-06-29 08:00:0{index}",
+                            }
+                            for index, content in enumerate(cancellation_events, start=1)
+                        ]
+                    },
+                )
+            comment_post_calls += 1
+            payload = json.loads(request.content)
+            metadata = json.loads(payload["content"])["myretail_cancellation"]
+            if metadata["status"] == "cancellation_pending":
+                cancellation_events.append(payload["content"])
+                return httpx.Response(200, json={"data": {"name": "COMMENT-1"}})
+            if metadata["status"] == "cancelled":
+                return httpx.Response(503, json={"message": "temporary failure"})
+        if request.url.path == "/api/resource/Bin":
+            return httpx.Response(
+                200,
+                json={"data": [{"actual_qty": "5.000", "reserved_qty": "0.000"}]},
+            )
+        if request.url.path in {"/api/resource/Stock%20Entry", "/api/resource/Stock Entry"}:
+            reversal_posts += 1
+            return httpx.Response(200, json={"data": {"name": "MAT-STE-2026-00002"}})
+        return httpx.Response(404)
+
+    client = ERPNextClient(make_settings(), transport=httpx.MockTransport(handler))
+    actor = AuthenticatedUser(email="owner@example.com", full_name="Owner", roles=["Owner"])
+
+    with pytest.raises(ERPNextUnavailableError):
+        await client.cancel_stock_movement(
+            "MAT-STE-2026-00001",
+            StockMovementCancelRequest(reason="Wrong delivery"),
+            actor=actor,
+        )
+
+    with pytest.raises(ERPNextConflictError):
+        await client.cancel_stock_movement(
+            "MAT-STE-2026-00001",
+            StockMovementCancelRequest(reason="Repeat"),
+            actor=actor,
+        )
+    assert reversal_posts == 1
+    assert comment_post_calls == 2
 
 
 @pytest.mark.anyio

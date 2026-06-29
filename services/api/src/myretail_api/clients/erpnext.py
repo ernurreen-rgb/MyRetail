@@ -104,6 +104,16 @@ class ERPNextUser:
     roles: list[str]
 
 
+@dataclass(frozen=True)
+class StockQuantities:
+    actual: Decimal
+    reserved: Decimal
+
+    @property
+    def available(self) -> Decimal:
+        return self.actual - self.reserved
+
+
 class ERPNextClient:
     def __init__(
         self,
@@ -464,11 +474,22 @@ class ERPNextClient:
             filters.append(["Stock Entry", "posting_date", ">=", date_from.isoformat()])
         if date_to is not None:
             filters.append(["Stock Entry", "posting_date", "<=", date_to.isoformat()])
+        cancelled_ids: list[str] = []
+        if status in {"posted", "cancelled"}:
+            all_cancellations = await self._get_stock_movement_cancellations()
+            cancelled_ids = [
+                movement_id
+                for movement_id, cancellation in all_cancellations.items()
+                if self._is_cancellation_status(cancellation)
+            ]
         if status == "posted":
             filters.append(["Stock Entry", "docstatus", "=", 1])
-            filters.append(["Stock Entry", "remarks", "not like", '%"status":"cancelled"%'])
+            if cancelled_ids:
+                filters.append(["Stock Entry", "name", "not in", cancelled_ids])
         elif status == "cancelled":
-            filters.append(["Stock Entry", "remarks", "like", '%"status":"cancelled"%'])
+            if not cancelled_ids:
+                return StockMovementList(items=[], count=0, limit=limit, offset=offset)
+            filters.append(["Stock Entry", "name", "in", cancelled_ids])
 
         count = await self._count_resource(
             "Stock Entry",
@@ -495,7 +516,23 @@ class ERPNextClient:
             offset=offset,
             order_by="modified desc",
         )
-        movements = [self._to_stock_movement(row) for row in rows if row.get("name")]
+        movement_ids = [
+            str(row.get("name") or "")
+            for row in rows
+            if isinstance(row.get("name"), str) and row.get("name")
+        ]
+        page_cancellations = await self._get_stock_movement_cancellations(movement_ids)
+        enriched_rows: list[Mapping[str, Any]] = []
+        for row in rows:
+            movement_id = str(row.get("name") or "")
+            if not movement_id:
+                continue
+            enriched = dict(row)
+            cancellation = page_cancellations.get(movement_id)
+            if cancellation is not None:
+                enriched["__myretail_cancellation"] = cancellation
+            enriched_rows.append(enriched)
+        movements = [self._to_stock_movement(row) for row in enriched_rows]
 
         return StockMovementList(
             items=movements,
@@ -512,7 +549,11 @@ class ERPNextClient:
         data = payload.get("data")
         if not isinstance(data, Mapping):
             raise ERPNextUnavailableError("ERPNext Stock Entry response does not contain data")
-        return self._to_stock_movement(data)
+        row = dict(data)
+        cancellation = await self._get_stock_movement_cancellation(movement_id)
+        if cancellation is not None:
+            row["__myretail_cancellation"] = cancellation
+        return self._to_stock_movement(row)
 
     async def create_stock_movement(
         self,
@@ -567,9 +608,25 @@ class ERPNextClient:
                 "Движение уже отменено",
             )
 
-        reversal_request = self._to_reversal_request(movement, request.reason)
-        reversal = await self.create_stock_movement(reversal_request, actor=actor)
         cancelled_at = datetime.now(UTC)
+        await self._mark_stock_movement_cancellation_pending(
+            movement,
+            actor=actor,
+            cancelled_at=cancelled_at,
+        )
+        reversal_request = self._to_reversal_request(movement, request.reason)
+        try:
+            reversal = await self.create_stock_movement(reversal_request, actor=actor)
+        except (
+            ERPNextAuthenticationError,
+            ERPNextProductNotFoundError,
+            ERPNextUnavailableError,
+            ERPNextValidationError,
+            ERPNextConflictError,
+        ):
+            await self._mark_stock_movement_posted(movement)
+            raise
+
         await self._mark_stock_movement_cancelled(
             movement,
             actor=actor,
@@ -695,6 +752,43 @@ class ERPNextClient:
                 if isinstance((parent := row.get("parent")), str) and parent
             }
         )
+
+    async def _get_stock_movement_cancellation(
+        self,
+        movement_id: str,
+    ) -> Mapping[str, Any] | None:
+        cancellations = await self._get_stock_movement_cancellations([movement_id])
+        return cancellations.get(movement_id)
+
+    async def _get_stock_movement_cancellations(
+        self,
+        movement_ids: list[str] | None = None,
+    ) -> dict[str, Mapping[str, Any]]:
+        filters: list[list[Any]] = [
+            ["Comment", "reference_doctype", "=", "Stock Entry"],
+            ["Comment", "comment_type", "=", "Info"],
+            ["Comment", "content", "like", "%myretail_cancellation%"],
+        ]
+        if movement_ids is not None:
+            if not movement_ids:
+                return {}
+            filters.append(["Comment", "reference_name", "in", movement_ids])
+
+        rows = await self._query_resource_all(
+            "Comment",
+            fields=["reference_name", "content", "creation"],
+            filters=filters,
+            order_by="creation asc",
+        )
+        cancellations: dict[str, Mapping[str, Any]] = {}
+        for row in rows:
+            movement_id = row.get("reference_name")
+            if not isinstance(movement_id, str) or not movement_id:
+                continue
+            cancellation = self._extract_myretail_cancellation(row.get("content"))
+            if cancellation is not None:
+                cancellations[movement_id] = cancellation
+        return cancellations
 
     async def _get_item(self, item_code: str) -> Mapping[str, Any]:
         payload = await self._request_json(
@@ -999,15 +1093,17 @@ class ERPNextClient:
         movement: StockMovementCreate,
     ) -> list[StockMovementLine]:
         lines: list[StockMovementLine] = []
+        adjustment_direction: str | None = None
         for index, line in enumerate(movement.lines):
-            before = await self._get_on_hand_quantity(line.product_id, movement.warehouse_id)
+            quantities = await self._get_stock_quantities(line.product_id, movement.warehouse_id)
+            before = quantities.actual
             if movement.type == "receipt":
                 quantity = self._line_quantity(line, index)
                 after = before + quantity
             elif movement.type in {"write_off", "transfer"}:
                 quantity = self._line_quantity(line, index)
+                self._ensure_available(quantity, quantities.available, index, "quantity")
                 after = before - quantity
-                self._ensure_non_negative(after, index)
             else:
                 counted = self._line_counted_quantity(line, index)
                 expected = self._line_expected_quantity(line, index)
@@ -1026,6 +1122,29 @@ class ERPNextClient:
                         "Остаток не изменился",
                         {f"lines.{index}.counted_quantity": "Укажите новое значение остатка"},
                     )
+                direction = "increase" if counted > before else "decrease"
+                if adjustment_direction is None:
+                    adjustment_direction = direction
+                elif adjustment_direction != direction:
+                    raise ERPNextValidationError(
+                        (
+                            "РљРѕСЂСЂРµРєС‚РёСЂРѕРІРєР° РЅРµ РґРѕР»Р¶РЅР° СЃРјРµС€РёРІР°С‚СЊ "
+                            "СѓРІРµР»РёС‡РµРЅРёРµ Рё СѓРјРµРЅСЊС€РµРЅРёРµ РѕСЃС‚Р°С‚РєР°"
+                        ),
+                        {
+                            f"lines.{index}.counted_quantity": (
+                                "РћС„РѕСЂРјРёС‚Рµ СѓРІРµР»РёС‡РµРЅРёРµ Рё СѓРјРµРЅСЊС€РµРЅРёРµ "
+                                "РѕС‚РґРµР»СЊРЅС‹РјРё РґРѕРєСѓРјРµРЅС‚Р°РјРё"
+                            )
+                        },
+                    )
+                if direction == "decrease":
+                    self._ensure_available(
+                        before - counted,
+                        quantities.available,
+                        index,
+                        "counted_quantity",
+                    )
                 quantity = counted
                 after = counted
 
@@ -1040,9 +1159,12 @@ class ERPNextClient:
         return lines
 
     async def _get_on_hand_quantity(self, product_id: str, warehouse_id: str) -> Decimal:
+        return (await self._get_stock_quantities(product_id, warehouse_id)).actual
+
+    async def _get_stock_quantities(self, product_id: str, warehouse_id: str) -> StockQuantities:
         rows = await self._query_resource(
             "Bin",
-            fields=["actual_qty"],
+            fields=["actual_qty", "reserved_qty"],
             filters=[
                 ["Bin", "item_code", "=", product_id],
                 ["Bin", "warehouse", "=", warehouse_id],
@@ -1050,8 +1172,11 @@ class ERPNextClient:
             limit=1,
         )
         if not rows:
-            return ZERO_QUANTITY
-        return self._decimal_quantity(rows[0].get("actual_qty"))
+            return StockQuantities(actual=ZERO_QUANTITY, reserved=ZERO_QUANTITY)
+        return StockQuantities(
+            actual=self._decimal_quantity(rows[0].get("actual_qty")),
+            reserved=self._decimal_quantity(rows[0].get("reserved_qty")),
+        )
 
     def _to_stock_entry_payload(
         self,
@@ -1100,27 +1225,80 @@ class ERPNextClient:
         cancelled_at: datetime,
         reversal_movement_id: str,
     ) -> None:
+        await self._update_stock_movement_metadata(
+            movement,
+            status="cancelled",
+            actor=actor,
+            cancelled_at=cancelled_at,
+            reversal_movement_id=reversal_movement_id,
+        )
+
+    async def _mark_stock_movement_cancellation_pending(
+        self,
+        movement: StockMovement,
+        *,
+        actor: AuthenticatedUser,
+        cancelled_at: datetime,
+    ) -> None:
+        await self._update_stock_movement_metadata(
+            movement,
+            status="cancellation_pending",
+            actor=actor,
+            cancelled_at=cancelled_at,
+            reversal_movement_id=None,
+        )
+
+    async def _mark_stock_movement_posted(self, movement: StockMovement) -> None:
+        await self._update_stock_movement_metadata(
+            movement,
+            status="posted",
+            actor=None,
+            cancelled_at=None,
+            reversal_movement_id=None,
+        )
+
+    async def _update_stock_movement_metadata(
+        self,
+        movement: StockMovement,
+        *,
+        status: str,
+        actor: AuthenticatedUser | None,
+        cancelled_at: datetime | None,
+        reversal_movement_id: str | None,
+    ) -> None:
         metadata = {
-            "myretail": {
+            "myretail_cancellation": {
                 "type": movement.type,
-                "status": "cancelled",
+                "status": status,
                 "warehouse_id": movement.warehouse_id,
                 "destination_warehouse_id": movement.destination_warehouse_id,
                 "reason_code": movement.reason_code,
                 "comment": movement.comment,
                 "created_by": movement.created_by.model_dump(),
                 "created_at": movement.created_at.isoformat().replace("+00:00", "Z"),
-                "cancelled_by": {"email": actor.email, "full_name": actor.full_name},
-                "cancelled_at": cancelled_at.isoformat().replace("+00:00", "Z"),
-                "reversal_movement_id": reversal_movement_id,
                 "lines": [line.model_dump() for line in movement.lines],
             }
         }
+        if actor is not None and cancelled_at is not None:
+            metadata["myretail_cancellation"]["cancelled_by"] = {
+                "email": actor.email,
+                "full_name": actor.full_name,
+            }
+            metadata["myretail_cancellation"]["cancelled_at"] = cancelled_at.isoformat().replace(
+                "+00:00",
+                "Z",
+            )
+        if reversal_movement_id is not None:
+            metadata["myretail_cancellation"]["reversal_movement_id"] = reversal_movement_id
         await self._request_json(
-            "PUT",
-            f"/api/resource/Stock Entry/{quote(movement.id, safe='')}",
+            "POST",
+            "/api/resource/Comment",
             json_payload={
-                "remarks": json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
+                "doctype": "Comment",
+                "comment_type": "Info",
+                "reference_doctype": "Stock Entry",
+                "reference_name": movement.id,
+                "content": json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
             },
         )
 
@@ -1216,6 +1394,9 @@ class ERPNextClient:
 
     def _to_stock_movement(self, row: Mapping[str, Any]) -> StockMovement:
         metadata = self._extract_myretail_metadata(row.get("remarks"))
+        cancellation = row.get("__myretail_cancellation")
+        if not isinstance(cancellation, Mapping):
+            cancellation = None
         movement_type = str(metadata.get("type") or self._map_stock_entry_type(row))
         safe_movement_type = self._safe_movement_type(movement_type)
         lines = self._stock_movement_lines_from_metadata(metadata, row)
@@ -1230,10 +1411,22 @@ class ERPNextClient:
             and isinstance(row.get("to_warehouse"), str)
         ):
             destination_warehouse_id = row.get("to_warehouse")
+        reversal_movement_id = None
+        if cancellation is not None and isinstance(cancellation.get("reversal_movement_id"), str):
+            reversal_movement_id = cancellation.get("reversal_movement_id")
+        elif isinstance(metadata.get("reversal_movement_id"), str):
+            reversal_movement_id = metadata.get("reversal_movement_id")
         return StockMovement(
             id=str(row.get("name") or ""),
             type=safe_movement_type,
-            status=self._safe_movement_status(str(metadata.get("status") or ""), row),
+            status=self._safe_movement_status(
+                str(
+                    cancellation.get("status")
+                    if cancellation is not None
+                    else metadata.get("status") or ""
+                ),
+                row,
+            ),
             warehouse_id=str(
                 metadata.get("warehouse_id")
                 or row.get("from_warehouse")
@@ -1247,11 +1440,17 @@ class ERPNextClient:
             comment=metadata.get("comment") if isinstance(metadata.get("comment"), str) else None,
             created_by=self._audit_user(metadata.get("created_by"), row.get("owner")),
             created_at=self._parse_datetime(metadata.get("created_at") or row.get("modified")),
-            cancelled_by=self._audit_user_or_none(metadata.get("cancelled_by")),
-            cancelled_at=self._parse_optional_datetime(metadata.get("cancelled_at")),
-            reversal_movement_id=metadata.get("reversal_movement_id")
-            if isinstance(metadata.get("reversal_movement_id"), str)
-            else None,
+            cancelled_by=self._audit_user_or_none(
+                cancellation.get("cancelled_by")
+                if cancellation is not None
+                else metadata.get("cancelled_by")
+            ),
+            cancelled_at=self._parse_optional_datetime(
+                cancellation.get("cancelled_at")
+                if cancellation is not None
+                else metadata.get("cancelled_at")
+            ),
+            reversal_movement_id=reversal_movement_id,
             lines=lines,
         )
 
@@ -1267,6 +1466,23 @@ class ERPNextClient:
             return {}
         metadata = parsed.get("myretail")
         return metadata if isinstance(metadata, Mapping) else {}
+
+    @staticmethod
+    def _extract_myretail_cancellation(raw_content: Any) -> Mapping[str, Any] | None:
+        if not isinstance(raw_content, str) or not raw_content.strip():
+            return None
+        try:
+            parsed = json.loads(raw_content)
+        except ValueError:
+            return None
+        if not isinstance(parsed, Mapping):
+            return None
+        metadata = parsed.get("myretail_cancellation")
+        return metadata if isinstance(metadata, Mapping) else None
+
+    @staticmethod
+    def _is_cancellation_status(cancellation: Mapping[str, Any]) -> bool:
+        return cancellation.get("status") in {"cancelled", "cancellation_pending"}
 
     def _stock_movement_lines_from_metadata(
         self,
@@ -1323,6 +1539,8 @@ class ERPNextClient:
 
     @staticmethod
     def _safe_movement_status(value: str, row: Mapping[str, Any]) -> str:
+        if value == "cancellation_pending":
+            return "cancelled"
         if value in {"posted", "cancelled"}:
             return value
         return "cancelled" if int(row.get("docstatus") or 0) == 2 else "posted"
@@ -1378,6 +1596,24 @@ class ERPNextClient:
                 "INSUFFICIENT_STOCK",
                 "Недостаточно доступного остатка.",
                 {f"lines.{index}.quantity": "Недостаточно доступного остатка"},
+            )
+
+    @staticmethod
+    def _ensure_available(
+        requested: Decimal,
+        available: Decimal,
+        index: int,
+        field_name: str,
+    ) -> None:
+        if requested > available:
+            raise ERPNextConflictError(
+                "INSUFFICIENT_STOCK",
+                "РќРµРґРѕСЃС‚Р°С‚РѕС‡РЅРѕ РґРѕСЃС‚СѓРїРЅРѕРіРѕ РѕСЃС‚Р°С‚РєР°.",
+                {
+                    f"lines.{index}.{field_name}": (
+                        f"Р”РѕСЃС‚СѓРїРЅРѕ {format_quantity(available)}"
+                    )
+                },
             )
 
     @staticmethod

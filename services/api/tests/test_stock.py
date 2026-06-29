@@ -387,8 +387,6 @@ async def test_stock_options_and_balances_support_search_filter_and_pagination(
         "available": "8.000",
         "updated_at": "2026-06-29T08:00:00Z",
     }
-
-
 @pytest.mark.anyio
 async def test_stock_create_receipt_is_idempotent(tmp_path: Path) -> None:
     erpnext_client = StubStockERPNextClient()
@@ -581,10 +579,33 @@ async def test_stock_rejects_invalid_lines_and_transfer_rules(tmp_path: Path) ->
                 "lines": [{"product_id": "SKU-001", "quantity": "1.000"}],
             },
         )
+        mixed_adjustment_response = await client.post(
+            "/stock/movements",
+            headers=auth_headers(tmp_path, idempotency_key=str(uuid4())),
+            json={
+                "type": "adjustment",
+                "warehouse_id": "Stores - MR",
+                "reason_code": "manual_count",
+                "lines": [
+                    {
+                        "product_id": "SKU-001",
+                        "expected_quantity": "10.000",
+                        "counted_quantity": "11.000",
+                    },
+                    {
+                        "product_id": "SKU-002",
+                        "expected_quantity": "5.000",
+                        "counted_quantity": "4.000",
+                    },
+                ],
+            },
+        )
 
     assert duplicate_response.status_code == 422
     assert duplicate_response.json()["error"]["fields"]["lines.0.product_id"]
     assert transfer_response.status_code == 422
+    assert mixed_adjustment_response.status_code == 422
+    assert "lines.1.counted_quantity" in mixed_adjustment_response.json()["error"]["fields"]
     assert transfer_response.json()["error"]["fields"] == {
         "destination_warehouse_id": "Склад назначения должен отличаться от источника"
     }

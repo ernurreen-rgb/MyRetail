@@ -3,6 +3,7 @@ import hashlib
 import json
 from collections.abc import Awaitable, Callable
 from datetime import date
+from decimal import Decimal
 from typing import Annotated, TypeVar
 from uuid import UUID
 
@@ -266,6 +267,7 @@ def _validate_movement_request(movement: StockMovementCreate) -> None:
     if movement.reason_code == "other" and movement.comment is None:
         raise _validation_error({"comment": "Комментарий обязателен для причины Другое"})
 
+    adjustment_direction: str | None = None
     for index, line in enumerate(movement.lines):
         if movement.type == "adjustment":
             if line.counted_quantity is None:
@@ -280,8 +282,44 @@ def _validate_movement_request(movement: StockMovementCreate) -> None:
                 raise _validation_error(
                     {f"lines.{index}.quantity": "Для корректировки передайте counted_quantity"}
                 )
+            direction = _adjustment_direction(line.counted_quantity, line.expected_quantity)
+            if direction is None:
+                raise _validation_error(
+                    {
+                        f"lines.{index}.counted_quantity": (
+                            "РЈРєР°Р¶РёС‚Рµ РЅРѕРІРѕРµ Р·РЅР°С‡РµРЅРёРµ РѕСЃС‚Р°С‚РєР°"
+                        )
+                    }
+                )
+            if adjustment_direction is None:
+                adjustment_direction = direction
+            elif adjustment_direction != direction:
+                raise _validation_error(
+                    {
+                        f"lines.{index}.counted_quantity": (
+                            "РќРµ СЃРјРµС€РёРІР°Р№С‚Рµ СѓРІРµР»РёС‡РµРЅРёРµ "
+                            "Рё СѓРјРµРЅСЊС€РµРЅРёРµ "
+                            "РѕСЃС‚Р°С‚РєР° РІ РѕРґРЅРѕР№ РєРѕСЂСЂРµРєС‚РёСЂРѕРІРєРµ"
+                        )
+                    }
+                )
         elif line.quantity is None:
             raise _validation_error({f"lines.{index}.quantity": "Количество обязательно"})
+
+
+def _adjustment_direction(
+    counted_quantity: str | None,
+    expected_quantity: str | None,
+) -> str | None:
+    if counted_quantity is None or expected_quantity is None:
+        return None
+    counted = Decimal(counted_quantity)
+    expected = Decimal(expected_quantity)
+    if counted > expected:
+        return "increase"
+    if counted < expected:
+        return "decrease"
+    return None
 
 
 def _require_idempotency_key(idempotency_key: str | None) -> str:
