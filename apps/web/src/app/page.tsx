@@ -92,7 +92,7 @@ export default async function Home() {
           </div>
           <div className="flex flex-wrap items-center gap-3">
             <span className="rounded-full bg-[var(--accent-soft)] px-3 py-1.5 text-xs font-semibold text-[var(--accent)]">
-              Sprint 2
+              Sprint 3
             </span>
             <form action="/api/auth/logout" method="post">
               <button
@@ -163,12 +163,20 @@ export default async function Home() {
                 Товары
               </h2>
             </div>
-            <Link
-              href="/products"
-              className="w-fit rounded-full bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-white transition hover:brightness-95"
-            >
-              Открыть управление товарами
-            </Link>
+            <div className="flex flex-wrap gap-2">
+              <Link
+                href="/products"
+                className="w-fit rounded-full bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-white transition hover:brightness-95"
+              >
+                Открыть управление товарами
+              </Link>
+              <Link
+                href="/stock"
+                className="w-fit rounded-full border border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-sm font-semibold transition hover:border-[var(--accent)] hover:text-[var(--accent)]"
+              >
+                Открыть склад
+              </Link>
+            </div>
           </div>
 
           {products.status === "ready" ? (
