@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from http.cookiejar import CookieJar
@@ -255,6 +256,11 @@ def ensure_stock_baseline(
     if not items:
         return
 
+    # ERPNext stock ledger posting time has one-second precision. Move the
+    # reconciliation into the next second so it deterministically follows
+    # movements created immediately before this reset.
+    current_time = datetime.now()
+    time.sleep((1_000_000 - current_time.microsecond) / 1_000_000 + 0.05)
     now = datetime.now()
     draft = client.create_document(
         "Stock Reconciliation",
