@@ -47,6 +47,7 @@ def test_stock_qa_data_scripts_seed_balances_and_reservation() -> None:
         assert item_code in implementation
     assert '"Bin"' in implementation
     assert '"Stock Reconciliation"' in implementation
+    assert "time.sleep" in implementation
     assert '"Sales Order"' in implementation
     assert "MYRETAIL-QA-RESERVATION" in implementation
     assert '"DELETE"' not in implementation

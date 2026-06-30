@@ -457,17 +457,24 @@ class ERPNextClient:
         offset: int = 0,
     ) -> StockMovementList:
         filters: list[list[Any]] = []
-        or_filters: list[list[Any]] | None = None
+        parent_ids: set[str] | None = None
         if warehouse_id is not None:
-            or_filters = [
-                ["Stock Entry", "from_warehouse", "=", warehouse_id],
-                ["Stock Entry", "to_warehouse", "=", warehouse_id],
-            ]
+            parent_ids = set(
+                await self._find_stock_entry_parents_by_warehouse(warehouse_id)
+            )
         if product_id is not None:
-            parent_ids = await self._find_stock_entry_parents_by_product(product_id)
+            product_parent_ids = set(
+                await self._find_stock_entry_parents_by_product(product_id)
+            )
+            parent_ids = (
+                product_parent_ids
+                if parent_ids is None
+                else parent_ids.intersection(product_parent_ids)
+            )
+        if parent_ids is not None:
             if not parent_ids:
                 return StockMovementList(items=[], count=0, limit=limit, offset=offset)
-            filters.append(["Stock Entry", "name", "in", parent_ids])
+            filters.append(["Stock Entry", "name", "in", sorted(parent_ids)])
         if movement_type is not None:
             filters.append(["Stock Entry", "remarks", "like", f'%"type":"{movement_type}"%'])
         if date_from is not None:
@@ -494,7 +501,6 @@ class ERPNextClient:
         count = await self._count_resource(
             "Stock Entry",
             filters=filters,
-            or_filters=or_filters,
         )
         rows = await self._query_resource(
             "Stock Entry",
@@ -511,7 +517,6 @@ class ERPNextClient:
                 "remarks",
             ],
             filters=filters or None,
-            or_filters=or_filters,
             limit=limit,
             offset=offset,
             order_by="modified desc",
@@ -742,6 +747,28 @@ class ERPNextClient:
             "Stock Entry Detail",
             fields=["parent"],
             filters=[["Stock Entry Detail", "item_code", "=", product_id]],
+            order_by="parent desc",
+            parent_doctype="Stock Entry",
+        )
+        return sorted(
+            {
+                parent
+                for row in rows
+                if isinstance((parent := row.get("parent")), str) and parent
+            }
+        )
+
+    async def _find_stock_entry_parents_by_warehouse(
+        self,
+        warehouse_id: str,
+    ) -> list[str]:
+        rows = await self._query_resource_all(
+            "Stock Entry Detail",
+            fields=["parent"],
+            or_filters=[
+                ["Stock Entry Detail", "s_warehouse", "=", warehouse_id],
+                ["Stock Entry Detail", "t_warehouse", "=", warehouse_id],
+            ],
             order_by="parent desc",
             parent_doctype="Stock Entry",
         )

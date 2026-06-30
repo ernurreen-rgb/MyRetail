@@ -548,25 +548,31 @@ async def test_list_stock_movements_filters_receipts_by_destination_warehouse() 
 
     def handler(request: httpx.Request) -> httpx.Response:
         request_paths.append(request.url.path)
+        if request.url.path in {
+            "/api/resource/Stock%20Entry%20Detail",
+            "/api/resource/Stock Entry Detail",
+        }:
+            assert json.loads(request.url.params["fields"]) == ["parent"]
+            assert json.loads(request.url.params["or_filters"]) == [
+                ["Stock Entry Detail", "s_warehouse", "=", "Stores - MR"],
+                ["Stock Entry Detail", "t_warehouse", "=", "Stores - MR"],
+            ]
+            assert request.url.params["parent"] == "Stock Entry"
+            return httpx.Response(
+                200,
+                json={"data": [{"parent": "MAT-STE-2026-01201"}]},
+            )
+        if request.url.path == "/api/method/frappe.client.get_count":
+            assert request.url.params["doctype"] == "Stock Entry"
+            assert json.loads(request.url.params["filters"]) == [
+                ["Stock Entry", "name", "in", ["MAT-STE-2026-01201"]]
+            ]
+            return httpx.Response(200, json={"message": 1})
         if request.url.path in {"/api/resource/Stock%20Entry", "/api/resource/Stock Entry"}:
-            or_filters = json.loads(request.url.params["or_filters"])
-            assert ["Stock Entry", "from_warehouse", "=", "Stores - MR"] in or_filters
-            assert ["Stock Entry", "to_warehouse", "=", "Stores - MR"] in or_filters
-            fields = json.loads(request.url.params["fields"])
-            if fields == ["name"]:
-                offset = int(request.url.params["limit_start"])
-                remaining = max(0, 1501 - offset)
-                batch_size = min(500, remaining)
-                return httpx.Response(
-                    200,
-                    json={
-                        "data": [
-                            {"name": f"MAT-STE-2026-{offset + index:05d}"}
-                            for index in range(batch_size)
-                        ]
-                    },
-                )
-            assert request.url.params["limit_start"] == "1200"
+            assert json.loads(request.url.params["filters"]) == [
+                ["Stock Entry", "name", "in", ["MAT-STE-2026-01201"]]
+            ]
+            assert request.url.params["limit_start"] == "0"
             assert request.url.params["limit_page_length"] == "25"
             return httpx.Response(
                 200,
@@ -577,7 +583,7 @@ async def test_list_stock_movements_filters_receipts_by_destination_warehouse() 
                             "stock_entry_type": "Material Receipt",
                             "docstatus": 1,
                             "from_warehouse": None,
-                            "to_warehouse": "Stores - MR",
+                            "to_warehouse": None,
                             "posting_date": "2026-06-29",
                             "posting_time": "08:00:00",
                             "owner": "owner@example.com",
@@ -596,10 +602,10 @@ async def test_list_stock_movements_filters_receipts_by_destination_warehouse() 
     movements = await client.list_stock_movements(
         warehouse_id="Stores - MR",
         limit=25,
-        offset=1200,
+        offset=0,
     )
 
-    assert movements.count == 1501
+    assert movements.count == 1
     assert movements.items[0].id == "MAT-STE-2026-01201"
     assert movements.items[0].type == "receipt"
     assert movements.items[0].warehouse_id == "Stores - MR"
