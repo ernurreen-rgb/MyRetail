@@ -93,6 +93,13 @@ catch {
 $permissionFields = [Uri]::EscapeDataString('["name"]')
 $permissionDefinitions = @(
     @{
+        parent = "Supplier"
+        read = 1
+        select = 1
+        create = 1
+        write = 1
+    },
+    @{
         parent = "Warehouse"
         read = 1
         select = 1
@@ -132,9 +139,26 @@ $permissionDefinitions = @(
         create = 1
         write = 1
         submit = 1
+        cancel = 1
     },
     @{
         parent = "Stock Entry Detail"
+        read = 1
+        select = 1
+        create = 1
+        write = 1
+    },
+    @{
+        parent = "Purchase Receipt"
+        read = 1
+        select = 1
+        create = 1
+        write = 1
+        submit = 1
+        cancel = 1
+    },
+    @{
+        parent = "Purchase Receipt Item"
         read = 1
         select = 1
         create = 1
@@ -169,7 +193,7 @@ foreach ($definition in $permissionDefinitions) {
         write = 0
         delete = 0
     }
-    foreach ($permissionFlag in @("create", "write", "delete", "submit")) {
+    foreach ($permissionFlag in @("create", "write", "delete", "submit", "cancel")) {
         if ($definition.ContainsKey($permissionFlag)) {
             $permissionBody[$permissionFlag] = $definition[$permissionFlag]
         }
@@ -258,6 +282,7 @@ $apiEnv = @(
     "MYRETAIL_ERPNEXT_TIMEOUT_SECONDS=$(Get-ApiSetting -Name 'MYRETAIL_ERPNEXT_TIMEOUT_SECONDS' -Default '10')"
     "MYRETAIL_ERPNEXT_SELLING_PRICE_LIST=$(Get-ApiSetting -Name 'MYRETAIL_ERPNEXT_SELLING_PRICE_LIST' -Default 'Standard Selling')"
     "MYRETAIL_ERPNEXT_BUYING_PRICE_LIST=$(Get-ApiSetting -Name 'MYRETAIL_ERPNEXT_BUYING_PRICE_LIST' -Default 'Standard Buying')"
+    "MYRETAIL_ERPNEXT_COMPANY=$(Get-ApiSetting -Name 'MYRETAIL_ERPNEXT_COMPANY' -Default 'MyRetail Demo')"
     "MYRETAIL_DEFAULT_CURRENCY=$(Get-ApiSetting -Name 'MYRETAIL_DEFAULT_CURRENCY' -Default 'KZT')"
 ) -join [Environment]::NewLine
 

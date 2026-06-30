@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     erpnext_timeout_seconds: float = 10.0
     erpnext_selling_price_list: str = "Standard Selling"
     erpnext_buying_price_list: str = "Standard Buying"
+    erpnext_company: str = "MyRetail Demo"
     default_currency: str = "KZT"
     stock_idempotency_db_path: Path = API_ROOT / "tmp" / "stock_idempotency.sqlite3"
 

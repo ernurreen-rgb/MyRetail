@@ -21,7 +21,7 @@ class IdempotencyBeginResult:
     record: IdempotencyRecord | None = None
 
 
-class StockIdempotencyStore:
+class IdempotencyStore:
     def __init__(self, database_path: Path) -> None:
         self._database_path = database_path
         self._ensure_schema()
@@ -177,3 +177,6 @@ class StockIdempotencyStore:
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self._database_path, timeout=30)
+
+
+StockIdempotencyStore = IdempotencyStore

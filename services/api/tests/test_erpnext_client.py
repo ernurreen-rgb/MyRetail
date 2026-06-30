@@ -16,6 +16,7 @@ from myretail_api.clients.erpnext import (
 from myretail_api.config import Settings
 from myretail_api.models.auth import AuthenticatedUser
 from myretail_api.models.products import ProductCreate, ProductUpdate
+from myretail_api.models.purchases import PurchaseCancelRequest, PurchaseSubmitRequest
 from myretail_api.models.stock import StockMovementCancelRequest, StockMovementCreate
 
 
@@ -1079,3 +1080,281 @@ async def test_authenticate_user_fails_closed_when_roles_cannot_be_verified() ->
 
     with pytest.raises(ERPNextRoleVerificationError):
         await client.authenticate_user(email="cashier@example.com", password="correct")
+
+
+@pytest.mark.anyio
+async def test_submit_purchase_recovers_price_sync_without_second_submit() -> None:
+    metadata = {
+        "myretail_purchase": {
+            "supplier_invoice_number": "НК-42",
+            "supplier_invoice_date": "2026-06-29",
+            "comment": "Поставка",
+            "created_by": {"email": "owner@example.com", "full_name": "Owner"},
+            "created_at": "2026-06-30T08:00:00Z",
+            "lines": [
+                {
+                    "product_id": "QA-MILK-001",
+                    "sku": "QA-MILK-001",
+                    "name": "Milk",
+                    "unit": "Nos",
+                    "quantity": "2.000",
+                    "unit_price": "600.00",
+                    "line_total": "1200.00",
+                }
+            ],
+        }
+    }
+    purchase_doc: dict[str, object] = {
+        "doctype": "Purchase Receipt",
+        "name": "PREC-00001",
+        "supplier": "SUP-00001",
+        "supplier_name": "Supplier",
+        "set_warehouse": "Stores - MR",
+        "posting_date": "2026-06-30",
+        "docstatus": 0,
+        "owner": "owner@example.com",
+        "creation": "2026-06-30T08:00:00Z",
+        "modified": "2026-06-30T08:00:00Z",
+        "currency": "KZT",
+        "remarks": json.dumps(metadata, separators=(",", ":")),
+        "items": [],
+    }
+    comments: list[dict[str, object]] = []
+    state = {"submit_count": 0, "price": "510.00", "fail_price_once": True}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path in {
+            "/api/resource/Purchase%20Receipt/PREC-00001",
+            "/api/resource/Purchase Receipt/PREC-00001",
+        }:
+            return httpx.Response(200, json={"data": purchase_doc})
+        if request.url.path == "/api/resource/Supplier/SUP-00001":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "name": "SUP-00001",
+                        "supplier_name": "Supplier",
+                        "disabled": 0,
+                        "modified": "2026-06-30T08:00:00Z",
+                    }
+                },
+            )
+        if request.url.path == "/api/method/frappe.client.submit":
+            state["submit_count"] += 1
+            purchase_doc["docstatus"] = 1
+            purchase_doc["modified"] = "2026-06-30T08:01:00Z"
+            state["price"] = "600.00"
+            return httpx.Response(200, json={"message": purchase_doc})
+        if request.url.path == "/api/resource/Comment" and request.method == "GET":
+            return httpx.Response(200, json={"data": comments})
+        if request.url.path == "/api/resource/Comment" and request.method == "POST":
+            body = json.loads(request.content)
+            comments.append(
+                {
+                    "content": body["content"],
+                    "creation": f"2026-06-30T08:0{len(comments)}:00Z",
+                }
+            )
+            return httpx.Response(200, json={"data": {"name": f"COMMENT-{len(comments)}"}})
+        if request.url.path in {"/api/resource/Item%20Price", "/api/resource/Item Price"}:
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "name": "PRICE-BUY",
+                            "item_code": "QA-MILK-001",
+                            "price_list": "Standard Buying",
+                            "price_list_rate": state["price"],
+                            "currency": "KZT",
+                        }
+                    ]
+                },
+            )
+        if request.url.path in {
+            "/api/resource/Item%20Price/PRICE-BUY",
+            "/api/resource/Item Price/PRICE-BUY",
+        }:
+            if state["fail_price_once"]:
+                state["fail_price_once"] = False
+                return httpx.Response(503, json={"message": "temporary"})
+            state["price"] = json.loads(request.content)["price_list_rate"]
+            return httpx.Response(200, json={"data": {}})
+        if request.url.path == "/api/resource/Warehouse":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "name": "Stores - MR",
+                            "warehouse_name": "Stores",
+                            "disabled": 0,
+                            "is_group": 0,
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(404)
+
+    client = ERPNextClient(make_settings(), transport=httpx.MockTransport(handler))
+    actor = AuthenticatedUser(email="owner@example.com", full_name="Owner", roles=["Owner"])
+    request = PurchaseSubmitRequest(expected_updated_at=datetime(2026, 6, 30, 8, 0, tzinfo=UTC))
+
+    with pytest.raises(ERPNextUnavailableError):
+        await client.submit_purchase("PREC-00001", request, actor=actor)
+
+    submitted = await client.submit_purchase("PREC-00001", request, actor=actor)
+
+    assert submitted.status == "posted"
+    assert submitted.lines[0].unit_price == "600.00"
+    assert state["submit_count"] == 1
+    assert state["price"] == "600.00"
+    event_statuses = [
+        json.loads(str(comment["content"]))["myretail_purchase_event"]["status"]
+        for comment in comments
+    ]
+    assert event_statuses == ["submit_pending", "price_synced"]
+    first_event = json.loads(str(comments[0]["content"]))["myretail_purchase_event"]
+    assert first_event["original_prices"] == {
+        "QA-MILK-001": {"exists": True, "price": "510.00"}
+    }
+
+
+@pytest.mark.anyio
+async def test_cancel_purchase_restores_previous_buying_price_and_blocks_repeat() -> None:
+    metadata = {
+        "myretail_purchase": {
+            "created_by": {"email": "owner@example.com", "full_name": "Owner"},
+            "created_at": "2026-06-30T08:00:00Z",
+            "lines": [
+                {
+                    "product_id": "QA-MILK-001",
+                    "sku": "QA-MILK-001",
+                    "name": "Milk",
+                    "unit": "Nos",
+                    "quantity": "2.000",
+                    "unit_price": "600.00",
+                    "line_total": "1200.00",
+                }
+            ],
+        }
+    }
+    purchase_doc: dict[str, object] = {
+        "doctype": "Purchase Receipt",
+        "name": "PREC-00001",
+        "supplier": "SUP-00001",
+        "supplier_name": "Supplier",
+        "set_warehouse": "Stores - MR",
+        "posting_date": "2026-06-30",
+        "docstatus": 1,
+        "owner": "owner@example.com",
+        "creation": "2026-06-30T08:00:00Z",
+        "modified": "2026-06-30T08:02:00Z",
+        "currency": "KZT",
+        "remarks": json.dumps(metadata, separators=(",", ":")),
+        "items": [],
+    }
+    comments: list[dict[str, object]] = [
+        {
+            "content": json.dumps(
+                {
+                    "myretail_purchase_event": {
+                        "status": "price_synced",
+                        "original_prices": {
+                            "QA-MILK-001": {"exists": True, "price": "510.00"}
+                        },
+                        "submitted_by": {"email": "owner@example.com", "full_name": "Owner"},
+                        "submitted_at": "2026-06-30T08:01:00Z",
+                    }
+                },
+                separators=(",", ":"),
+            ),
+            "creation": "2026-06-30T08:01:00Z",
+        }
+    ]
+    state = {"price": "600.00", "cancel_count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path in {
+            "/api/resource/Purchase%20Receipt/PREC-00001",
+            "/api/resource/Purchase Receipt/PREC-00001",
+        }:
+            return httpx.Response(200, json={"data": purchase_doc})
+        if request.url.path == "/api/resource/Comment" and request.method == "GET":
+            return httpx.Response(200, json={"data": comments})
+        if request.url.path == "/api/resource/Comment" and request.method == "POST":
+            body = json.loads(request.content)
+            comments.append(
+                {
+                    "content": body["content"],
+                    "creation": f"2026-06-30T08:0{len(comments) + 1}:00Z",
+                }
+            )
+            return httpx.Response(200, json={"data": {"name": f"COMMENT-{len(comments)}"}})
+        if request.url.path == "/api/method/frappe.client.cancel":
+            state["cancel_count"] += 1
+            purchase_doc["docstatus"] = 2
+            purchase_doc["modified"] = "2026-06-30T08:03:00Z"
+            return httpx.Response(200, json={"message": purchase_doc})
+        if request.url.path in {
+            "/api/resource/Purchase%20Receipt%20Item",
+            "/api/resource/Purchase Receipt Item",
+        }:
+            return httpx.Response(200, json={"data": []})
+        if request.url.path in {"/api/resource/Item%20Price", "/api/resource/Item Price"}:
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "name": "PRICE-BUY",
+                            "item_code": "QA-MILK-001",
+                            "price_list": "Standard Buying",
+                            "price_list_rate": state["price"],
+                            "currency": "KZT",
+                        }
+                    ]
+                },
+            )
+        if request.url.path in {
+            "/api/resource/Item%20Price/PRICE-BUY",
+            "/api/resource/Item Price/PRICE-BUY",
+        }:
+            state["price"] = json.loads(request.content)["price_list_rate"]
+            return httpx.Response(200, json={"data": {}})
+        if request.url.path == "/api/resource/Warehouse":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "name": "Stores - MR",
+                            "warehouse_name": "Stores",
+                            "disabled": 0,
+                            "is_group": 0,
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(404)
+
+    client = ERPNextClient(make_settings(), transport=httpx.MockTransport(handler))
+    actor = AuthenticatedUser(email="owner@example.com", full_name="Owner", roles=["Owner"])
+
+    cancelled = await client.cancel_purchase(
+        "PREC-00001",
+        PurchaseCancelRequest(reason="Ошибка поставки"),
+        actor=actor,
+    )
+
+    assert cancelled.status == "cancelled"
+    assert state["cancel_count"] == 1
+    assert state["price"] == "510.00"
+    with pytest.raises(ERPNextConflictError) as exc_info:
+        await client.cancel_purchase(
+            "PREC-00001",
+            PurchaseCancelRequest(reason="Повтор"),
+            actor=actor,
+        )
+    assert exc_info.value.code == "PURCHASE_ALREADY_CANCELLED"
