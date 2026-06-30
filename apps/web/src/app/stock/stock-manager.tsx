@@ -612,14 +612,14 @@ export function StockManager({
     <div
       className={
         canManage
-          ? "grid gap-6 xl:grid-cols-[minmax(0,1fr)_420px] xl:items-start"
-          : "grid gap-6"
+          ? "grid min-w-0 gap-6 xl:grid-cols-[minmax(0,1fr)_minmax(340px,420px)] xl:items-start"
+          : "grid min-w-0 gap-6"
       }
     >
-      <div className="grid gap-6">
+      <div className="grid min-w-0 gap-6">
         <section
           aria-labelledby="stock-balances-heading"
-          className="rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5 shadow-[0_12px_36px_rgba(20,32,24,0.04)] sm:p-6"
+          className="min-w-0 rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5 shadow-[0_12px_36px_rgba(20,32,24,0.04)] sm:p-6"
         >
           <div className="mb-5 flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
             <div>
@@ -651,8 +651,11 @@ export function StockManager({
             ) : null}
           </div>
 
-          <form onSubmit={handleSearch} className="mb-4 grid gap-3 lg:grid-cols-[1fr_260px_auto]">
-            <label className="block">
+          <form
+            onSubmit={handleSearch}
+            className="mb-4 grid min-w-0 gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(220px,260px)]"
+          >
+            <label className="block min-w-0">
               <span className="text-sm font-semibold">
                 Поиск по названию, артикулу или штрихкоду
               </span>
@@ -664,7 +667,7 @@ export function StockManager({
                 placeholder="Например: DEMO-001 или молоко"
               />
             </label>
-            <label className="block">
+            <label className="block min-w-0">
               <span className="text-sm font-semibold">Склад</span>
               <select
                 value={warehouseId}
@@ -681,7 +684,7 @@ export function StockManager({
                 ))}
               </select>
             </label>
-            <div className="flex items-end gap-3">
+            <div className="flex flex-wrap items-end gap-3 lg:col-span-2 lg:justify-end">
               <button type="submit" className={secondaryButtonClass} disabled={isLoadingBalances}>
                 Найти
               </button>
@@ -746,7 +749,7 @@ export function StockManager({
             </div>
           ) : (
             <>
-              <div className="overflow-x-auto rounded-xl border border-[var(--border)]">
+              <div className="max-w-full overflow-x-auto rounded-xl border border-[var(--border)]">
                 <table className="min-w-[980px] w-full border-collapse text-left text-sm">
                   <thead className="bg-[var(--surface-muted)] text-xs uppercase tracking-[0.08em] text-[var(--muted)]">
                     <tr>
@@ -1142,7 +1145,7 @@ export function StockManager({
       </div>
 
       {canManage ? (
-        <aside className="rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5 shadow-[0_12px_36px_rgba(20,32,24,0.04)] sm:p-6 xl:sticky xl:top-6">
+        <aside className="min-w-0 rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5 shadow-[0_12px_36px_rgba(20,32,24,0.04)] sm:p-6 xl:sticky xl:top-6">
           <div className="mb-5">
             <p className="text-sm text-[var(--muted)]">Owner/Admin</p>
             <h2 className="text-2xl font-semibold tracking-tight">Операции склада</h2>
