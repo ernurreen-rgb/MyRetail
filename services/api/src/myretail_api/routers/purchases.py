@@ -109,7 +109,8 @@ async def create_supplier(
         key=key,
         request_hash=request_hash,
         status_code=status.HTTP_201_CREATED,
-        execute=lambda: client.create_supplier(supplier),
+        execute=lambda: client.create_supplier(supplier, idempotency_key=key),
+        recover=lambda: client.recover_created_supplier(key),
     )
 
 
@@ -203,7 +204,12 @@ async def create_purchase(
         key=key,
         request_hash=request_hash,
         status_code=status.HTTP_201_CREATED,
-        execute=lambda: client.create_purchase(purchase, actor=tenant_context.user),
+        execute=lambda: client.create_purchase(
+            purchase,
+            actor=tenant_context.user,
+            idempotency_key=key,
+        ),
+        recover=lambda: client.recover_created_purchase(key),
     )
 
 
@@ -363,6 +369,7 @@ async def _idempotent_response(
     request_hash: str,
     status_code: int,
     execute: Callable[[], Awaitable[T]],
+    recover: Callable[[], Awaitable[T | None]] | None = None,
 ) -> JSONResponse:
     begin = _begin_idempotency(store, tenant=tenant, key=key, request_hash=request_hash)
     if begin.record is not None:
@@ -372,9 +379,29 @@ async def _idempotent_response(
         )
 
     if not begin.acquired:
+        recovered_response = await _recover_idempotent_response(
+            store=store,
+            tenant=tenant,
+            key=key,
+            request_hash=request_hash,
+            status_code=status_code,
+            recover=recover,
+        )
+        if recovered_response is not None:
+            return recovered_response
         record = await _wait_idempotency(store, tenant=tenant, key=key, request_hash=request_hash)
         if record is not None:
             return JSONResponse(status_code=record.status_code, content=record.response_body)
+        recovered_response = await _recover_idempotent_response(
+            store=store,
+            tenant=tenant,
+            key=key,
+            request_hash=request_hash,
+            status_code=status_code,
+            recover=recover,
+        )
+        if recovered_response is not None:
+            return recovered_response
         raise _api_error(
             status.HTTP_409_CONFLICT,
             "IDEMPOTENCY_CONFLICT",
@@ -384,9 +411,44 @@ async def _idempotent_response(
     try:
         result = await _call_erpnext(execute())
     except Exception:
+        recovered_response = await _recover_idempotent_response(
+            store=store,
+            tenant=tenant,
+            key=key,
+            request_hash=request_hash,
+            status_code=status_code,
+            recover=recover,
+        )
+        if recovered_response is not None:
+            return recovered_response
         store.release(tenant=tenant, key=key, request_hash=request_hash)
         raise
 
+    response_body = jsonable_encoder(result)
+    store.complete(
+        tenant=tenant,
+        key=key,
+        request_hash=request_hash,
+        status_code=status_code,
+        response_body=response_body,
+    )
+    return JSONResponse(status_code=status_code, content=response_body)
+
+
+async def _recover_idempotent_response(
+    *,
+    store: IdempotencyStore,
+    tenant: str,
+    key: str,
+    request_hash: str,
+    status_code: int,
+    recover: Callable[[], Awaitable[T | None]] | None,
+) -> JSONResponse | None:
+    if recover is None:
+        return None
+    result = await _call_erpnext(recover())
+    if result is None:
+        return None
     response_body = jsonable_encoder(result)
     store.complete(
         tenant=tenant,

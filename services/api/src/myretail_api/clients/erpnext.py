@@ -1,9 +1,11 @@
+import asyncio
 import json
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, ClassVar
 from urllib.parse import quote
 
 import httpx
@@ -86,6 +88,10 @@ class ERPNextUnavailableError(RuntimeError):
     """Raised when ERPNext cannot serve a valid response."""
 
 
+class ERPNextAmbiguousCreateError(ERPNextUnavailableError):
+    """Raised when ERPNext may have created a document but did not return it."""
+
+
 class ERPNextTimeoutError(RuntimeError):
     """Raised when ERPNext does not respond before the configured timeout."""
 
@@ -139,6 +145,9 @@ class StockQuantities:
 
 
 class ERPNextClient:
+    _resource_locks: ClassVar[dict[tuple[int, str], asyncio.Lock]] = {}
+    _resource_locks_guard: ClassVar[threading.Lock] = threading.Lock()
+
     def __init__(
         self,
         settings: Settings,
@@ -161,6 +170,17 @@ class ERPNextClient:
         self._buying_price_list = settings.erpnext_buying_price_list
         self._company = settings.erpnext_company
         self._currency = settings.default_currency
+
+    @classmethod
+    def _resource_lock(cls, doctype: str, document_id: str) -> asyncio.Lock:
+        loop_id = id(asyncio.get_running_loop())
+        key = (loop_id, f"{doctype}:{document_id}")
+        with cls._resource_locks_guard:
+            lock = cls._resource_locks.get(key)
+            if lock is None:
+                lock = asyncio.Lock()
+                cls._resource_locks[key] = lock
+            return lock
 
     async def authenticate_user(self, *, email: str, password: str) -> ERPNextUser:
         try:
@@ -442,8 +462,13 @@ class ERPNextClient:
     async def get_supplier(self, supplier_id: str) -> Supplier:
         return self._to_supplier(await self._get_supplier_row(supplier_id))
 
-    async def create_supplier(self, supplier: SupplierCreate) -> Supplier:
-        payload = self._supplier_payload(supplier)
+    async def create_supplier(
+        self,
+        supplier: SupplierCreate,
+        *,
+        idempotency_key: str | None = None,
+    ) -> Supplier:
+        payload = self._supplier_payload(supplier, create_idempotency_key=idempotency_key)
         response = await self._request_json(
             "POST",
             "/api/resource/Supplier",
@@ -455,23 +480,37 @@ class ERPNextClient:
             supplier_id = str(data.get("name") or "")
         if not supplier_id:
             supplier_id = str(data or "")
-        return await self.get_supplier(supplier_id)
+        if not supplier_id:
+            recovered = await self.recover_created_supplier(idempotency_key)
+            if recovered is not None:
+                return recovered
+            raise ERPNextUnavailableError("ERPNext Supplier create response does not contain name")
+        try:
+            return await self.get_supplier(supplier_id)
+        except (ERPNextProductNotFoundError, ERPNextTimeoutError, ERPNextUnavailableError) as exc:
+            recovered = await self.recover_created_supplier(idempotency_key)
+            if recovered is not None:
+                return recovered
+            raise ERPNextAmbiguousCreateError(
+                "ERPNext Supplier was created but could not be read back"
+            ) from exc
 
     async def update_supplier(self, supplier_id: str, supplier: SupplierUpdate) -> Supplier:
-        row = await self._get_supplier_row(supplier_id)
-        self._ensure_expected_updated_at(
-            row,
-            supplier.expected_updated_at,
-            code="SUPPLIER_CHANGED",
-            field_name="expected_updated_at",
-        )
-        payload = self._supplier_payload(supplier, original=row)
-        await self._request_json(
-            "PUT",
-            f"/api/resource/Supplier/{quote(supplier_id, safe='')}",
-            json_payload=payload,
-        )
-        return await self.get_supplier(supplier_id)
+        async with self._resource_lock("Supplier", supplier_id):
+            row = await self._get_supplier_row(supplier_id)
+            self._ensure_expected_updated_at(
+                row,
+                supplier.expected_updated_at,
+                code="SUPPLIER_CHANGED",
+                field_name="expected_updated_at",
+            )
+            payload = self._supplier_payload(supplier, original=row)
+            await self._request_json(
+                "PUT",
+                f"/api/resource/Supplier/{quote(supplier_id, safe='')}",
+                json_payload=payload,
+            )
+            return await self.get_supplier(supplier_id)
 
     async def archive_supplier(self, supplier_id: str) -> None:
         row = await self._get_supplier_row(supplier_id)
@@ -567,10 +606,14 @@ class ERPNextClient:
         purchase: PurchaseCreate,
         *,
         actor: AuthenticatedUser,
+        idempotency_key: str | None = None,
     ) -> Purchase:
         supplier = await self._assert_supplier_active(purchase.supplier_id)
         await self._assert_warehouse_active(purchase.warehouse_id)
         lines = await self._build_purchase_lines(purchase.lines)
+        original_prices = await self._current_buying_price_snapshots(
+            [line.product_id for line in lines]
+        )
         created_at = datetime.now(UTC)
         payload = self._to_purchase_receipt_payload(
             purchase,
@@ -579,6 +622,7 @@ class ERPNextClient:
             actor=actor,
             created_at=created_at,
             docstatus=0,
+            create_idempotency_key=idempotency_key,
         )
         response = await self._request_json(
             "POST",
@@ -589,9 +633,36 @@ class ERPNextClient:
         purchase_id = ""
         if isinstance(data, Mapping):
             purchase_id = str(data.get("name") or "")
-        return await self.get_purchase(purchase_id)
+        if not purchase_id:
+            created = await self.recover_created_purchase(idempotency_key)
+            if created is None:
+                raise ERPNextUnavailableError(
+                    "ERPNext Purchase Receipt create response does not contain name"
+                )
+            await self._restore_buying_price_snapshots(original_prices)
+            return created
+        try:
+            created = await self.get_purchase(purchase_id)
+        except (ERPNextProductNotFoundError, ERPNextTimeoutError, ERPNextUnavailableError) as exc:
+            created = await self.recover_created_purchase(idempotency_key)
+            if created is not None:
+                await self._restore_buying_price_snapshots(original_prices)
+                return created
+            raise ERPNextAmbiguousCreateError(
+                "ERPNext Purchase Receipt was created but could not be read back"
+            ) from exc
+        await self._restore_buying_price_snapshots(original_prices)
+        return created
 
     async def update_purchase(self, purchase_id: str, purchase: PurchaseUpdate) -> Purchase:
+        async with self._resource_lock("Purchase Receipt", purchase_id):
+            return await self._update_purchase_unlocked(purchase_id, purchase)
+
+    async def _update_purchase_unlocked(
+        self,
+        purchase_id: str,
+        purchase: PurchaseUpdate,
+    ) -> Purchase:
         row = await self._get_purchase_receipt(purchase_id)
         if int(row.get("docstatus") or 0) != 0:
             raise ERPNextConflictError(
@@ -755,11 +826,14 @@ class ERPNextClient:
         supplier: SupplierCreate | SupplierUpdate,
         *,
         original: Mapping[str, Any] | None = None,
+        create_idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         update_fields = supplier.model_dump(exclude={"expected_updated_at"}, exclude_unset=True)
         metadata = dict(self._extract_myretail_supplier_metadata(
             original.get("supplier_details") if original is not None else None
         ))
+        if create_idempotency_key is not None:
+            metadata["create_idempotency_key"] = create_idempotency_key
         for field in ("contact_name", "phone", "email", "address"):
             if field in update_fields:
                 metadata[field] = update_fields[field]
@@ -788,6 +862,25 @@ class ERPNextClient:
             separators=(",", ":"),
         )
         return payload
+
+    async def recover_created_supplier(self, idempotency_key: str | None) -> Supplier | None:
+        if idempotency_key is None:
+            return None
+        rows = await self._query_resource(
+            "Supplier",
+            fields=[
+                "name",
+                "supplier_name",
+                "tax_id",
+                "supplier_details",
+                "disabled",
+                "modified",
+            ],
+            filters=[["Supplier", "supplier_details", "like", f"%{idempotency_key}%"]],
+            limit=2,
+            order_by="creation desc",
+        )
+        return self._to_supplier(rows[0]) if rows else None
 
     async def _get_supplier_row(self, supplier_id: str) -> Mapping[str, Any]:
         payload = await self._request_json(
@@ -928,6 +1021,7 @@ class ERPNextClient:
         actor: AuthenticatedUser,
         created_at: datetime,
         docstatus: int,
+        create_idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         metadata = {
             "myretail_purchase": {
@@ -943,6 +1037,8 @@ class ERPNextClient:
                 "lines": [line.model_dump() for line in lines],
             }
         }
+        if create_idempotency_key is not None:
+            metadata["myretail_purchase"]["create_idempotency_key"] = create_idempotency_key
         return {
             "doctype": "Purchase Receipt",
             "company": self._company,
@@ -977,6 +1073,35 @@ class ERPNextClient:
             "rate": line.unit_price,
             "amount": line.line_total,
         }
+
+    async def recover_created_purchase(self, idempotency_key: str | None) -> Purchase | None:
+        if idempotency_key is None:
+            return None
+        rows = await self._query_resource(
+            "Purchase Receipt",
+            fields=[
+                "name",
+                "supplier",
+                "supplier_name",
+                "set_warehouse",
+                "posting_date",
+                "docstatus",
+                "owner",
+                "creation",
+                "modified",
+                "remarks",
+                "currency",
+                "net_total",
+                "grand_total",
+            ],
+            filters=[["Purchase Receipt", "remarks", "like", f"%{idempotency_key}%"]],
+            limit=2,
+            order_by="creation desc",
+        )
+        if not rows:
+            return None
+        purchase_id = str(rows[0].get("name") or "")
+        return await self._to_purchase(rows[0], events=await self._get_purchase_events(purchase_id))
 
     async def _get_purchase_receipt(self, purchase_id: str) -> Mapping[str, Any]:
         payload = await self._request_json(
@@ -1121,6 +1246,21 @@ class ERPNextClient:
                 "price": self._format_money(row.get("price_list_rate") or "0"),
             }
         return snapshots
+
+    async def _restore_buying_price_snapshots(
+        self,
+        snapshots: Mapping[str, Mapping[str, object]],
+    ) -> None:
+        for item_code, snapshot in snapshots.items():
+            if snapshot.get("exists") and snapshot.get("price") is not None:
+                await self._upsert_item_price(
+                    item_code=item_code,
+                    price_list=self._buying_price_list,
+                    price=str(snapshot["price"]),
+                    buying=True,
+                )
+            else:
+                await self._delete_item_price(item_code, self._buying_price_list)
 
     async def _latest_posted_purchase_price(
         self,

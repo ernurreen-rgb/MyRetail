@@ -8,7 +8,11 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
-from myretail_api.clients.erpnext import ERPNextConflictError, ERPNextUnavailableError
+from myretail_api.clients.erpnext import (
+    ERPNextConflictError,
+    ERPNextUnavailableError,
+    ERPNextValidationError,
+)
 from myretail_api.config import Settings, get_settings
 from myretail_api.dependencies import get_erpnext_client, get_purchases_idempotency_store
 from myretail_api.idempotency import IdempotencyStore
@@ -45,6 +49,12 @@ class StubPurchasesERPNextClient:
         self.buying_prices: dict[str, str | None] = {"QA-MILK-001": "510.00"}
         self.next_supplier = 1
         self.next_purchase = 1
+        self.create_supplier_calls = 0
+        self.create_purchase_calls = 0
+        self.supplier_create_keys: dict[str, str] = {}
+        self.purchase_create_keys: dict[str, str] = {}
+        self.product_units: dict[str, str] = {"QA-MILK-001": "Nos"}
+        self.warehouses = {"Stores - MR", "Reserve - MR"}
         self.submit_calls = 0
 
     async def list_suppliers(
@@ -89,7 +99,13 @@ class StubPurchasesERPNextClient:
             raise ERPNextUnavailableError("not found")
         return supplier
 
-    async def create_supplier(self, supplier: SupplierCreate) -> Supplier:
+    async def create_supplier(
+        self,
+        supplier: SupplierCreate,
+        *,
+        idempotency_key: str | None = None,
+    ) -> Supplier:
+        self.create_supplier_calls += 1
         supplier_id = f"SUP-{self.next_supplier:05d}"
         self.next_supplier += 1
         created = Supplier(
@@ -104,7 +120,15 @@ class StubPurchasesERPNextClient:
             updated_at=self.now,
         )
         self.suppliers[supplier_id] = created
+        if idempotency_key is not None:
+            self.supplier_create_keys[idempotency_key] = supplier_id
         return created
+
+    async def recover_created_supplier(self, idempotency_key: str | None) -> Supplier | None:
+        if idempotency_key is None:
+            return None
+        supplier_id = self.supplier_create_keys.get(idempotency_key)
+        return self.suppliers.get(supplier_id or "")
 
     async def update_supplier(self, supplier_id: str, supplier: SupplierUpdate) -> Supplier:
         current = self.suppliers[supplier_id]
@@ -180,16 +204,30 @@ class StubPurchasesERPNextClient:
         purchase: PurchaseCreate,
         *,
         actor: AuthenticatedUser,
+        idempotency_key: str | None = None,
     ) -> Purchase:
+        self.create_purchase_calls += 1
         supplier = self.suppliers[purchase.supplier_id]
         if not supplier.is_active:
             raise ERPNextConflictError("SUPPLIER_ARCHIVED", "archived")
+        if purchase.warehouse_id not in self.warehouses:
+            raise ERPNextValidationError("warehouse", {"warehouse_id": "invalid"})
+        for index, line in enumerate(purchase.lines):
+            unit = self.product_units.get(line.product_id)
+            if unit is None:
+                raise ERPNextValidationError("product", {f"lines.{index}.product_id": "invalid"})
+            quantity = Decimal(line.quantity)
+            if unit == "Nos" and quantity != quantity.to_integral_value():
+                raise ERPNextValidationError(
+                    "fractional",
+                    {f"lines.{index}.quantity": "fractional Nos"},
+                )
         lines = [
             PurchaseLine(
                 product_id=line.product_id,
                 sku=line.product_id,
                 name="Milk",
-                unit="Nos",
+                unit=self.product_units[line.product_id],
                 quantity=line.quantity,
                 unit_price=line.unit_price,
                 line_total=f"{Decimal(line.quantity) * Decimal(line.unit_price):.2f}",
@@ -221,7 +259,15 @@ class StubPurchasesERPNextClient:
             lines=lines,
         )
         self.purchases[purchase_id] = created
+        if idempotency_key is not None:
+            self.purchase_create_keys[idempotency_key] = purchase_id
         return created
+
+    async def recover_created_purchase(self, idempotency_key: str | None) -> Purchase | None:
+        if idempotency_key is None:
+            return None
+        purchase_id = self.purchase_create_keys.get(idempotency_key)
+        return self.purchases.get(purchase_id or "")
 
     async def update_purchase(self, purchase_id: str, purchase: PurchaseUpdate) -> Purchase:
         current = self.purchases[purchase_id]
@@ -246,6 +292,8 @@ class StubPurchasesERPNextClient:
         current = self.purchases[purchase_id]
         if current.status == "posted":
             raise ERPNextConflictError("PURCHASE_ALREADY_POSTED", "posted")
+        if not self.suppliers[current.supplier.id].is_active:
+            raise ERPNextConflictError("SUPPLIER_ARCHIVED", "archived")
         if current.updated_at != request.expected_updated_at:
             raise ERPNextConflictError("PURCHASE_CHANGED", "changed")
         for line in current.lines:
@@ -310,6 +358,47 @@ class BlockingSubmitPurchasesClient(StubPurchasesERPNextClient):
         await self.release.wait()
         self.submit_calls -= 1
         return await super().submit_purchase(purchase_id, request, actor=actor)
+
+
+class FlakySupplierCreateClient(StubPurchasesERPNextClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_once = True
+
+    async def create_supplier(
+        self,
+        supplier: SupplierCreate,
+        *,
+        idempotency_key: str | None = None,
+    ) -> Supplier:
+        created = await super().create_supplier(supplier, idempotency_key=idempotency_key)
+        if self.fail_once:
+            self.fail_once = False
+            raise ERPNextUnavailableError("lost supplier response")
+        return created
+
+
+class FlakyPurchaseCreateClient(StubPurchasesERPNextClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_once = True
+
+    async def create_purchase(
+        self,
+        purchase: PurchaseCreate,
+        *,
+        actor: AuthenticatedUser,
+        idempotency_key: str | None = None,
+    ) -> Purchase:
+        created = await super().create_purchase(
+            purchase,
+            actor=actor,
+            idempotency_key=idempotency_key,
+        )
+        if self.fail_once:
+            self.fail_once = False
+            raise ERPNextUnavailableError("lost purchase response")
+        return created
 
 
 @pytest.fixture
@@ -433,6 +522,40 @@ async def test_supplier_crud_search_pagination_and_archive(tmp_path: Path) -> No
 
 
 @pytest.mark.anyio
+async def test_supplier_create_recovers_partial_failure_without_second_create(
+    tmp_path: Path,
+) -> None:
+    erpnext_client = FlakySupplierCreateClient()
+    app = make_app(erpnext_client, tmp_path)
+    key = str(uuid4())
+    payload = {
+        "name": "Supplier Recovery",
+        "tax_id": "123456789012",
+        "contact_name": "Damir",
+    }
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        first_response = await client.post(
+            "/suppliers",
+            headers=auth_headers(tmp_path, idempotency_key=key),
+            json=payload,
+        )
+        second_response = await client.post(
+            "/suppliers",
+            headers=auth_headers(tmp_path, idempotency_key=key),
+            json=payload,
+        )
+
+    assert first_response.status_code == 201
+    assert second_response.status_code == 201
+    assert first_response.json()["id"] == second_response.json()["id"]
+    assert erpnext_client.create_supplier_calls == 1
+
+
+@pytest.mark.anyio
 async def test_purchases_cashier_and_wrong_tenant_are_forbidden(tmp_path: Path) -> None:
     app = make_app(StubPurchasesERPNextClient(), tmp_path)
 
@@ -512,6 +635,158 @@ async def test_purchase_draft_submit_cancel_flow_updates_stock_and_price(tmp_pat
 
 
 @pytest.mark.anyio
+async def test_purchase_create_recovers_partial_failure_without_second_create(
+    tmp_path: Path,
+) -> None:
+    erpnext_client = FlakyPurchaseCreateClient()
+    app = make_app(erpnext_client, tmp_path)
+    key = str(uuid4())
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        supplier = await create_supplier_via_api(client, tmp_path)
+        payload = {
+            "supplier_id": supplier["id"],
+            "warehouse_id": "Stores - MR",
+            "posting_date": "2026-06-30",
+            "lines": [
+                {"product_id": "QA-MILK-001", "quantity": "1.000", "unit_price": "600.00"}
+            ],
+        }
+        first_response = await client.post(
+            "/purchases",
+            headers=auth_headers(tmp_path, idempotency_key=key),
+            json=payload,
+        )
+        second_response = await client.post(
+            "/purchases",
+            headers=auth_headers(tmp_path, idempotency_key=key),
+            json=payload,
+        )
+
+    assert first_response.status_code == 201
+    assert second_response.status_code == 201
+    assert first_response.json()["id"] == second_response.json()["id"]
+    assert erpnext_client.create_purchase_calls == 1
+
+
+@pytest.mark.anyio
+async def test_purchase_patch_returns_changed_and_immutable_conflicts(tmp_path: Path) -> None:
+    erpnext_client = StubPurchasesERPNextClient()
+    app = make_app(erpnext_client, tmp_path)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        supplier = await create_supplier_via_api(client, tmp_path)
+        draft_response = await client.post(
+            "/purchases",
+            headers=auth_headers(tmp_path, idempotency_key=str(uuid4())),
+            json={
+                "supplier_id": supplier["id"],
+                "warehouse_id": "Stores - MR",
+                "posting_date": "2026-06-30",
+                "lines": [
+                    {"product_id": "QA-MILK-001", "quantity": "1.000", "unit_price": "600.00"}
+                ],
+            },
+        )
+        draft = draft_response.json()
+        update_response = await client.patch(
+            f"/purchases/{draft['id']}",
+            headers=auth_headers(tmp_path),
+            json={"expected_updated_at": draft["updated_at"], "comment": "Updated"},
+        )
+        stale_response = await client.patch(
+            f"/purchases/{draft['id']}",
+            headers=auth_headers(tmp_path),
+            json={"expected_updated_at": draft["updated_at"], "comment": "Stale"},
+        )
+        updated = update_response.json()
+        submit_response = await client.post(
+            f"/purchases/{draft['id']}/submit",
+            headers=auth_headers(tmp_path, idempotency_key=str(uuid4())),
+            json={"expected_updated_at": updated["updated_at"]},
+        )
+        immutable_response = await client.patch(
+            f"/purchases/{draft['id']}",
+            headers=auth_headers(tmp_path),
+            json={
+                "expected_updated_at": submit_response.json()["updated_at"],
+                "comment": "After submit",
+            },
+        )
+
+    assert update_response.status_code == 200
+    assert stale_response.status_code == 409
+    assert stale_response.json()["error"]["code"] == "PURCHASE_CHANGED"
+    assert immutable_response.status_code == 409
+    assert immutable_response.json()["error"]["code"] == "PURCHASE_IMMUTABLE"
+
+
+@pytest.mark.anyio
+async def test_archived_supplier_is_blocked_for_purchase_create_and_submit(
+    tmp_path: Path,
+) -> None:
+    erpnext_client = StubPurchasesERPNextClient()
+    app = make_app(erpnext_client, tmp_path)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        archived_supplier = await create_supplier_via_api(client, tmp_path, name="Archived")
+        await client.delete(
+            f"/suppliers/{archived_supplier['id']}",
+            headers=auth_headers(tmp_path),
+        )
+        create_response = await client.post(
+            "/purchases",
+            headers=auth_headers(tmp_path, idempotency_key=str(uuid4())),
+            json={
+                "supplier_id": archived_supplier["id"],
+                "warehouse_id": "Stores - MR",
+                "posting_date": "2026-06-30",
+                "lines": [
+                    {"product_id": "QA-MILK-001", "quantity": "1.000", "unit_price": "600.00"}
+                ],
+            },
+        )
+
+        active_supplier = await create_supplier_via_api(client, tmp_path, name="Active")
+        draft_response = await client.post(
+            "/purchases",
+            headers=auth_headers(tmp_path, idempotency_key=str(uuid4())),
+            json={
+                "supplier_id": active_supplier["id"],
+                "warehouse_id": "Stores - MR",
+                "posting_date": "2026-06-30",
+                "lines": [
+                    {"product_id": "QA-MILK-001", "quantity": "1.000", "unit_price": "600.00"}
+                ],
+            },
+        )
+        draft = draft_response.json()
+        await client.delete(
+            f"/suppliers/{active_supplier['id']}",
+            headers=auth_headers(tmp_path),
+        )
+        submit_response = await client.post(
+            f"/purchases/{draft['id']}/submit",
+            headers=auth_headers(tmp_path, idempotency_key=str(uuid4())),
+            json={"expected_updated_at": draft["updated_at"]},
+        )
+
+    assert create_response.status_code == 409
+    assert create_response.json()["error"]["code"] == "SUPPLIER_ARCHIVED"
+    assert submit_response.status_code == 409
+    assert submit_response.json()["error"]["code"] == "SUPPLIER_ARCHIVED"
+
+
+@pytest.mark.anyio
 async def test_purchase_submit_is_concurrently_idempotent(tmp_path: Path) -> None:
     erpnext_client = BlockingSubmitPurchasesClient()
     app = make_app(erpnext_client, tmp_path)
@@ -559,6 +834,63 @@ async def test_purchase_submit_is_concurrently_idempotent(tmp_path: Path) -> Non
     assert second_response.status_code == 200
     assert first_response.json()["id"] == second_response.json()["id"]
     assert erpnext_client.submit_calls == 1
+
+
+@pytest.mark.anyio
+async def test_purchase_line_validation_covers_precision_and_missing_refs(
+    tmp_path: Path,
+) -> None:
+    erpnext_client = StubPurchasesERPNextClient()
+    app = make_app(erpnext_client, tmp_path)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        supplier = await create_supplier_via_api(client, tmp_path)
+
+        async def post_purchase(line: dict[str, str], warehouse_id: str = "Stores - MR") -> int:
+            response = await client.post(
+                "/purchases",
+                headers=auth_headers(tmp_path, idempotency_key=str(uuid4())),
+                json={
+                    "supplier_id": supplier["id"],
+                    "warehouse_id": warehouse_id,
+                    "posting_date": "2026-06-30",
+                    "lines": [line],
+                },
+            )
+            return response.status_code
+
+        statuses = [
+            await post_purchase(
+                {"product_id": "QA-MILK-001", "quantity": "0.000", "unit_price": "600.00"}
+            ),
+            await post_purchase(
+                {"product_id": "QA-MILK-001", "quantity": "-1.000", "unit_price": "600.00"}
+            ),
+            await post_purchase(
+                {"product_id": "QA-MILK-001", "quantity": "1.0001", "unit_price": "600.00"}
+            ),
+            await post_purchase(
+                {"product_id": "QA-MILK-001", "quantity": "1.000", "unit_price": "-1.00"}
+            ),
+            await post_purchase(
+                {"product_id": "QA-MILK-001", "quantity": "1.000", "unit_price": "1.001"}
+            ),
+            await post_purchase(
+                {"product_id": "QA-MILK-001", "quantity": "1.500", "unit_price": "600.00"}
+            ),
+            await post_purchase(
+                {"product_id": "MISSING", "quantity": "1.000", "unit_price": "600.00"}
+            ),
+            await post_purchase(
+                {"product_id": "QA-MILK-001", "quantity": "1.000", "unit_price": "600.00"},
+                warehouse_id="Missing - MR",
+            ),
+        ]
+
+    assert statuses == [422, 422, 422, 422, 422, 422, 422, 422]
 
 
 @pytest.mark.anyio

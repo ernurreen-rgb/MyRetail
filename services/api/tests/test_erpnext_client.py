@@ -1,5 +1,6 @@
+import asyncio
 import json
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import httpx
 import pytest
@@ -16,7 +17,13 @@ from myretail_api.clients.erpnext import (
 from myretail_api.config import Settings
 from myretail_api.models.auth import AuthenticatedUser
 from myretail_api.models.products import ProductCreate, ProductUpdate
-from myretail_api.models.purchases import PurchaseCancelRequest, PurchaseSubmitRequest
+from myretail_api.models.purchases import (
+    PurchaseCancelRequest,
+    PurchaseCreate,
+    PurchaseSubmitRequest,
+    PurchaseUpdate,
+    SupplierUpdate,
+)
 from myretail_api.models.stock import StockMovementCancelRequest, StockMovementCreate
 
 
@@ -1080,6 +1087,346 @@ async def test_authenticate_user_fails_closed_when_roles_cannot_be_verified() ->
 
     with pytest.raises(ERPNextRoleVerificationError):
         await client.authenticate_user(email="cashier@example.com", password="correct")
+
+
+@pytest.mark.anyio
+async def test_update_supplier_serializes_expected_updated_at_conflict() -> None:
+    state = {
+        "phone": "+7 700 000 00 00",
+        "modified": "2026-06-30T08:00:00Z",
+    }
+    put_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal put_calls
+        if request.url.path == "/api/resource/Supplier/SUP-00001":
+            if request.method == "GET":
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "name": "SUP-00001",
+                            "supplier_name": "Supplier",
+                            "supplier_details": json.dumps(
+                                {"myretail_supplier": {"phone": state["phone"]}},
+                                separators=(",", ":"),
+                            ),
+                            "disabled": 0,
+                            "modified": state["modified"],
+                        }
+                    },
+                )
+            if request.method == "PUT":
+                put_calls += 1
+                await asyncio.sleep(0.05)
+                payload = json.loads(request.content)
+                metadata = json.loads(payload["supplier_details"])["myretail_supplier"]
+                state["phone"] = metadata["phone"]
+                state["modified"] = "2026-06-30T08:01:00Z"
+                return httpx.Response(200, json={"data": {}})
+        return httpx.Response(404)
+
+    client = ERPNextClient(make_settings(), transport=httpx.MockTransport(handler))
+    expected = datetime(2026, 6, 30, 8, 0, tzinfo=UTC)
+
+    results = await asyncio.gather(
+        client.update_supplier(
+            "SUP-00001",
+            SupplierUpdate(expected_updated_at=expected, phone="+7 701 111 22 33"),
+        ),
+        client.update_supplier(
+            "SUP-00001",
+            SupplierUpdate(expected_updated_at=expected, phone="+7 702 111 22 33"),
+        ),
+        return_exceptions=True,
+    )
+
+    conflicts = [result for result in results if isinstance(result, ERPNextConflictError)]
+    successes = [result for result in results if not isinstance(result, Exception)]
+    assert len(successes) == 1
+    assert len(conflicts) == 1
+    assert conflicts[0].code == "SUPPLIER_CHANGED"
+    assert put_calls == 1
+
+
+@pytest.mark.anyio
+async def test_update_purchase_serializes_expected_updated_at_conflict() -> None:
+    metadata = {
+        "myretail_purchase": {
+            "created_by": {"email": "owner@example.com", "full_name": "Owner"},
+            "created_at": "2026-06-30T08:00:00Z",
+            "lines": [
+                {
+                    "product_id": "QA-MILK-001",
+                    "sku": "QA-MILK-001",
+                    "name": "Milk",
+                    "unit": "Nos",
+                    "quantity": "1.000",
+                    "unit_price": "600.00",
+                    "line_total": "600.00",
+                }
+            ],
+        }
+    }
+    purchase_doc: dict[str, object] = {
+        "doctype": "Purchase Receipt",
+        "name": "PREC-00001",
+        "supplier": "SUP-00001",
+        "supplier_name": "Supplier",
+        "set_warehouse": "Stores - MR",
+        "posting_date": "2026-06-30",
+        "docstatus": 0,
+        "owner": "owner@example.com",
+        "creation": "2026-06-30T08:00:00Z",
+        "modified": "2026-06-30T08:00:00Z",
+        "currency": "KZT",
+        "remarks": json.dumps(metadata, separators=(",", ":")),
+        "items": [],
+    }
+    put_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal put_calls
+        if request.url.path in {
+            "/api/resource/Purchase%20Receipt/PREC-00001",
+            "/api/resource/Purchase Receipt/PREC-00001",
+        }:
+            if request.method == "GET":
+                return httpx.Response(200, json={"data": purchase_doc})
+            if request.method == "PUT":
+                put_calls += 1
+                await asyncio.sleep(0.05)
+                payload = json.loads(request.content)
+                purchase_doc["remarks"] = payload["remarks"]
+                purchase_doc["modified"] = "2026-06-30T08:02:00Z"
+                return httpx.Response(200, json={"data": {}})
+        if request.url.path == "/api/resource/Supplier/SUP-00001":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "name": "SUP-00001",
+                        "supplier_name": "Supplier",
+                        "disabled": 0,
+                        "modified": "2026-06-30T08:00:00Z",
+                    }
+                },
+            )
+        if request.url.path.startswith("/api/resource/Warehouse/"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "name": "Stores - MR",
+                        "warehouse_name": "Stores",
+                        "disabled": 0,
+                        "is_group": 0,
+                    }
+                },
+            )
+        if request.url.path == "/api/resource/Warehouse":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "name": "Stores - MR",
+                            "warehouse_name": "Stores",
+                            "disabled": 0,
+                            "is_group": 0,
+                        }
+                    ]
+                },
+            )
+        if request.url.path == "/api/resource/Item":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "name": "QA-MILK-001",
+                            "item_name": "Milk",
+                            "stock_uom": "Nos",
+                            "disabled": 0,
+                        }
+                    ]
+                },
+            )
+        if request.url.path == "/api/resource/Comment":
+            return httpx.Response(200, json={"data": []})
+        return httpx.Response(404)
+
+    client = ERPNextClient(make_settings(), transport=httpx.MockTransport(handler))
+    expected = datetime(2026, 6, 30, 8, 0, tzinfo=UTC)
+
+    results = await asyncio.gather(
+        client.update_purchase(
+            "PREC-00001",
+            PurchaseUpdate(expected_updated_at=expected, comment="First"),
+        ),
+        client.update_purchase(
+            "PREC-00001",
+            PurchaseUpdate(expected_updated_at=expected, comment="Second"),
+        ),
+        return_exceptions=True,
+    )
+
+    conflicts = [result for result in results if isinstance(result, ERPNextConflictError)]
+    successes = [result for result in results if not isinstance(result, Exception)]
+    assert len(successes) == 1
+    assert len(conflicts) == 1
+    assert conflicts[0].code == "PURCHASE_CHANGED"
+    assert put_calls == 1
+
+
+@pytest.mark.anyio
+async def test_create_purchase_draft_restores_erpnext_auto_buying_price() -> None:
+    state = {"price": "510.00", "purchase_created": False}
+    restored_prices: list[str] = []
+    metadata = {
+        "myretail_purchase": {
+            "created_by": {"email": "owner@example.com", "full_name": "Owner"},
+            "created_at": "2026-06-30T08:00:00Z",
+            "lines": [
+                {
+                    "product_id": "QA-MILK-001",
+                    "sku": "QA-MILK-001",
+                    "name": "Milk",
+                    "unit": "Nos",
+                    "quantity": "1.000",
+                    "unit_price": "778.00",
+                    "line_total": "778.00",
+                }
+            ],
+        }
+    }
+    purchase_doc = {
+        "doctype": "Purchase Receipt",
+        "name": "PREC-00001",
+        "supplier": "SUP-00001",
+        "supplier_name": "Supplier",
+        "set_warehouse": "Stores - MR",
+        "posting_date": "2026-06-30",
+        "docstatus": 0,
+        "owner": "owner@example.com",
+        "creation": "2026-06-30T08:00:00Z",
+        "modified": "2026-06-30T08:00:00Z",
+        "currency": "KZT",
+        "remarks": json.dumps(metadata, separators=(",", ":")),
+        "items": [],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/resource/Supplier/SUP-00001":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "name": "SUP-00001",
+                        "supplier_name": "Supplier",
+                        "disabled": 0,
+                        "modified": "2026-06-30T08:00:00Z",
+                    }
+                },
+            )
+        if request.url.path.startswith("/api/resource/Warehouse/"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "name": "Stores - MR",
+                        "warehouse_name": "Stores",
+                        "disabled": 0,
+                        "is_group": 0,
+                    }
+                },
+            )
+        if request.url.path == "/api/resource/Warehouse":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "name": "Stores - MR",
+                            "warehouse_name": "Stores",
+                            "disabled": 0,
+                            "is_group": 0,
+                        }
+                    ]
+                },
+            )
+        if request.url.path == "/api/resource/Item":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "name": "QA-MILK-001",
+                            "item_name": "Milk",
+                            "stock_uom": "Nos",
+                            "disabled": 0,
+                        }
+                    ]
+                },
+            )
+        if request.url.path in {"/api/resource/Item%20Price", "/api/resource/Item Price"}:
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "name": "PRICE-BUY",
+                            "item_code": "QA-MILK-001",
+                            "price_list": "Standard Buying",
+                            "price_list_rate": state["price"],
+                            "currency": "KZT",
+                        }
+                    ]
+                },
+            )
+        if request.url.path in {
+            "/api/resource/Item%20Price/PRICE-BUY",
+            "/api/resource/Item Price/PRICE-BUY",
+        }:
+            state["price"] = json.loads(request.content)["price_list_rate"]
+            restored_prices.append(state["price"])
+            return httpx.Response(200, json={"data": {}})
+        if request.url.path in {
+            "/api/resource/Purchase%20Receipt",
+            "/api/resource/Purchase Receipt",
+        }:
+            state["purchase_created"] = True
+            state["price"] = "778.00"
+            return httpx.Response(200, json={"data": {"name": "PREC-00001"}})
+        if request.url.path in {
+            "/api/resource/Purchase%20Receipt/PREC-00001",
+            "/api/resource/Purchase Receipt/PREC-00001",
+        }:
+            return httpx.Response(200, json={"data": purchase_doc})
+        if request.url.path == "/api/resource/Comment":
+            return httpx.Response(200, json={"data": []})
+        return httpx.Response(404)
+
+    client = ERPNextClient(make_settings(), transport=httpx.MockTransport(handler))
+    actor = AuthenticatedUser(email="owner@example.com", full_name="Owner", roles=["Owner"])
+
+    created = await client.create_purchase(
+        PurchaseCreate(
+            supplier_id="SUP-00001",
+            warehouse_id="Stores - MR",
+            posting_date=date(2026, 6, 30),
+            lines=[
+                {"product_id": "QA-MILK-001", "quantity": "1.000", "unit_price": "778.00"}
+            ],
+        ),
+        actor=actor,
+        idempotency_key="purchase-create-key",
+    )
+
+    assert created.id == "PREC-00001"
+    assert state["purchase_created"] is True
+    assert state["price"] == "510.00"
+    assert restored_prices == ["510.00"]
 
 
 @pytest.mark.anyio

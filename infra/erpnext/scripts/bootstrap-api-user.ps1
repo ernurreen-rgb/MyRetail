@@ -139,7 +139,6 @@ $permissionDefinitions = @(
         create = 1
         write = 1
         submit = 1
-        cancel = 1
     },
     @{
         parent = "Stock Entry Detail"

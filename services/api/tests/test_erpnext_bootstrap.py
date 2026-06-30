@@ -30,7 +30,7 @@ def test_bootstrap_api_user_grants_minimal_stock_permissions() -> None:
     assert "create = 1" in stock_entry_block
     assert "write = 1" in stock_entry_block
     assert "submit = 1" in stock_entry_block
-    assert "cancel = 1" in stock_entry_block
+    assert "cancel = 1" not in stock_entry_block
     assert '"submit"' in script
     assert '"cancel"' in script
 
