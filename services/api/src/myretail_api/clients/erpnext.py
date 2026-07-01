@@ -1,11 +1,9 @@
-import asyncio
 import json
-import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
 from decimal import Decimal, InvalidOperation
-from typing import Any, ClassVar
+from typing import Any
 from urllib.parse import quote
 
 import httpx
@@ -145,9 +143,6 @@ class StockQuantities:
 
 
 class ERPNextClient:
-    _resource_locks: ClassVar[dict[tuple[int, str], asyncio.Lock]] = {}
-    _resource_locks_guard: ClassVar[threading.Lock] = threading.Lock()
-
     def __init__(
         self,
         settings: Settings,
@@ -170,17 +165,6 @@ class ERPNextClient:
         self._buying_price_list = settings.erpnext_buying_price_list
         self._company = settings.erpnext_company
         self._currency = settings.default_currency
-
-    @classmethod
-    def _resource_lock(cls, doctype: str, document_id: str) -> asyncio.Lock:
-        loop_id = id(asyncio.get_running_loop())
-        key = (loop_id, f"{doctype}:{document_id}")
-        with cls._resource_locks_guard:
-            lock = cls._resource_locks.get(key)
-            if lock is None:
-                lock = asyncio.Lock()
-                cls._resource_locks[key] = lock
-            return lock
 
     async def authenticate_user(self, *, email: str, password: str) -> ERPNextUser:
         try:
@@ -469,11 +453,19 @@ class ERPNextClient:
         idempotency_key: str | None = None,
     ) -> Supplier:
         payload = self._supplier_payload(supplier, create_idempotency_key=idempotency_key)
-        response = await self._request_json(
-            "POST",
-            "/api/resource/Supplier",
-            json_payload=payload,
-        )
+        try:
+            response = await self._request_json(
+                "POST",
+                "/api/resource/Supplier",
+                json_payload=payload,
+            )
+        except (ERPNextTimeoutError, ERPNextUnavailableError) as exc:
+            recovered = await self.recover_created_supplier(idempotency_key)
+            if recovered is not None:
+                return recovered
+            raise ERPNextAmbiguousCreateError(
+                "ERPNext Supplier create result is ambiguous"
+            ) from exc
         data = response.get("data")
         supplier_id = ""
         if isinstance(data, Mapping):
@@ -484,7 +476,9 @@ class ERPNextClient:
             recovered = await self.recover_created_supplier(idempotency_key)
             if recovered is not None:
                 return recovered
-            raise ERPNextUnavailableError("ERPNext Supplier create response does not contain name")
+            raise ERPNextAmbiguousCreateError(
+                "ERPNext Supplier create response does not contain name"
+            )
         try:
             return await self.get_supplier(supplier_id)
         except (ERPNextProductNotFoundError, ERPNextTimeoutError, ERPNextUnavailableError) as exc:
@@ -496,21 +490,25 @@ class ERPNextClient:
             ) from exc
 
     async def update_supplier(self, supplier_id: str, supplier: SupplierUpdate) -> Supplier:
-        async with self._resource_lock("Supplier", supplier_id):
-            row = await self._get_supplier_row(supplier_id)
-            self._ensure_expected_updated_at(
-                row,
-                supplier.expected_updated_at,
-                code="SUPPLIER_CHANGED",
-                field_name="expected_updated_at",
-            )
-            payload = self._supplier_payload(supplier, original=row)
-            await self._request_json(
-                "PUT",
-                f"/api/resource/Supplier/{quote(supplier_id, safe='')}",
-                json_payload=payload,
-            )
-            return await self.get_supplier(supplier_id)
+        row = await self._get_supplier_row(supplier_id)
+        self._ensure_expected_updated_at(
+            row,
+            supplier.expected_updated_at,
+            code="SUPPLIER_CHANGED",
+            field_name="expected_updated_at",
+        )
+        payload = self._supplier_payload(supplier, original=row)
+        saved = await self._save_document_with_modified_check(
+            "Supplier",
+            supplier_id,
+            row=row,
+            updates=payload,
+            conflict_code="SUPPLIER_CHANGED",
+            field_name="expected_updated_at",
+        )
+        if saved is not None:
+            return self._to_supplier(saved)
+        return await self.get_supplier(supplier_id)
 
     async def archive_supplier(self, supplier_id: str) -> None:
         row = await self._get_supplier_row(supplier_id)
@@ -624,23 +622,32 @@ class ERPNextClient:
             docstatus=0,
             create_idempotency_key=idempotency_key,
         )
-        response = await self._request_json(
-            "POST",
-            "/api/resource/Purchase Receipt",
-            json_payload=payload,
-        )
+        try:
+            response = await self._request_json(
+                "POST",
+                "/api/resource/Purchase Receipt",
+                json_payload=payload,
+            )
+        except (ERPNextTimeoutError, ERPNextUnavailableError) as exc:
+            created = await self.recover_created_purchase(idempotency_key)
+            if created is not None:
+                await self._restore_buying_price_snapshots(original_prices)
+                return created
+            raise ERPNextAmbiguousCreateError(
+                "ERPNext Purchase Receipt create result is ambiguous"
+            ) from exc
         data = response.get("data")
         purchase_id = ""
         if isinstance(data, Mapping):
             purchase_id = str(data.get("name") or "")
         if not purchase_id:
             created = await self.recover_created_purchase(idempotency_key)
-            if created is None:
-                raise ERPNextUnavailableError(
-                    "ERPNext Purchase Receipt create response does not contain name"
-                )
-            await self._restore_buying_price_snapshots(original_prices)
-            return created
+            if created is not None:
+                await self._restore_buying_price_snapshots(original_prices)
+                return created
+            raise ERPNextAmbiguousCreateError(
+                "ERPNext Purchase Receipt create response does not contain name"
+            )
         try:
             created = await self.get_purchase(purchase_id)
         except (ERPNextProductNotFoundError, ERPNextTimeoutError, ERPNextUnavailableError) as exc:
@@ -655,14 +662,6 @@ class ERPNextClient:
         return created
 
     async def update_purchase(self, purchase_id: str, purchase: PurchaseUpdate) -> Purchase:
-        async with self._resource_lock("Purchase Receipt", purchase_id):
-            return await self._update_purchase_unlocked(purchase_id, purchase)
-
-    async def _update_purchase_unlocked(
-        self,
-        purchase_id: str,
-        purchase: PurchaseUpdate,
-    ) -> Purchase:
         row = await self._get_purchase_receipt(purchase_id)
         if int(row.get("docstatus") or 0) != 0:
             raise ERPNextConflictError(
@@ -712,12 +711,17 @@ class ERPNextClient:
         )
         payload.pop("doctype", None)
         payload.pop("docstatus", None)
-        await self._request_json(
-            "PUT",
-            f"/api/resource/Purchase Receipt/{quote(purchase_id, safe='')}",
-            json_payload=payload,
+        saved = await self._save_document_with_modified_check(
+            "Purchase Receipt",
+            purchase_id,
+            row=row,
+            updates=payload,
+            conflict_code="PURCHASE_CHANGED",
+            field_name="expected_updated_at",
         )
-        return await self.get_purchase(purchase_id)
+        return await self.get_purchase(
+            str(saved.get("name") or purchase_id) if saved else purchase_id
+        )
 
     async def submit_purchase(
         self,
@@ -1114,6 +1118,31 @@ class ERPNextClient:
                 "ERPNext Purchase Receipt response does not contain data"
             )
         return data
+
+    async def _save_document_with_modified_check(
+        self,
+        doctype: str,
+        document_id: str,
+        *,
+        row: Mapping[str, Any],
+        updates: Mapping[str, Any],
+        conflict_code: str,
+        field_name: str,
+    ) -> Mapping[str, Any] | None:
+        document = dict(row)
+        document.update(updates)
+        document["doctype"] = doctype
+        document["name"] = document_id
+        conflict_message = "Данные изменены, обновите страницу"
+        payload = await self._request_json(
+            "POST",
+            "/api/method/frappe.client.save",
+            json_payload={"doc": document},
+            timestamp_conflict_code=conflict_code,
+            timestamp_conflict_fields={field_name: conflict_message},
+        )
+        message = payload.get("message") or payload.get("data")
+        return message if isinstance(message, Mapping) else None
 
     async def _submit_document(self, row: Mapping[str, Any]) -> Mapping[str, Any] | None:
         payload = await self._request_json(
@@ -3022,6 +3051,8 @@ class ERPNextClient:
         *,
         params: dict[str, str] | None = None,
         json_payload: Mapping[str, Any] | None = None,
+        timestamp_conflict_code: str | None = None,
+        timestamp_conflict_fields: dict[str, str] | None = None,
     ) -> Mapping[str, Any]:
         try:
             async with httpx.AsyncClient(
@@ -3047,6 +3078,15 @@ class ERPNextClient:
             raise ERPNextProductNotFoundError("ERPNext Item was not found")
         if response.status_code in {408, 504}:
             raise ERPNextTimeoutError("ERPNext request timed out")
+        if (
+            timestamp_conflict_code is not None
+            and self._is_timestamp_conflict_response(response)
+        ):
+            raise ERPNextConflictError(
+                timestamp_conflict_code,
+                "Данные изменены, обновите страницу",
+                timestamp_conflict_fields,
+            )
         if response.status_code >= 500:
             raise ERPNextUnavailableError("ERPNext returned a server error")
 
@@ -3121,6 +3161,23 @@ class ERPNextClient:
             if isinstance(message, str) and message:
                 return message
         return "ERPNext отклонил данные товара"
+
+    @staticmethod
+    def _is_timestamp_conflict_response(response: httpx.Response) -> bool:
+        if response.status_code not in {409, 417, 500}:
+            return False
+        try:
+            payload = json.dumps(response.json(), ensure_ascii=False)
+        except ValueError:
+            payload = response.text
+        return any(
+            marker in payload
+            for marker in (
+                "TimestampMismatchError",
+                "Document has been modified",
+                "modified after you have opened",
+            )
+        )
 
     @staticmethod
     def _extract_roles(raw_roles: Any) -> list[str]:

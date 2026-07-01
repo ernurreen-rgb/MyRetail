@@ -9,7 +9,10 @@ import pytest
 from pydantic import SecretStr
 
 from myretail_api.clients.erpnext import (
+    ERPNextAmbiguousCreateError,
     ERPNextConflictError,
+    ERPNextProductNotFoundError,
+    ERPNextTimeoutError,
     ERPNextUnavailableError,
     ERPNextValidationError,
 )
@@ -165,14 +168,32 @@ class StubPurchasesERPNextClient:
         limit: int = 50,
         offset: int = 0,
     ) -> PurchaseList:
-        _ = q, date_from, date_to
+        query = (q or "").lower()
         items = list(self.purchases.values())
+        if query:
+            items = [
+                purchase
+                for purchase in items
+                if any(
+                    query in str(value or "").lower()
+                    for value in (
+                        purchase.id,
+                        purchase.supplier.name,
+                        purchase.supplier_invoice_number,
+                        purchase.comment,
+                    )
+                )
+            ]
         if supplier_id:
             items = [purchase for purchase in items if purchase.supplier.id == supplier_id]
         if warehouse_id:
             items = [purchase for purchase in items if purchase.warehouse.id == warehouse_id]
         if status:
             items = [purchase for purchase in items if purchase.status == status]
+        if date_from:
+            items = [purchase for purchase in items if purchase.posting_date >= date_from]
+        if date_to:
+            items = [purchase for purchase in items if purchase.posting_date <= date_to]
         summaries = [
             PurchaseSummary(
                 id=purchase.id,
@@ -197,7 +218,10 @@ class StubPurchasesERPNextClient:
         )
 
     async def get_purchase(self, purchase_id: str) -> Purchase:
-        return self.purchases[purchase_id]
+        purchase = self.purchases.get(purchase_id)
+        if purchase is None:
+            raise ERPNextProductNotFoundError("not found")
+        return purchase
 
     async def create_purchase(
         self,
@@ -374,7 +398,7 @@ class FlakySupplierCreateClient(StubPurchasesERPNextClient):
         created = await super().create_supplier(supplier, idempotency_key=idempotency_key)
         if self.fail_once:
             self.fail_once = False
-            raise ERPNextUnavailableError("lost supplier response")
+            raise ERPNextAmbiguousCreateError("lost supplier response")
         return created
 
 
@@ -397,8 +421,42 @@ class FlakyPurchaseCreateClient(StubPurchasesERPNextClient):
         )
         if self.fail_once:
             self.fail_once = False
-            raise ERPNextUnavailableError("lost purchase response")
+            raise ERPNextAmbiguousCreateError("lost purchase response")
         return created
+
+
+class DelayedSupplierRecoveryClient(FlakySupplierCreateClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.recovery_calls = 0
+
+    async def recover_created_supplier(self, idempotency_key: str | None) -> Supplier | None:
+        self.recovery_calls += 1
+        if self.recovery_calls < 3:
+            return None
+        return await super().recover_created_supplier(idempotency_key)
+
+
+class DelayedPurchaseRecoveryClient(FlakyPurchaseCreateClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.recovery_calls = 0
+
+    async def recover_created_purchase(self, idempotency_key: str | None) -> Purchase | None:
+        self.recovery_calls += 1
+        if self.recovery_calls < 3:
+            return None
+        return await super().recover_created_purchase(idempotency_key)
+
+
+class PurchaseRouteFailuresClient(StubPurchasesERPNextClient):
+    async def list_purchases(self, **kwargs: object) -> PurchaseList:
+        _ = kwargs
+        raise ERPNextUnavailableError("ERPNext is down")
+
+    async def get_purchase(self, purchase_id: str) -> Purchase:
+        _ = purchase_id
+        raise ERPNextTimeoutError("ERPNext timed out")
 
 
 @pytest.fixture
@@ -556,6 +614,41 @@ async def test_supplier_create_recovers_partial_failure_without_second_create(
 
 
 @pytest.mark.anyio
+async def test_supplier_create_keeps_idempotency_key_until_delayed_recovery(
+    tmp_path: Path,
+) -> None:
+    erpnext_client = DelayedSupplierRecoveryClient()
+    app = make_app(erpnext_client, tmp_path)
+    key = str(uuid4())
+    payload = {
+        "name": "Delayed Supplier Recovery",
+        "tax_id": "123456789012",
+        "contact_name": "Damir",
+    }
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        first_response = await client.post(
+            "/suppliers",
+            headers=auth_headers(tmp_path, idempotency_key=key),
+            json=payload,
+        )
+        second_response = await client.post(
+            "/suppliers",
+            headers=auth_headers(tmp_path, idempotency_key=key),
+            json=payload,
+        )
+
+    assert first_response.status_code == 503
+    assert second_response.status_code == 201
+    assert second_response.json()["name"] == "Delayed Supplier Recovery"
+    assert erpnext_client.create_supplier_calls == 1
+    assert erpnext_client.recovery_calls >= 3
+
+
+@pytest.mark.anyio
 async def test_purchases_cashier_and_wrong_tenant_are_forbidden(tmp_path: Path) -> None:
     app = make_app(StubPurchasesERPNextClient(), tmp_path)
 
@@ -670,6 +763,177 @@ async def test_purchase_create_recovers_partial_failure_without_second_create(
     assert second_response.status_code == 201
     assert first_response.json()["id"] == second_response.json()["id"]
     assert erpnext_client.create_purchase_calls == 1
+
+
+@pytest.mark.anyio
+async def test_purchase_create_keeps_idempotency_key_until_delayed_recovery(
+    tmp_path: Path,
+) -> None:
+    erpnext_client = DelayedPurchaseRecoveryClient()
+    app = make_app(erpnext_client, tmp_path)
+    key = str(uuid4())
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        supplier = await create_supplier_via_api(client, tmp_path)
+        payload = {
+            "supplier_id": supplier["id"],
+            "warehouse_id": "Stores - MR",
+            "posting_date": "2026-06-30",
+            "lines": [
+                {"product_id": "QA-MILK-001", "quantity": "1.000", "unit_price": "600.00"}
+            ],
+        }
+        first_response = await client.post(
+            "/purchases",
+            headers=auth_headers(tmp_path, idempotency_key=key),
+            json=payload,
+        )
+        second_response = await client.post(
+            "/purchases",
+            headers=auth_headers(tmp_path, idempotency_key=key),
+            json=payload,
+        )
+
+    assert first_response.status_code == 503
+    assert second_response.status_code == 201
+    assert second_response.json()["supplier"]["id"] == supplier["id"]
+    assert erpnext_client.create_purchase_calls == 1
+    assert erpnext_client.recovery_calls >= 3
+
+
+@pytest.mark.anyio
+async def test_purchase_list_filters_dates_offset_count_and_missing_detail(
+    tmp_path: Path,
+) -> None:
+    erpnext_client = StubPurchasesERPNextClient()
+    app = make_app(erpnext_client, tmp_path)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        first_supplier = await create_supplier_via_api(client, tmp_path, name="First Supplier")
+        second_supplier = await create_supplier_via_api(client, tmp_path, name="Second Supplier")
+
+        async def create_purchase(
+            supplier_id: str,
+            warehouse_id: str,
+            posting_date: str,
+            invoice_number: str,
+            comment: str,
+        ) -> dict[str, object]:
+            response = await client.post(
+                "/purchases",
+                headers=auth_headers(tmp_path, idempotency_key=str(uuid4())),
+                json={
+                    "supplier_id": supplier_id,
+                    "warehouse_id": warehouse_id,
+                    "posting_date": posting_date,
+                    "supplier_invoice_number": invoice_number,
+                    "comment": comment,
+                    "lines": [
+                        {
+                            "product_id": "QA-MILK-001",
+                            "quantity": "1.000",
+                            "unit_price": "600.00",
+                        }
+                    ],
+                },
+            )
+            assert response.status_code == 201
+            return response.json()
+
+        await create_purchase(
+            str(first_supplier["id"]),
+            "Stores - MR",
+            "2026-06-28",
+            "A-1",
+            "early",
+        )
+        reserve_purchase = await create_purchase(
+            str(first_supplier["id"]),
+            "Reserve - MR",
+            "2026-06-30",
+            "A-2",
+            "reserve shipment",
+        )
+        await create_purchase(
+            str(second_supplier["id"]),
+            "Stores - MR",
+            "2026-07-01",
+            "B-1",
+            "late",
+        )
+
+        filtered_response = await client.get(
+            "/purchases",
+            headers=auth_headers(tmp_path),
+            params={
+                "supplier_id": first_supplier["id"],
+                "warehouse_id": "Reserve - MR",
+                "status": "draft",
+                "date_from": "2026-06-29",
+                "date_to": "2026-06-30",
+                "limit": "1",
+                "offset": "0",
+            },
+        )
+        offset_response = await client.get(
+            "/purchases",
+            headers=auth_headers(tmp_path),
+            params={"supplier_id": first_supplier["id"], "limit": "1", "offset": "1"},
+        )
+        query_response = await client.get(
+            "/purchases",
+            headers=auth_headers(tmp_path),
+            params={"q": "reserve"},
+        )
+        missing_response = await client.get(
+            "/purchases/PREC-MISSING",
+            headers=auth_headers(tmp_path),
+        )
+
+    filtered = filtered_response.json()
+    assert filtered_response.status_code == 200
+    assert filtered["count"] == 1
+    assert filtered["items"][0]["id"] == reserve_purchase["id"]
+    assert filtered["limit"] == 1
+    assert filtered["offset"] == 0
+
+    offset = offset_response.json()
+    assert offset_response.status_code == 200
+    assert offset["count"] == 2
+    assert offset["limit"] == 1
+    assert offset["offset"] == 1
+    assert offset["items"][0]["id"] == reserve_purchase["id"]
+
+    assert query_response.status_code == 200
+    assert query_response.json()["items"][0]["id"] == reserve_purchase["id"]
+    assert missing_response.status_code == 404
+    assert missing_response.json()["error"]["code"] == "NOT_FOUND"
+
+
+@pytest.mark.anyio
+async def test_purchase_routes_map_erpnext_unavailable_and_timeout(tmp_path: Path) -> None:
+    app = make_app(PurchaseRouteFailuresClient(), tmp_path)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        list_response = await client.get("/purchases", headers=auth_headers(tmp_path))
+        detail_response = await client.get(
+            "/purchases/PREC-00001",
+            headers=auth_headers(tmp_path),
+        )
+
+    assert list_response.status_code == 503
+    assert list_response.json()["error"]["code"] == "ERPNEXT_UNAVAILABLE"
+    assert detail_response.status_code == 504
+    assert detail_response.json()["error"]["code"] == "ERPNEXT_TIMEOUT"
 
 
 @pytest.mark.anyio

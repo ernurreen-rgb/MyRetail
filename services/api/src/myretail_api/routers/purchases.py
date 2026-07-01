@@ -11,6 +11,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 
 from myretail_api.clients.erpnext import (
+    ERPNextAmbiguousCreateError,
     ERPNextAuthenticationError,
     ERPNextClient,
     ERPNextConflictError,
@@ -286,6 +287,8 @@ async def cancel_purchase(
 async def _call_erpnext(call: Awaitable[T]) -> T:
     try:
         return await call
+    except ERPNextAmbiguousCreateError:
+        raise
     except ERPNextTimeoutError as exc:
         raise _api_error(
             status.HTTP_504_GATEWAY_TIMEOUT,
@@ -379,19 +382,35 @@ async def _idempotent_response(
         )
 
     if not begin.acquired:
-        recovered_response = await _recover_idempotent_response(
-            store=store,
-            tenant=tenant,
-            key=key,
-            request_hash=request_hash,
-            status_code=status_code,
-            recover=recover,
+        if recover is not None:
+            response = await _wait_or_recover_idempotency(
+                store=store,
+                tenant=tenant,
+                key=key,
+                request_hash=request_hash,
+                status_code=status_code,
+                recover=recover,
+            )
+            if response is not None:
+                return response
+        else:
+            record = await _wait_idempotency(
+                store=store,
+                tenant=tenant,
+                key=key,
+                request_hash=request_hash,
+            )
+            if record is not None:
+                return JSONResponse(status_code=record.status_code, content=record.response_body)
+        raise _api_error(
+            status.HTTP_409_CONFLICT,
+            "IDEMPOTENCY_CONFLICT",
+            "Запрос с этим Idempotency-Key ещё выполняется",
         )
-        if recovered_response is not None:
-            return recovered_response
-        record = await _wait_idempotency(store, tenant=tenant, key=key, request_hash=request_hash)
-        if record is not None:
-            return JSONResponse(status_code=record.status_code, content=record.response_body)
+
+    try:
+        result = await _call_erpnext(execute())
+    except ERPNextAmbiguousCreateError as exc:
         recovered_response = await _recover_idempotent_response(
             store=store,
             tenant=tenant,
@@ -403,13 +422,10 @@ async def _idempotent_response(
         if recovered_response is not None:
             return recovered_response
         raise _api_error(
-            status.HTTP_409_CONFLICT,
-            "IDEMPOTENCY_CONFLICT",
-            "Запрос с этим Idempotency-Key ещё выполняется",
-        )
-
-    try:
-        result = await _call_erpnext(execute())
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "ERPNEXT_UNAVAILABLE",
+            "ERPNext временно недоступен",
+        ) from exc
     except Exception:
         recovered_response = await _recover_idempotent_response(
             store=store,
@@ -458,6 +474,49 @@ async def _recover_idempotent_response(
         response_body=response_body,
     )
     return JSONResponse(status_code=status_code, content=response_body)
+
+
+async def _wait_or_recover_idempotency(
+    *,
+    store: IdempotencyStore,
+    tenant: str,
+    key: str,
+    request_hash: str,
+    status_code: int,
+    recover: Callable[[], Awaitable[T | None]],
+    timeout_seconds: float = 30.0,
+    poll_seconds: float = 0.25,
+) -> JSONResponse | None:
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    while asyncio.get_running_loop().time() < deadline:
+        try:
+            record = await asyncio.to_thread(
+                store.get_completed,
+                tenant=tenant,
+                key=key,
+                request_hash=request_hash,
+            )
+        except IdempotencyConflictError as exc:
+            raise _api_error(
+                status.HTTP_409_CONFLICT,
+                "IDEMPOTENCY_CONFLICT",
+                "Idempotency-Key уже использован для другого запроса",
+            ) from exc
+        if record is not None:
+            return JSONResponse(status_code=record.status_code, content=record.response_body)
+
+        recovered_response = await _recover_idempotent_response(
+            store=store,
+            tenant=tenant,
+            key=key,
+            request_hash=request_hash,
+            status_code=status_code,
+            recover=recover,
+        )
+        if recovered_response is not None:
+            return recovered_response
+        await asyncio.sleep(poll_seconds)
+    return None
 
 
 def _begin_idempotency(

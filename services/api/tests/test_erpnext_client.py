@@ -1090,40 +1090,47 @@ async def test_authenticate_user_fails_closed_when_roles_cannot_be_verified() ->
 
 
 @pytest.mark.anyio
-async def test_update_supplier_serializes_expected_updated_at_conflict() -> None:
+async def test_update_supplier_uses_frappe_save_expected_updated_at_conflict() -> None:
     state = {
         "phone": "+7 700 000 00 00",
         "modified": "2026-06-30T08:00:00Z",
     }
-    put_calls = 0
+    save_calls = 0
+    server_lock = asyncio.Lock()
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal put_calls
+        nonlocal save_calls
         if request.url.path == "/api/resource/Supplier/SUP-00001":
-            if request.method == "GET":
-                return httpx.Response(
-                    200,
-                    json={
-                        "data": {
-                            "name": "SUP-00001",
-                            "supplier_name": "Supplier",
-                            "supplier_details": json.dumps(
-                                {"myretail_supplier": {"phone": state["phone"]}},
-                                separators=(",", ":"),
-                            ),
-                            "disabled": 0,
-                            "modified": state["modified"],
-                        }
-                    },
-                )
-            if request.method == "PUT":
-                put_calls += 1
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "name": "SUP-00001",
+                        "supplier_name": "Supplier",
+                        "supplier_details": json.dumps(
+                            {"myretail_supplier": {"phone": state["phone"]}},
+                            separators=(",", ":"),
+                        ),
+                        "disabled": 0,
+                        "modified": state["modified"],
+                    }
+                },
+            )
+        if request.url.path == "/api/method/frappe.client.save":
+            save_calls += 1
+            document = json.loads(request.content)["doc"]
+            async with server_lock:
+                if document["modified"] != state["modified"]:
+                    return httpx.Response(
+                        409,
+                        json={"exception": "frappe.exceptions.TimestampMismatchError"},
+                    )
                 await asyncio.sleep(0.05)
-                payload = json.loads(request.content)
-                metadata = json.loads(payload["supplier_details"])["myretail_supplier"]
+                metadata = json.loads(document["supplier_details"])["myretail_supplier"]
                 state["phone"] = metadata["phone"]
                 state["modified"] = "2026-06-30T08:01:00Z"
-                return httpx.Response(200, json={"data": {}})
+                document["modified"] = state["modified"]
+                return httpx.Response(200, json={"message": document})
         return httpx.Response(404)
 
     client = ERPNextClient(make_settings(), transport=httpx.MockTransport(handler))
@@ -1146,11 +1153,11 @@ async def test_update_supplier_serializes_expected_updated_at_conflict() -> None
     assert len(successes) == 1
     assert len(conflicts) == 1
     assert conflicts[0].code == "SUPPLIER_CHANGED"
-    assert put_calls == 1
+    assert save_calls == 2
 
 
 @pytest.mark.anyio
-async def test_update_purchase_serializes_expected_updated_at_conflict() -> None:
+async def test_update_purchase_uses_frappe_save_expected_updated_at_conflict() -> None:
     metadata = {
         "myretail_purchase": {
             "created_by": {"email": "owner@example.com", "full_name": "Owner"},
@@ -1183,23 +1190,30 @@ async def test_update_purchase_serializes_expected_updated_at_conflict() -> None
         "remarks": json.dumps(metadata, separators=(",", ":")),
         "items": [],
     }
-    put_calls = 0
+    save_calls = 0
+    server_lock = asyncio.Lock()
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal put_calls
+        nonlocal save_calls
         if request.url.path in {
             "/api/resource/Purchase%20Receipt/PREC-00001",
             "/api/resource/Purchase Receipt/PREC-00001",
         }:
-            if request.method == "GET":
-                return httpx.Response(200, json={"data": purchase_doc})
-            if request.method == "PUT":
-                put_calls += 1
+            return httpx.Response(200, json={"data": purchase_doc})
+        if request.url.path == "/api/method/frappe.client.save":
+            save_calls += 1
+            document = json.loads(request.content)["doc"]
+            async with server_lock:
+                if document["modified"] != purchase_doc["modified"]:
+                    return httpx.Response(
+                        409,
+                        json={"exception": "frappe.exceptions.TimestampMismatchError"},
+                    )
                 await asyncio.sleep(0.05)
-                payload = json.loads(request.content)
-                purchase_doc["remarks"] = payload["remarks"]
+                purchase_doc["remarks"] = document["remarks"]
                 purchase_doc["modified"] = "2026-06-30T08:02:00Z"
-                return httpx.Response(200, json={"data": {}})
+                document["modified"] = purchase_doc["modified"]
+                return httpx.Response(200, json={"message": document})
         if request.url.path == "/api/resource/Supplier/SUP-00001":
             return httpx.Response(
                 200,
@@ -1276,7 +1290,7 @@ async def test_update_purchase_serializes_expected_updated_at_conflict() -> None
     assert len(successes) == 1
     assert len(conflicts) == 1
     assert conflicts[0].code == "PURCHASE_CHANGED"
-    assert put_calls == 1
+    assert save_calls == 2
 
 
 @pytest.mark.anyio
@@ -1620,7 +1634,12 @@ async def test_cancel_purchase_restores_previous_buying_price_and_blocks_repeat(
             "creation": "2026-06-30T08:01:00Z",
         }
     ]
-    state = {"price": "600.00", "cancel_count": 0}
+    state = {
+        "price": "600.00",
+        "cancel_count": 0,
+        "restore_attempts": 0,
+        "fail_restore_once": True,
+    }
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path in {
@@ -1668,6 +1687,10 @@ async def test_cancel_purchase_restores_previous_buying_price_and_blocks_repeat(
             "/api/resource/Item%20Price/PRICE-BUY",
             "/api/resource/Item Price/PRICE-BUY",
         }:
+            state["restore_attempts"] += 1
+            if state["fail_restore_once"]:
+                state["fail_restore_once"] = False
+                return httpx.Response(503, json={"message": "temporary ERPNext failure"})
             state["price"] = json.loads(request.content)["price_list_rate"]
             return httpx.Response(200, json={"data": {}})
         if request.url.path == "/api/resource/Warehouse":
@@ -1689,6 +1712,13 @@ async def test_cancel_purchase_restores_previous_buying_price_and_blocks_repeat(
     client = ERPNextClient(make_settings(), transport=httpx.MockTransport(handler))
     actor = AuthenticatedUser(email="owner@example.com", full_name="Owner", roles=["Owner"])
 
+    with pytest.raises(ERPNextUnavailableError):
+        await client.cancel_purchase(
+            "PREC-00001",
+            PurchaseCancelRequest(reason="Ошибка поставки"),
+            actor=actor,
+        )
+
     cancelled = await client.cancel_purchase(
         "PREC-00001",
         PurchaseCancelRequest(reason="Ошибка поставки"),
@@ -1697,6 +1727,7 @@ async def test_cancel_purchase_restores_previous_buying_price_and_blocks_repeat(
 
     assert cancelled.status == "cancelled"
     assert state["cancel_count"] == 1
+    assert state["restore_attempts"] == 2
     assert state["price"] == "510.00"
     with pytest.raises(ERPNextConflictError) as exc_info:
         await client.cancel_purchase(
