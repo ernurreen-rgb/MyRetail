@@ -18,6 +18,30 @@ from myretail_api.models.products import (
     ProductOptions,
     ProductUpdate,
 )
+from myretail_api.models.purchases import (
+    Purchase,
+    PurchaseCancelRequest,
+    PurchaseCreate,
+    PurchaseLine,
+    PurchaseLineCreate,
+    PurchaseList,
+    PurchaseOptions,
+    PurchaseSubmitRequest,
+    PurchaseSummary,
+    PurchaseSupplierRef,
+    PurchaseUpdate,
+    Supplier,
+    SupplierCreate,
+    SupplierList,
+    SupplierStatusFilter,
+    SupplierUpdate,
+)
+from myretail_api.models.purchases import (
+    format_money as format_purchase_money,
+)
+from myretail_api.models.purchases import (
+    format_quantity as format_purchase_quantity,
+)
 from myretail_api.models.stock import (
     AuditUser,
     ReasonOption,
@@ -60,6 +84,10 @@ class ERPNextAuthenticationError(RuntimeError):
 
 class ERPNextUnavailableError(RuntimeError):
     """Raised when ERPNext cannot serve a valid response."""
+
+
+class ERPNextAmbiguousCreateError(ERPNextUnavailableError):
+    """Raised when ERPNext may have created a document but did not return it."""
 
 
 class ERPNextTimeoutError(RuntimeError):
@@ -135,6 +163,7 @@ class ERPNextClient:
         self._transport = transport
         self._selling_price_list = settings.erpnext_selling_price_list
         self._buying_price_list = settings.erpnext_buying_price_list
+        self._company = settings.erpnext_company
         self._currency = settings.default_currency
 
     async def authenticate_user(self, *, email: str, password: str) -> ERPNextUser:
@@ -361,6 +390,1260 @@ class ERPNextClient:
             f"/api/resource/Item/{quote(item_code, safe='')}",
             json_payload={"disabled": 1},
         )
+
+    async def list_suppliers(
+        self,
+        *,
+        q: str | None = None,
+        status: SupplierStatusFilter = "active",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> SupplierList:
+        filters: list[list[Any]] = []
+        if status == "active":
+            filters.append(["Supplier", "disabled", "=", 0])
+        elif status == "archived":
+            filters.append(["Supplier", "disabled", "=", 1])
+
+        query = (q or "").strip()
+        or_filters: list[list[Any]] | None = None
+        if query:
+            or_filters = [
+                ["Supplier", "name", "like", f"%{query}%"],
+                ["Supplier", "supplier_name", "like", f"%{query}%"],
+                ["Supplier", "tax_id", "like", f"%{query}%"],
+                ["Supplier", "supplier_details", "like", f"%{query}%"],
+            ]
+
+        count = await self._count_resource(
+            "Supplier",
+            filters=filters or None,
+            or_filters=or_filters,
+        )
+        rows = await self._query_resource(
+            "Supplier",
+            fields=[
+                "name",
+                "supplier_name",
+                "tax_id",
+                "supplier_details",
+                "disabled",
+                "modified",
+            ],
+            filters=filters or None,
+            or_filters=or_filters,
+            limit=limit,
+            offset=offset,
+            order_by="supplier_name asc",
+        )
+        return SupplierList(
+            items=[self._to_supplier(row) for row in rows],
+            count=count,
+            limit=limit,
+            offset=offset,
+        )
+
+    async def get_supplier(self, supplier_id: str) -> Supplier:
+        return self._to_supplier(await self._get_supplier_row(supplier_id))
+
+    async def create_supplier(
+        self,
+        supplier: SupplierCreate,
+        *,
+        idempotency_key: str | None = None,
+    ) -> Supplier:
+        payload = self._supplier_payload(supplier, create_idempotency_key=idempotency_key)
+        try:
+            response = await self._request_json(
+                "POST",
+                "/api/resource/Supplier",
+                json_payload=payload,
+            )
+        except (ERPNextTimeoutError, ERPNextUnavailableError) as exc:
+            recovered = await self.recover_created_supplier(idempotency_key)
+            if recovered is not None:
+                return recovered
+            raise ERPNextAmbiguousCreateError(
+                "ERPNext Supplier create result is ambiguous"
+            ) from exc
+        data = response.get("data")
+        supplier_id = ""
+        if isinstance(data, Mapping):
+            supplier_id = str(data.get("name") or "")
+        if not supplier_id:
+            supplier_id = str(data or "")
+        if not supplier_id:
+            recovered = await self.recover_created_supplier(idempotency_key)
+            if recovered is not None:
+                return recovered
+            raise ERPNextAmbiguousCreateError(
+                "ERPNext Supplier create response does not contain name"
+            )
+        try:
+            return await self.get_supplier(supplier_id)
+        except (ERPNextProductNotFoundError, ERPNextTimeoutError, ERPNextUnavailableError) as exc:
+            recovered = await self.recover_created_supplier(idempotency_key)
+            if recovered is not None:
+                return recovered
+            raise ERPNextAmbiguousCreateError(
+                "ERPNext Supplier was created but could not be read back"
+            ) from exc
+
+    async def update_supplier(self, supplier_id: str, supplier: SupplierUpdate) -> Supplier:
+        row = await self._get_supplier_row(supplier_id)
+        self._ensure_expected_updated_at(
+            row,
+            supplier.expected_updated_at,
+            code="SUPPLIER_CHANGED",
+            field_name="expected_updated_at",
+        )
+        payload = self._supplier_payload(supplier, original=row)
+        saved = await self._save_document_with_modified_check(
+            "Supplier",
+            supplier_id,
+            row=row,
+            updates=payload,
+            conflict_code="SUPPLIER_CHANGED",
+            field_name="expected_updated_at",
+        )
+        if saved is not None:
+            return self._to_supplier(saved)
+        return await self.get_supplier(supplier_id)
+
+    async def archive_supplier(self, supplier_id: str) -> None:
+        row = await self._get_supplier_row(supplier_id)
+        if self._is_disabled(row):
+            return
+        await self._request_json(
+            "PUT",
+            f"/api/resource/Supplier/{quote(supplier_id, safe='')}",
+            json_payload={"disabled": 1},
+        )
+
+    async def list_purchase_options(self) -> PurchaseOptions:
+        return PurchaseOptions(
+            warehouses=await self._list_warehouses(),
+            currency=self._currency,
+        )
+
+    async def list_purchases(
+        self,
+        *,
+        q: str | None = None,
+        supplier_id: str | None = None,
+        warehouse_id: str | None = None,
+        status: str | None = None,
+        date_from: date | None = None,
+        date_to: date | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> PurchaseList:
+        filters: list[list[Any]] = []
+        if supplier_id is not None:
+            filters.append(["Purchase Receipt", "supplier", "=", supplier_id])
+        if warehouse_id is not None:
+            filters.append(["Purchase Receipt", "set_warehouse", "=", warehouse_id])
+        if status is not None:
+            filters.append(["Purchase Receipt", "docstatus", "=", self._purchase_docstatus(status)])
+        if date_from is not None:
+            filters.append(["Purchase Receipt", "posting_date", ">=", date_from.isoformat()])
+        if date_to is not None:
+            filters.append(["Purchase Receipt", "posting_date", "<=", date_to.isoformat()])
+
+        query = (q or "").strip()
+        or_filters: list[list[Any]] | None = None
+        if query:
+            or_filters = [
+                ["Purchase Receipt", "name", "like", f"%{query}%"],
+                ["Purchase Receipt", "remarks", "like", f"%{query}%"],
+            ]
+
+        count = await self._count_resource(
+            "Purchase Receipt",
+            filters=filters or None,
+            or_filters=or_filters,
+        )
+        rows = await self._query_resource(
+            "Purchase Receipt",
+            fields=[
+                "name",
+                "supplier",
+                "supplier_name",
+                "set_warehouse",
+                "posting_date",
+                "docstatus",
+                "owner",
+                "creation",
+                "modified",
+                "remarks",
+                "currency",
+                "net_total",
+                "grand_total",
+            ],
+            filters=filters or None,
+            or_filters=or_filters,
+            limit=limit,
+            offset=offset,
+            order_by="modified desc",
+        )
+        warehouses = {warehouse.id: warehouse for warehouse in await self._list_warehouses()}
+        return PurchaseList(
+            items=[self._to_purchase_summary(row, warehouses=warehouses) for row in rows],
+            count=count,
+            limit=limit,
+            offset=offset,
+        )
+
+    async def get_purchase(self, purchase_id: str) -> Purchase:
+        row = await self._get_purchase_receipt(purchase_id)
+        events = await self._get_purchase_events(purchase_id)
+        return await self._to_purchase(row, events=events)
+
+    async def create_purchase(
+        self,
+        purchase: PurchaseCreate,
+        *,
+        actor: AuthenticatedUser,
+        idempotency_key: str | None = None,
+    ) -> Purchase:
+        supplier = await self._assert_supplier_active(purchase.supplier_id)
+        await self._assert_warehouse_active(purchase.warehouse_id)
+        lines = await self._build_purchase_lines(purchase.lines)
+        original_prices = await self._current_buying_price_snapshots(
+            [line.product_id for line in lines]
+        )
+        created_at = datetime.now(UTC)
+        payload = self._to_purchase_receipt_payload(
+            purchase,
+            supplier=supplier,
+            lines=lines,
+            actor=actor,
+            created_at=created_at,
+            docstatus=0,
+            create_idempotency_key=idempotency_key,
+        )
+        try:
+            response = await self._request_json(
+                "POST",
+                "/api/resource/Purchase Receipt",
+                json_payload=payload,
+            )
+        except (ERPNextTimeoutError, ERPNextUnavailableError) as exc:
+            created = await self.recover_created_purchase(idempotency_key)
+            if created is not None:
+                await self._restore_buying_price_snapshots(original_prices)
+                return created
+            raise ERPNextAmbiguousCreateError(
+                "ERPNext Purchase Receipt create result is ambiguous"
+            ) from exc
+        data = response.get("data")
+        purchase_id = ""
+        if isinstance(data, Mapping):
+            purchase_id = str(data.get("name") or "")
+        if not purchase_id:
+            created = await self.recover_created_purchase(idempotency_key)
+            if created is not None:
+                await self._restore_buying_price_snapshots(original_prices)
+                return created
+            raise ERPNextAmbiguousCreateError(
+                "ERPNext Purchase Receipt create response does not contain name"
+            )
+        try:
+            created = await self.get_purchase(purchase_id)
+        except (ERPNextProductNotFoundError, ERPNextTimeoutError, ERPNextUnavailableError) as exc:
+            created = await self.recover_created_purchase(idempotency_key)
+            if created is not None:
+                await self._restore_buying_price_snapshots(original_prices)
+                return created
+            raise ERPNextAmbiguousCreateError(
+                "ERPNext Purchase Receipt was created but could not be read back"
+            ) from exc
+        await self._restore_buying_price_snapshots(original_prices)
+        return created
+
+    async def update_purchase(self, purchase_id: str, purchase: PurchaseUpdate) -> Purchase:
+        row = await self._get_purchase_receipt(purchase_id)
+        if int(row.get("docstatus") or 0) != 0:
+            raise ERPNextConflictError(
+                "PURCHASE_IMMUTABLE",
+                "Проведённый или отменённый документ нельзя изменить",
+            )
+        self._ensure_expected_updated_at(
+            row,
+            purchase.expected_updated_at,
+            code="PURCHASE_CHANGED",
+            field_name="expected_updated_at",
+        )
+        metadata = self._extract_myretail_purchase_metadata(row.get("remarks"))
+        supplier_id = purchase.supplier_id or str(row.get("supplier") or "")
+        supplier = await self._assert_supplier_active(supplier_id)
+        warehouse_id = purchase.warehouse_id or str(row.get("set_warehouse") or "")
+        await self._assert_warehouse_active(warehouse_id)
+        create_like = PurchaseCreate(
+            supplier_id=supplier_id,
+            warehouse_id=warehouse_id,
+            posting_date=purchase.posting_date or self._parse_date(row.get("posting_date")),
+            supplier_invoice_number=(
+                purchase.supplier_invoice_number
+                if "supplier_invoice_number" in purchase.model_fields_set
+                else metadata.get("supplier_invoice_number")
+            ),
+            supplier_invoice_date=(
+                purchase.supplier_invoice_date
+                if "supplier_invoice_date" in purchase.model_fields_set
+                else self._parse_optional_date(metadata.get("supplier_invoice_date"))
+            ),
+            comment=(
+                purchase.comment
+                if "comment" in purchase.model_fields_set
+                else metadata.get("comment")
+            ),
+            lines=purchase.lines or self._purchase_line_creates_from_row(row),
+        )
+        lines = await self._build_purchase_lines(create_like.lines)
+        payload = self._to_purchase_receipt_payload(
+            create_like,
+            supplier=supplier,
+            lines=lines,
+            actor=self._actor_from_metadata(metadata, row.get("owner")),
+            created_at=self._parse_datetime(metadata.get("created_at") or row.get("creation")),
+            docstatus=0,
+        )
+        payload.pop("doctype", None)
+        payload.pop("docstatus", None)
+        saved = await self._save_document_with_modified_check(
+            "Purchase Receipt",
+            purchase_id,
+            row=row,
+            updates=payload,
+            conflict_code="PURCHASE_CHANGED",
+            field_name="expected_updated_at",
+        )
+        return await self.get_purchase(
+            str(saved.get("name") or purchase_id) if saved else purchase_id
+        )
+
+    async def submit_purchase(
+        self,
+        purchase_id: str,
+        request: PurchaseSubmitRequest,
+        *,
+        actor: AuthenticatedUser,
+    ) -> Purchase:
+        row = await self._get_purchase_receipt(purchase_id)
+        events = await self._get_purchase_events(purchase_id)
+        docstatus = int(row.get("docstatus") or 0)
+        latest_event = self._latest_purchase_event(events)
+        if docstatus == 2:
+            raise ERPNextConflictError(
+                "PURCHASE_ALREADY_CANCELLED",
+                "Закупка уже отменена",
+            )
+        if docstatus == 1 and latest_event.get("status") == "price_synced":
+            raise ERPNextConflictError(
+                "PURCHASE_ALREADY_POSTED",
+                "Закупка уже проведена",
+            )
+        if docstatus == 0:
+            self._ensure_expected_updated_at(
+                row,
+                request.expected_updated_at,
+                code="PURCHASE_CHANGED",
+                field_name="expected_updated_at",
+            )
+            await self._assert_supplier_active(str(row.get("supplier") or ""))
+            original_prices = await self._current_buying_price_snapshots(
+                self._purchase_item_codes(row)
+            )
+            submitted_at = datetime.now(UTC)
+            await self._add_purchase_event(
+                purchase_id,
+                {
+                    "status": "submit_pending",
+                    "original_prices": original_prices,
+                    "submitted_by": {"email": actor.email, "full_name": actor.full_name},
+                    "submitted_at": submitted_at.isoformat().replace("+00:00", "Z"),
+                },
+            )
+            submitted = await self._submit_document(row)
+            row = submitted if submitted else await self._get_purchase_receipt(purchase_id)
+            events = await self._get_purchase_events(purchase_id)
+        elif docstatus != 1:
+            raise ERPNextConflictError(
+                "PURCHASE_IMMUTABLE",
+                "Закупку нельзя провести в текущем статусе",
+            )
+
+        await self._sync_purchase_prices(purchase_id, row, events=events, actor=actor)
+        return await self.get_purchase(purchase_id)
+
+    async def cancel_purchase(
+        self,
+        purchase_id: str,
+        request: PurchaseCancelRequest,
+        *,
+        actor: AuthenticatedUser,
+    ) -> Purchase:
+        row = await self._get_purchase_receipt(purchase_id)
+        events = await self._get_purchase_events(purchase_id)
+        latest_event = self._latest_purchase_event(events)
+        docstatus = int(row.get("docstatus") or 0)
+        if docstatus == 0:
+            raise ERPNextConflictError(
+                "PURCHASE_IMMUTABLE",
+                "Можно отменить только проведённую закупку",
+            )
+        if docstatus == 2 and latest_event.get("status") == "cancelled":
+            raise ERPNextConflictError(
+                "PURCHASE_ALREADY_CANCELLED",
+                "Закупка уже отменена",
+            )
+
+        cancelled_at = datetime.now(UTC)
+        if docstatus == 1:
+            await self._add_purchase_event(
+                purchase_id,
+                {
+                    "status": "cancel_pending",
+                    "reason": request.reason,
+                    "cancelled_by": {"email": actor.email, "full_name": actor.full_name},
+                    "cancelled_at": cancelled_at.isoformat().replace("+00:00", "Z"),
+                },
+            )
+            try:
+                cancelled = await self._cancel_document(row)
+                row = cancelled if cancelled else await self._get_purchase_receipt(purchase_id)
+            except (
+                ERPNextAuthenticationError,
+                ERPNextProductNotFoundError,
+                ERPNextUnavailableError,
+                ERPNextValidationError,
+            ):
+                raise
+
+        events = await self._get_purchase_events(purchase_id)
+        await self._restore_purchase_prices(purchase_id, row, events=events, actor=actor)
+        return await self.get_purchase(purchase_id)
+
+    def _supplier_payload(
+        self,
+        supplier: SupplierCreate | SupplierUpdate,
+        *,
+        original: Mapping[str, Any] | None = None,
+        create_idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        update_fields = supplier.model_dump(exclude={"expected_updated_at"}, exclude_unset=True)
+        metadata = dict(self._extract_myretail_supplier_metadata(
+            original.get("supplier_details") if original is not None else None
+        ))
+        if create_idempotency_key is not None:
+            metadata["create_idempotency_key"] = create_idempotency_key
+        for field in ("contact_name", "phone", "email", "address"):
+            if field in update_fields:
+                metadata[field] = update_fields[field]
+
+        payload: dict[str, Any] = {}
+        if isinstance(supplier, SupplierCreate):
+            payload.update(
+                {
+                    "doctype": "Supplier",
+                    "supplier_name": supplier.name,
+                    "supplier_type": "Company",
+                    "disabled": 0,
+                }
+            )
+            if supplier.tax_id is not None:
+                payload["tax_id"] = supplier.tax_id
+        else:
+            if "name" in update_fields:
+                payload["supplier_name"] = supplier.name
+            if "tax_id" in update_fields:
+                payload["tax_id"] = supplier.tax_id or ""
+
+        payload["supplier_details"] = json.dumps(
+            {"myretail_supplier": metadata},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return payload
+
+    async def recover_created_supplier(self, idempotency_key: str | None) -> Supplier | None:
+        if idempotency_key is None:
+            return None
+        rows = await self._query_resource(
+            "Supplier",
+            fields=[
+                "name",
+                "supplier_name",
+                "tax_id",
+                "supplier_details",
+                "disabled",
+                "modified",
+            ],
+            filters=[["Supplier", "supplier_details", "like", f"%{idempotency_key}%"]],
+            limit=2,
+            order_by="creation desc",
+        )
+        return self._to_supplier(rows[0]) if rows else None
+
+    async def _get_supplier_row(self, supplier_id: str) -> Mapping[str, Any]:
+        payload = await self._request_json(
+            "GET",
+            f"/api/resource/Supplier/{quote(supplier_id, safe='')}",
+        )
+        data = payload.get("data")
+        if not isinstance(data, Mapping):
+            raise ERPNextUnavailableError("ERPNext Supplier response does not contain data")
+        return data
+
+    async def _assert_supplier_active(self, supplier_id: str) -> Supplier:
+        supplier = self._to_supplier(await self._get_supplier_row(supplier_id))
+        if not supplier.is_active:
+            raise ERPNextConflictError(
+                "SUPPLIER_ARCHIVED",
+                "Архивного поставщика нельзя использовать для новой закупки",
+                {"supplier_id": "Поставщик архивирован"},
+            )
+        return supplier
+
+    async def _assert_warehouse_active(self, warehouse_id: str) -> Warehouse:
+        payload = await self._request_json(
+            "GET",
+            f"/api/resource/Warehouse/{quote(warehouse_id, safe='')}",
+        )
+        data = payload.get("data")
+        if not isinstance(data, Mapping):
+            raise ERPNextUnavailableError("ERPNext Warehouse response does not contain data")
+        warehouse = Warehouse(
+            id=str(data.get("name") or warehouse_id),
+            name=str(data.get("warehouse_name") or data.get("name") or warehouse_id),
+            is_default=False,
+            is_active=not bool(data.get("disabled")) and not bool(data.get("is_group")),
+        )
+        if not warehouse.is_active:
+            raise ERPNextValidationError(
+                "Склад недоступен",
+                {"warehouse_id": "Выберите активный склад"},
+            )
+        return warehouse
+
+    def _to_supplier(self, row: Mapping[str, Any]) -> Supplier:
+        metadata = self._extract_myretail_supplier_metadata(row.get("supplier_details"))
+        return Supplier(
+            id=str(row.get("name") or ""),
+            name=str(row.get("supplier_name") or row.get("name") or ""),
+            tax_id=str(row.get("tax_id") or metadata.get("tax_id") or "") or None,
+            contact_name=metadata.get("contact_name")
+            if isinstance(metadata.get("contact_name"), str)
+            else None,
+            phone=metadata.get("phone") if isinstance(metadata.get("phone"), str) else None,
+            email=metadata.get("email") if isinstance(metadata.get("email"), str) else None,
+            address=metadata.get("address") if isinstance(metadata.get("address"), str) else None,
+            is_active=not self._is_disabled(row),
+            updated_at=self._parse_datetime(row.get("modified")),
+        )
+
+    @staticmethod
+    def _extract_myretail_supplier_metadata(raw_details: Any) -> Mapping[str, Any]:
+        if not isinstance(raw_details, str) or not raw_details.strip():
+            return {}
+        try:
+            parsed = json.loads(raw_details)
+        except ValueError:
+            return {}
+        if not isinstance(parsed, Mapping):
+            return {}
+        metadata = parsed.get("myretail_supplier")
+        return metadata if isinstance(metadata, Mapping) else {}
+
+    async def _build_purchase_lines(
+        self,
+        request_lines: list[PurchaseLineCreate],
+    ) -> list[PurchaseLine]:
+        item_codes = sorted({line.product_id for line in request_lines})
+        items = await self._get_purchase_item_snapshots(item_codes)
+        lines: list[PurchaseLine] = []
+        for index, line in enumerate(request_lines):
+            item = items.get(line.product_id)
+            if item is None:
+                raise ERPNextValidationError(
+                    "Товар не найден",
+                    {f"lines.{index}.product_id": "Товар не найден"},
+                )
+            if self._is_disabled(item):
+                raise ERPNextValidationError(
+                    "Товар архивирован",
+                    {f"lines.{index}.product_id": "Выберите активный товар"},
+                )
+            unit = str(item.get("stock_uom") or "")
+            quantity = Decimal(line.quantity)
+            if unit == "Nos" and quantity != quantity.to_integral_value():
+                raise ERPNextValidationError(
+                    "Для штуки требуется целое количество",
+                    {f"lines.{index}.quantity": "Для единицы Nos укажите целое количество"},
+                )
+            unit_price = Decimal(line.unit_price)
+            line_total = quantity * unit_price
+            lines.append(
+                PurchaseLine(
+                    product_id=line.product_id,
+                    sku=line.product_id,
+                    name=str(item.get("item_name") or line.product_id),
+                    unit=unit,
+                    quantity=format_purchase_quantity(quantity),
+                    unit_price=format_purchase_money(unit_price),
+                    line_total=format_purchase_money(line_total),
+                )
+            )
+        return lines
+
+    async def _get_purchase_item_snapshots(
+        self,
+        item_codes: list[str],
+    ) -> dict[str, Mapping[str, Any]]:
+        unique_item_codes = sorted({item_code for item_code in item_codes if item_code})
+        if not unique_item_codes:
+            return {}
+        rows = await self._query_resource_all(
+            "Item",
+            fields=["name", "item_name", "stock_uom", "disabled"],
+            filters=[["Item", "name", "in", unique_item_codes]],
+            order_by="name asc",
+        )
+        return {
+            item_code: row
+            for row in rows
+            if isinstance((item_code := row.get("name")), str) and item_code
+        }
+
+    def _to_purchase_receipt_payload(
+        self,
+        purchase: PurchaseCreate,
+        *,
+        supplier: Supplier,
+        lines: list[PurchaseLine],
+        actor: AuthenticatedUser,
+        created_at: datetime,
+        docstatus: int,
+        create_idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        metadata = {
+            "myretail_purchase": {
+                "supplier_invoice_number": purchase.supplier_invoice_number,
+                "supplier_invoice_date": (
+                    purchase.supplier_invoice_date.isoformat()
+                    if purchase.supplier_invoice_date is not None
+                    else None
+                ),
+                "comment": purchase.comment,
+                "created_by": {"email": actor.email, "full_name": actor.full_name},
+                "created_at": created_at.isoformat().replace("+00:00", "Z"),
+                "lines": [line.model_dump() for line in lines],
+            }
+        }
+        if create_idempotency_key is not None:
+            metadata["myretail_purchase"]["create_idempotency_key"] = create_idempotency_key
+        return {
+            "doctype": "Purchase Receipt",
+            "company": self._company,
+            "supplier": purchase.supplier_id,
+            "supplier_name": supplier.name,
+            "set_warehouse": purchase.warehouse_id,
+            "posting_date": purchase.posting_date.isoformat(),
+            "set_posting_time": 1,
+            "currency": self._currency,
+            "docstatus": docstatus,
+            "remarks": json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
+            "items": [
+                self._to_purchase_receipt_item(line, warehouse_id=purchase.warehouse_id)
+                for line in lines
+            ],
+        }
+
+    def _to_purchase_receipt_item(
+        self,
+        line: PurchaseLine,
+        *,
+        warehouse_id: str,
+    ) -> dict[str, Any]:
+        return {
+            "item_code": line.product_id,
+            "item_name": line.name,
+            "warehouse": warehouse_id,
+            "qty": line.quantity,
+            "received_qty": line.quantity,
+            "uom": line.unit,
+            "stock_uom": line.unit,
+            "rate": line.unit_price,
+            "amount": line.line_total,
+        }
+
+    async def recover_created_purchase(self, idempotency_key: str | None) -> Purchase | None:
+        if idempotency_key is None:
+            return None
+        rows = await self._query_resource(
+            "Purchase Receipt",
+            fields=[
+                "name",
+                "supplier",
+                "supplier_name",
+                "set_warehouse",
+                "posting_date",
+                "docstatus",
+                "owner",
+                "creation",
+                "modified",
+                "remarks",
+                "currency",
+                "net_total",
+                "grand_total",
+            ],
+            filters=[["Purchase Receipt", "remarks", "like", f"%{idempotency_key}%"]],
+            limit=2,
+            order_by="creation desc",
+        )
+        if not rows:
+            return None
+        purchase_id = str(rows[0].get("name") or "")
+        return await self._to_purchase(rows[0], events=await self._get_purchase_events(purchase_id))
+
+    async def _get_purchase_receipt(self, purchase_id: str) -> Mapping[str, Any]:
+        payload = await self._request_json(
+            "GET",
+            f"/api/resource/Purchase Receipt/{quote(purchase_id, safe='')}",
+        )
+        data = payload.get("data")
+        if not isinstance(data, Mapping):
+            raise ERPNextUnavailableError(
+                "ERPNext Purchase Receipt response does not contain data"
+            )
+        return data
+
+    async def _save_document_with_modified_check(
+        self,
+        doctype: str,
+        document_id: str,
+        *,
+        row: Mapping[str, Any],
+        updates: Mapping[str, Any],
+        conflict_code: str,
+        field_name: str,
+    ) -> Mapping[str, Any] | None:
+        document = dict(row)
+        document.update(updates)
+        document["doctype"] = doctype
+        document["name"] = document_id
+        conflict_message = "Данные изменены, обновите страницу"
+        payload = await self._request_json(
+            "POST",
+            "/api/method/frappe.client.save",
+            json_payload={"doc": document},
+            timestamp_conflict_code=conflict_code,
+            timestamp_conflict_fields={field_name: conflict_message},
+        )
+        message = payload.get("message") or payload.get("data")
+        return message if isinstance(message, Mapping) else None
+
+    async def _submit_document(self, row: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        payload = await self._request_json(
+            "POST",
+            "/api/method/frappe.client.submit",
+            json_payload={"doc": dict(row)},
+        )
+        message = payload.get("message") or payload.get("data")
+        return message if isinstance(message, Mapping) else None
+
+    async def _cancel_document(self, row: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        purchase_id = str(row.get("name") or "")
+        payload = await self._request_json(
+            "POST",
+            "/api/method/frappe.client.cancel",
+            json_payload={"doctype": "Purchase Receipt", "name": purchase_id},
+        )
+        message = payload.get("message") or payload.get("data")
+        return message if isinstance(message, Mapping) else None
+
+    async def _sync_purchase_prices(
+        self,
+        purchase_id: str,
+        row: Mapping[str, Any],
+        *,
+        events: list[Mapping[str, Any]],
+        actor: AuthenticatedUser,
+    ) -> None:
+        latest_event = self._latest_purchase_event(events)
+        if latest_event.get("status") == "price_synced":
+            return
+        original_prices = self._purchase_original_prices(events)
+        if original_prices is None:
+            original_prices = await self._current_buying_price_snapshots(
+                self._purchase_item_codes(row)
+            )
+            await self._add_purchase_event(
+                purchase_id,
+                {
+                    "status": "price_sync_pending",
+                    "original_prices": original_prices,
+                    "submitted_by": {"email": actor.email, "full_name": actor.full_name},
+                    "submitted_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                },
+            )
+
+        for line in self._purchase_lines_from_row(row):
+            await self._upsert_item_price(
+                item_code=line.product_id,
+                price_list=self._buying_price_list,
+                price=line.unit_price,
+                buying=True,
+            )
+
+        await self._add_purchase_event(
+            purchase_id,
+            {
+                "status": "price_synced",
+                "original_prices": original_prices,
+                "submitted_by": {"email": actor.email, "full_name": actor.full_name},
+                "submitted_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            },
+        )
+
+    async def _restore_purchase_prices(
+        self,
+        purchase_id: str,
+        row: Mapping[str, Any],
+        *,
+        events: list[Mapping[str, Any]],
+        actor: AuthenticatedUser,
+    ) -> None:
+        latest_event = self._latest_purchase_event(events)
+        if latest_event.get("status") == "cancelled":
+            return
+        original_prices = self._purchase_original_prices(events) or {}
+        for item_code in self._purchase_item_codes(row):
+            replacement_price = await self._latest_posted_purchase_price(
+                item_code,
+                exclude_purchase_id=purchase_id,
+            )
+            if replacement_price is not None:
+                await self._upsert_item_price(
+                    item_code=item_code,
+                    price_list=self._buying_price_list,
+                    price=replacement_price,
+                    buying=True,
+                )
+                continue
+
+            snapshot = original_prices.get(item_code)
+            if isinstance(snapshot, Mapping) and snapshot.get("exists") and snapshot.get("price"):
+                await self._upsert_item_price(
+                    item_code=item_code,
+                    price_list=self._buying_price_list,
+                    price=str(snapshot["price"]),
+                    buying=True,
+                )
+            else:
+                await self._delete_item_price(item_code, self._buying_price_list)
+
+        cancel_event = self._latest_purchase_event(
+            [event for event in events if event.get("status") == "cancel_pending"]
+        )
+        await self._add_purchase_event(
+            purchase_id,
+            {
+                "status": "cancelled",
+                "reason": cancel_event.get("reason"),
+                "cancelled_by": {"email": actor.email, "full_name": actor.full_name},
+                "cancelled_at": (
+                    cancel_event.get("cancelled_at")
+                    or datetime.now(UTC).isoformat().replace("+00:00", "Z")
+                ),
+            },
+        )
+
+    async def _current_buying_price_snapshots(
+        self,
+        item_codes: list[str],
+    ) -> dict[str, dict[str, object]]:
+        snapshots: dict[str, dict[str, object]] = {}
+        for item_code in item_codes:
+            row = await self._get_item_price_record(item_code, self._buying_price_list)
+            if row is None:
+                snapshots[item_code] = {"exists": False, "price": None}
+                continue
+            snapshots[item_code] = {
+                "exists": True,
+                "price": self._format_money(row.get("price_list_rate") or "0"),
+            }
+        return snapshots
+
+    async def _restore_buying_price_snapshots(
+        self,
+        snapshots: Mapping[str, Mapping[str, object]],
+    ) -> None:
+        for item_code, snapshot in snapshots.items():
+            if snapshot.get("exists") and snapshot.get("price") is not None:
+                await self._upsert_item_price(
+                    item_code=item_code,
+                    price_list=self._buying_price_list,
+                    price=str(snapshot["price"]),
+                    buying=True,
+                )
+            else:
+                await self._delete_item_price(item_code, self._buying_price_list)
+
+    async def _latest_posted_purchase_price(
+        self,
+        item_code: str,
+        *,
+        exclude_purchase_id: str,
+    ) -> str | None:
+        item_rows = await self._query_resource_all(
+            "Purchase Receipt Item",
+            fields=["parent", "rate"],
+            filters=[["Purchase Receipt Item", "item_code", "=", item_code]],
+            parent_doctype="Purchase Receipt",
+            order_by="modified desc",
+        )
+        parent_rates = {
+            str(row.get("parent")): self._format_money(row.get("rate") or "0")
+            for row in item_rows
+            if isinstance(row.get("parent"), str) and row.get("parent") != exclude_purchase_id
+        }
+        if not parent_rates:
+            return None
+        parent_rows = await self._query_resource_all(
+            "Purchase Receipt",
+            fields=["name", "posting_date", "modified"],
+            filters=[
+                ["Purchase Receipt", "name", "in", sorted(parent_rates)],
+                ["Purchase Receipt", "docstatus", "=", 1],
+            ],
+            order_by="posting_date desc, modified desc",
+        )
+        for parent in parent_rows:
+            parent_id = parent.get("name")
+            if isinstance(parent_id, str) and parent_id in parent_rates:
+                return parent_rates[parent_id]
+        return None
+
+    async def _add_purchase_event(
+        self,
+        purchase_id: str,
+        event: Mapping[str, Any],
+    ) -> None:
+        await self._request_json(
+            "POST",
+            "/api/resource/Comment",
+            json_payload={
+                "doctype": "Comment",
+                "comment_type": "Info",
+                "reference_doctype": "Purchase Receipt",
+                "reference_name": purchase_id,
+                "content": json.dumps(
+                    {"myretail_purchase_event": event},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            },
+        )
+
+    async def _get_purchase_events(self, purchase_id: str) -> list[Mapping[str, Any]]:
+        rows = await self._query_resource_all(
+            "Comment",
+            fields=["content", "creation"],
+            filters=[
+                ["Comment", "reference_doctype", "=", "Purchase Receipt"],
+                ["Comment", "reference_name", "=", purchase_id],
+                ["Comment", "comment_type", "=", "Info"],
+                ["Comment", "content", "like", "%myretail_purchase_event%"],
+            ],
+            order_by="creation asc",
+        )
+        events: list[Mapping[str, Any]] = []
+        for row in rows:
+            event = self._extract_myretail_purchase_event(row.get("content"))
+            if event is not None:
+                events.append(event)
+        return events
+
+    @staticmethod
+    def _extract_myretail_purchase_event(raw_content: Any) -> Mapping[str, Any] | None:
+        if not isinstance(raw_content, str) or not raw_content.strip():
+            return None
+        try:
+            parsed = json.loads(raw_content)
+        except ValueError:
+            return None
+        if not isinstance(parsed, Mapping):
+            return None
+        event = parsed.get("myretail_purchase_event")
+        return event if isinstance(event, Mapping) else None
+
+    @staticmethod
+    def _latest_purchase_event(events: list[Mapping[str, Any]]) -> Mapping[str, Any]:
+        return events[-1] if events else {}
+
+    @staticmethod
+    def _purchase_original_prices(
+        events: list[Mapping[str, Any]],
+    ) -> dict[str, Mapping[str, Any]] | None:
+        for event in reversed(events):
+            prices = event.get("original_prices")
+            if isinstance(prices, Mapping):
+                return {
+                    str(item_code): snapshot
+                    for item_code, snapshot in prices.items()
+                    if isinstance(snapshot, Mapping)
+                }
+        return None
+
+    async def _to_purchase(
+        self,
+        row: Mapping[str, Any],
+        *,
+        events: list[Mapping[str, Any]],
+    ) -> Purchase:
+        warehouses = {warehouse.id: warehouse for warehouse in await self._list_warehouses()}
+        metadata = self._extract_myretail_purchase_metadata(row.get("remarks"))
+        lines = self._purchase_lines_from_row(row)
+        subtotal = self._purchase_total(lines)
+        submit_event = self._latest_purchase_event(
+            [
+                event
+                for event in events
+                if event.get("status") in {"submit_pending", "price_sync_pending", "price_synced"}
+            ]
+        )
+        cancel_event = self._latest_purchase_event(
+            [event for event in events if event.get("status") == "cancelled"]
+        )
+        return Purchase(
+            id=str(row.get("name") or ""),
+            status=self._safe_purchase_status(row),
+            supplier=PurchaseSupplierRef(
+                id=str(row.get("supplier") or ""),
+                name=str(row.get("supplier_name") or row.get("supplier") or ""),
+            ),
+            warehouse=self._purchase_warehouse(row, warehouses),
+            posting_date=self._parse_date(row.get("posting_date")),
+            supplier_invoice_number=metadata.get("supplier_invoice_number")
+            if isinstance(metadata.get("supplier_invoice_number"), str)
+            else None,
+            supplier_invoice_date=self._parse_optional_date(
+                metadata.get("supplier_invoice_date")
+            ),
+            currency=str(row.get("currency") or self._currency),
+            comment=metadata.get("comment") if isinstance(metadata.get("comment"), str) else None,
+            subtotal=self._format_money(row.get("net_total") or subtotal),
+            total=self._format_money(row.get("grand_total") or subtotal),
+            created_by=self._audit_user(metadata.get("created_by"), row.get("owner")),
+            created_at=self._parse_datetime(metadata.get("created_at") or row.get("creation")),
+            submitted_by=self._audit_user_or_none(submit_event.get("submitted_by")),
+            submitted_at=self._parse_optional_datetime(submit_event.get("submitted_at")),
+            cancelled_by=self._audit_user_or_none(cancel_event.get("cancelled_by")),
+            cancelled_at=self._parse_optional_datetime(cancel_event.get("cancelled_at")),
+            updated_at=self._parse_datetime(row.get("modified")),
+            lines=lines,
+        )
+
+    def _to_purchase_summary(
+        self,
+        row: Mapping[str, Any],
+        *,
+        warehouses: dict[str, Warehouse],
+    ) -> PurchaseSummary:
+        metadata = self._extract_myretail_purchase_metadata(row.get("remarks"))
+        subtotal = self._format_money(row.get("net_total") or "0")
+        return PurchaseSummary(
+            id=str(row.get("name") or ""),
+            status=self._safe_purchase_status(row),
+            supplier=PurchaseSupplierRef(
+                id=str(row.get("supplier") or ""),
+                name=str(row.get("supplier_name") or row.get("supplier") or ""),
+            ),
+            warehouse=self._purchase_warehouse(row, warehouses),
+            posting_date=self._parse_date(row.get("posting_date")),
+            supplier_invoice_number=metadata.get("supplier_invoice_number")
+            if isinstance(metadata.get("supplier_invoice_number"), str)
+            else None,
+            supplier_invoice_date=self._parse_optional_date(
+                metadata.get("supplier_invoice_date")
+            ),
+            currency=str(row.get("currency") or self._currency),
+            subtotal=subtotal,
+            total=self._format_money(row.get("grand_total") or subtotal),
+            updated_at=self._parse_datetime(row.get("modified")),
+        )
+
+    def _purchase_lines_from_row(self, row: Mapping[str, Any]) -> list[PurchaseLine]:
+        metadata = self._extract_myretail_purchase_metadata(row.get("remarks"))
+        raw_metadata_lines = metadata.get("lines")
+        if isinstance(raw_metadata_lines, list) and raw_metadata_lines:
+            lines: list[PurchaseLine] = []
+            for raw_line in raw_metadata_lines:
+                if isinstance(raw_line, Mapping):
+                    lines.append(
+                        PurchaseLine(
+                            product_id=str(raw_line.get("product_id") or ""),
+                            sku=str(raw_line.get("sku") or raw_line.get("product_id") or ""),
+                            name=str(raw_line.get("name") or raw_line.get("product_id") or ""),
+                            unit=str(raw_line.get("unit") or ""),
+                            quantity=format_purchase_quantity(raw_line.get("quantity") or "0"),
+                            unit_price=format_purchase_money(raw_line.get("unit_price") or "0"),
+                            line_total=format_purchase_money(raw_line.get("line_total") or "0"),
+                        )
+                    )
+            if lines:
+                return lines
+
+        raw_items = row.get("items")
+        if not isinstance(raw_items, list):
+            return []
+        lines = []
+        for item in raw_items:
+            if not isinstance(item, Mapping) or not item.get("item_code"):
+                continue
+            quantity = format_purchase_quantity(item.get("qty") or "0")
+            unit_price = format_purchase_money(item.get("rate") or "0")
+            lines.append(
+                PurchaseLine(
+                    product_id=str(item.get("item_code") or ""),
+                    sku=str(item.get("item_code") or ""),
+                    name=str(item.get("item_name") or item.get("item_code") or ""),
+                    unit=str(item.get("uom") or item.get("stock_uom") or ""),
+                    quantity=quantity,
+                    unit_price=unit_price,
+                    line_total=format_purchase_money(
+                        item.get("amount") or Decimal(quantity) * Decimal(unit_price)
+                    ),
+                )
+            )
+        return lines
+
+    def _purchase_line_creates_from_row(self, row: Mapping[str, Any]) -> list[PurchaseLineCreate]:
+        return [
+            PurchaseLineCreate(
+                product_id=line.product_id,
+                quantity=line.quantity,
+                unit_price=line.unit_price,
+            )
+            for line in self._purchase_lines_from_row(row)
+        ]
+
+    @staticmethod
+    def _extract_myretail_purchase_metadata(raw_remarks: Any) -> Mapping[str, Any]:
+        if not isinstance(raw_remarks, str) or not raw_remarks.strip():
+            return {}
+        try:
+            parsed = json.loads(raw_remarks)
+        except ValueError:
+            return {}
+        if not isinstance(parsed, Mapping):
+            return {}
+        metadata = parsed.get("myretail_purchase")
+        return metadata if isinstance(metadata, Mapping) else {}
+
+    def _purchase_item_codes(self, row: Mapping[str, Any]) -> list[str]:
+        return sorted({line.product_id for line in self._purchase_lines_from_row(row)})
+
+    @staticmethod
+    def _purchase_total(lines: list[PurchaseLine]) -> str:
+        total = sum((Decimal(line.line_total) for line in lines), Decimal("0.00"))
+        return format_purchase_money(total)
+
+    @staticmethod
+    def _purchase_docstatus(status: str) -> int:
+        return {"draft": 0, "posted": 1, "cancelled": 2}[status]
+
+    @staticmethod
+    def _safe_purchase_status(row: Mapping[str, Any]) -> str:
+        docstatus = int(row.get("docstatus") or 0)
+        if docstatus == 1:
+            return "posted"
+        if docstatus == 2:
+            return "cancelled"
+        return "draft"
+
+    @staticmethod
+    def _purchase_warehouse(
+        row: Mapping[str, Any],
+        warehouses: dict[str, Warehouse],
+    ) -> WarehouseRef:
+        warehouse_id = str(row.get("set_warehouse") or "")
+        warehouse = warehouses.get(warehouse_id)
+        return WarehouseRef(
+            id=warehouse_id,
+            name=warehouse.name if warehouse is not None else warehouse_id,
+        )
+
+    def _ensure_expected_updated_at(
+        self,
+        row: Mapping[str, Any],
+        expected_updated_at: datetime,
+        *,
+        code: str,
+        field_name: str,
+    ) -> None:
+        current = self._parse_datetime(row.get("modified"))
+        expected = (
+            expected_updated_at.astimezone(UTC)
+            if expected_updated_at.tzinfo
+            else expected_updated_at.replace(tzinfo=UTC)
+        )
+        if current != expected:
+            raise ERPNextConflictError(
+                code,
+                "Документ изменился. Обновите данные и повторите действие.",
+                {field_name: current.isoformat().replace("+00:00", "Z")},
+            )
+
+    @staticmethod
+    def _actor_from_metadata(
+        metadata: Mapping[str, Any],
+        fallback_email: Any,
+    ) -> AuthenticatedUser:
+        raw_user = metadata.get("created_by")
+        if isinstance(raw_user, Mapping):
+            email = str(raw_user.get("email") or fallback_email or "unknown@example.com")
+            full_name = raw_user.get("full_name")
+            return AuthenticatedUser(
+                email=email,
+                full_name=full_name if isinstance(full_name, str) else None,
+                roles=["Owner"],
+            )
+        return AuthenticatedUser(
+            email=str(fallback_email or "unknown@example.com"),
+            full_name=None,
+            roles=["Owner"],
+        )
+
+    @staticmethod
+    def _parse_date(raw_value: Any) -> date:
+        if isinstance(raw_value, datetime):
+            return raw_value.date()
+        if isinstance(raw_value, date):
+            return raw_value
+        if isinstance(raw_value, str) and raw_value:
+            try:
+                return date.fromisoformat(raw_value[:10])
+            except ValueError:
+                return datetime.now(UTC).date()
+        return datetime.now(UTC).date()
+
+    @staticmethod
+    def _parse_optional_date(raw_value: Any) -> date | None:
+        if raw_value is None:
+            return None
+        if isinstance(raw_value, date) and not isinstance(raw_value, datetime):
+            return raw_value
+        if isinstance(raw_value, datetime):
+            return raw_value.date()
+        if isinstance(raw_value, str) and raw_value:
+            try:
+                return date.fromisoformat(raw_value[:10])
+            except ValueError:
+                return None
+        return None
 
     async def list_stock_options(self) -> StockOptions:
         return StockOptions(
@@ -1768,6 +3051,8 @@ class ERPNextClient:
         *,
         params: dict[str, str] | None = None,
         json_payload: Mapping[str, Any] | None = None,
+        timestamp_conflict_code: str | None = None,
+        timestamp_conflict_fields: dict[str, str] | None = None,
     ) -> Mapping[str, Any]:
         try:
             async with httpx.AsyncClient(
@@ -1793,6 +3078,15 @@ class ERPNextClient:
             raise ERPNextProductNotFoundError("ERPNext Item was not found")
         if response.status_code in {408, 504}:
             raise ERPNextTimeoutError("ERPNext request timed out")
+        if (
+            timestamp_conflict_code is not None
+            and self._is_timestamp_conflict_response(response)
+        ):
+            raise ERPNextConflictError(
+                timestamp_conflict_code,
+                "Данные изменены, обновите страницу",
+                timestamp_conflict_fields,
+            )
         if response.status_code >= 500:
             raise ERPNextUnavailableError("ERPNext returned a server error")
 
@@ -1867,6 +3161,23 @@ class ERPNextClient:
             if isinstance(message, str) and message:
                 return message
         return "ERPNext отклонил данные товара"
+
+    @staticmethod
+    def _is_timestamp_conflict_response(response: httpx.Response) -> bool:
+        if response.status_code not in {409, 417, 500}:
+            return False
+        try:
+            payload = json.dumps(response.json(), ensure_ascii=False)
+        except ValueError:
+            payload = response.text
+        return any(
+            marker in payload
+            for marker in (
+                "TimestampMismatchError",
+                "Document has been modified",
+                "modified after you have opened",
+            )
+        )
 
     @staticmethod
     def _extract_roles(raw_roles: Any) -> list[str]:

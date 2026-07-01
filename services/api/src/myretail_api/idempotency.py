@@ -21,7 +21,7 @@ class IdempotencyBeginResult:
     record: IdempotencyRecord | None = None
 
 
-class StockIdempotencyStore:
+class IdempotencyStore:
     def __init__(self, database_path: Path) -> None:
         self._database_path = database_path
         self._ensure_schema()
@@ -101,6 +101,33 @@ class StockIdempotencyStore:
             time.sleep(poll_seconds)
         return None
 
+    def get_completed(
+        self,
+        *,
+        tenant: str,
+        key: str,
+        request_hash: str,
+    ) -> IdempotencyRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT request_hash, status, status_code, response_body
+                FROM stock_idempotency
+                WHERE tenant = ? AND idempotency_key = ?
+                """,
+                (tenant, key),
+            ).fetchone()
+
+        if row is None:
+            return None
+        if row[0] != request_hash:
+            raise IdempotencyConflictError(
+                "Idempotency key was reused with a different body"
+            )
+        if row[1] != "completed":
+            return None
+        return self._record_from_row(row[2], row[3])
+
     def complete(
         self,
         *,
@@ -177,3 +204,6 @@ class StockIdempotencyStore:
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self._database_path, timeout=30)
+
+
+StockIdempotencyStore = IdempotencyStore
