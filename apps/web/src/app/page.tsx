@@ -1,6 +1,7 @@
 import { redirect } from "next/navigation";
 import Link from "next/link";
 
+import { canManagePurchases } from "@/lib/auth";
 import { getProducts } from "@/lib/products-server";
 import { getAuthSession } from "@/lib/session";
 
@@ -42,6 +43,10 @@ export default async function Home() {
   const products = await getProducts(session);
   const productsReady = products.status === "ready";
   const productsCount = productsReady ? products.data.count : 0;
+  const canSeePurchases = canManagePurchases(session.user.roles);
+  const visibleModules = canSeePurchases
+    ? modules
+    : modules.filter((module) => module !== "Закупки");
 
   const services = [
     {
@@ -92,7 +97,7 @@ export default async function Home() {
           </div>
           <div className="flex flex-wrap items-center gap-3">
             <span className="rounded-full bg-[var(--accent-soft)] px-3 py-1.5 text-xs font-semibold text-[var(--accent)]">
-              Sprint 3
+              Sprint 4
             </span>
             <form action="/api/auth/logout" method="post">
               <button
@@ -176,6 +181,14 @@ export default async function Home() {
               >
                 Открыть склад
               </Link>
+              {canSeePurchases ? (
+                <Link
+                  href="/purchases"
+                  className="w-fit rounded-full border border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-sm font-semibold transition hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                >
+                  Открыть закупки
+                </Link>
+              ) : null}
             </div>
           </div>
 
@@ -222,7 +235,7 @@ export default async function Home() {
               <h2 className="text-2xl font-semibold tracking-tight">Зафиксированный объём</h2>
             </div>
             <ul className="flex flex-wrap gap-2" aria-label="Модули MVP">
-              {modules.map((module) => (
+              {visibleModules.map((module) => (
                 <li
                   key={module}
                   className="rounded-full border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-sm"
