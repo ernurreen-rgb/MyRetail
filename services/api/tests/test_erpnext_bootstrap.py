@@ -8,10 +8,13 @@ def test_bootstrap_api_user_grants_minimal_stock_permissions() -> None:
     )
 
     for doctype in [
+        "Supplier",
         "Warehouse",
         "Bin",
         "Stock Entry",
         "Stock Entry Detail",
+        "Purchase Receipt",
+        "Purchase Receipt Item",
         "Comment",
         "Item",
         "Item Barcode",
@@ -27,7 +30,19 @@ def test_bootstrap_api_user_grants_minimal_stock_permissions() -> None:
     assert "create = 1" in stock_entry_block
     assert "write = 1" in stock_entry_block
     assert "submit = 1" in stock_entry_block
+    assert "cancel = 1" not in stock_entry_block
     assert '"submit"' in script
+    assert '"cancel"' in script
+
+    purchase_receipt_block = script[
+        script.index('parent = "Purchase Receipt"') : script.index(
+            'parent = "Purchase Receipt Item"'
+        )
+    ]
+    assert "create = 1" in purchase_receipt_block
+    assert "write = 1" in purchase_receipt_block
+    assert "submit = 1" in purchase_receipt_block
+    assert "cancel = 1" in purchase_receipt_block
 
 
 def test_stock_qa_data_scripts_seed_balances_and_reservation() -> None:
