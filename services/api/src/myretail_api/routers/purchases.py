@@ -52,6 +52,15 @@ suppliers_router = APIRouter(prefix="/suppliers", tags=["suppliers"])
 purchases_router = APIRouter(prefix="/purchases", tags=["purchases"])
 T = TypeVar("T")
 ACCESS_ROLES = {"Owner", "Admin"}
+CREATE_RECOVERY_TIMEOUT_SECONDS = 30.0
+CREATE_RECOVERY_POLL_SECONDS = 0.25
+ERPNEXT_UNAVAILABLE_RESPONSE = {
+    "error": {
+        "code": "ERPNEXT_UNAVAILABLE",
+        "message": "ERPNext временно недоступен",
+        "fields": {},
+    }
+}
 
 
 def require_purchases_access(
@@ -410,22 +419,25 @@ async def _idempotent_response(
 
     try:
         result = await _call_erpnext(execute())
-    except ERPNextAmbiguousCreateError as exc:
-        recovered_response = await _recover_idempotent_response(
+    except ERPNextAmbiguousCreateError:
+        recovered_response = await _wait_or_recover_idempotency(
             store=store,
             tenant=tenant,
             key=key,
             request_hash=request_hash,
             status_code=status_code,
             recover=recover,
+            timeout_seconds=CREATE_RECOVERY_TIMEOUT_SECONDS,
+            poll_seconds=CREATE_RECOVERY_POLL_SECONDS,
         )
         if recovered_response is not None:
             return recovered_response
-        raise _api_error(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            "ERPNEXT_UNAVAILABLE",
-            "ERPNext временно недоступен",
-        ) from exc
+        return _complete_terminal_idempotency_error(
+            store=store,
+            tenant=tenant,
+            key=key,
+            request_hash=request_hash,
+        )
     except Exception:
         recovered_response = await _recover_idempotent_response(
             store=store,
@@ -517,6 +529,26 @@ async def _wait_or_recover_idempotency(
             return recovered_response
         await asyncio.sleep(poll_seconds)
     return None
+
+
+def _complete_terminal_idempotency_error(
+    *,
+    store: IdempotencyStore,
+    tenant: str,
+    key: str,
+    request_hash: str,
+) -> JSONResponse:
+    store.complete(
+        tenant=tenant,
+        key=key,
+        request_hash=request_hash,
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        response_body=ERPNEXT_UNAVAILABLE_RESPONSE,
+    )
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content=ERPNEXT_UNAVAILABLE_RESPONSE,
+    )
 
 
 def _begin_idempotency(

@@ -621,6 +621,7 @@ class ERPNextClient:
             created_at=created_at,
             docstatus=0,
             create_idempotency_key=idempotency_key,
+            draft_price_snapshots=original_prices,
         )
         try:
             response = await self._request_json(
@@ -1026,6 +1027,7 @@ class ERPNextClient:
         created_at: datetime,
         docstatus: int,
         create_idempotency_key: str | None = None,
+        draft_price_snapshots: Mapping[str, Mapping[str, object]] | None = None,
     ) -> dict[str, Any]:
         metadata = {
             "myretail_purchase": {
@@ -1043,6 +1045,8 @@ class ERPNextClient:
         }
         if create_idempotency_key is not None:
             metadata["myretail_purchase"]["create_idempotency_key"] = create_idempotency_key
+        if draft_price_snapshots is not None:
+            metadata["myretail_purchase"]["draft_price_snapshots"] = draft_price_snapshots
         return {
             "doctype": "Purchase Receipt",
             "company": self._company,
@@ -1105,6 +1109,8 @@ class ERPNextClient:
         if not rows:
             return None
         purchase_id = str(rows[0].get("name") or "")
+        if int(rows[0].get("docstatus") or 0) == 0:
+            await self._restore_purchase_draft_price_snapshots(rows[0])
         return await self._to_purchase(rows[0], events=await self._get_purchase_events(purchase_id))
 
     async def _get_purchase_receipt(self, purchase_id: str) -> Mapping[str, Any]:
@@ -1291,6 +1297,14 @@ class ERPNextClient:
             else:
                 await self._delete_item_price(item_code, self._buying_price_list)
 
+    async def _restore_purchase_draft_price_snapshots(self, row: Mapping[str, Any]) -> None:
+        snapshots = self._purchase_draft_price_snapshots(row)
+        if snapshots is None:
+            raise ERPNextUnavailableError(
+                "ERPNext Purchase Receipt is missing draft price snapshots"
+            )
+        await self._restore_buying_price_snapshots(snapshots)
+
     async def _latest_posted_purchase_price(
         self,
         item_code: str,
@@ -1396,6 +1410,20 @@ class ERPNextClient:
                     if isinstance(snapshot, Mapping)
                 }
         return None
+
+    def _purchase_draft_price_snapshots(
+        self,
+        row: Mapping[str, Any],
+    ) -> dict[str, Mapping[str, Any]] | None:
+        metadata = self._extract_myretail_purchase_metadata(row.get("remarks"))
+        snapshots = metadata.get("draft_price_snapshots")
+        if not isinstance(snapshots, Mapping):
+            return None
+        return {
+            str(item_code): snapshot
+            for item_code, snapshot in snapshots.items()
+            if isinstance(snapshot, Mapping)
+        }
 
     async def _to_purchase(
         self,
@@ -3080,7 +3108,7 @@ class ERPNextClient:
             raise ERPNextTimeoutError("ERPNext request timed out")
         if (
             timestamp_conflict_code is not None
-            and self._is_timestamp_conflict_response(response)
+            and self._is_concurrency_conflict_response(response)
         ):
             raise ERPNextConflictError(
                 timestamp_conflict_code,
@@ -3163,14 +3191,15 @@ class ERPNextClient:
         return "ERPNext отклонил данные товара"
 
     @staticmethod
-    def _is_timestamp_conflict_response(response: httpx.Response) -> bool:
+    def _is_concurrency_conflict_response(response: httpx.Response) -> bool:
         if response.status_code not in {409, 417, 500}:
             return False
         try:
             payload = json.dumps(response.json(), ensure_ascii=False)
         except ValueError:
             payload = response.text
-        return any(
+        normalized = payload.lower()
+        timestamp_conflict = any(
             marker in payload
             for marker in (
                 "TimestampMismatchError",
@@ -3178,6 +3207,12 @@ class ERPNextClient:
                 "modified after you have opened",
             )
         )
+        deadlock_conflict = (
+            "querydeadlockerror" in normalized
+            or "er_lock_deadlock" in normalized
+            or ("deadlock" in normalized and "try restarting" in normalized)
+        )
+        return timestamp_conflict or deadlock_conflict
 
     @staticmethod
     def _extract_roles(raw_roles: Any) -> list[str]:

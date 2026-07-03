@@ -38,6 +38,7 @@ from myretail_api.models.purchases import (
     SupplierUpdate,
 )
 from myretail_api.models.stock import AuditUser, Warehouse, WarehouseRef
+from myretail_api.routers import purchases as purchases_router_module
 from myretail_api.security import create_access_token
 
 
@@ -449,6 +450,62 @@ class DelayedPurchaseRecoveryClient(FlakyPurchaseCreateClient):
         return await super().recover_created_purchase(idempotency_key)
 
 
+class DraftPriceRecoveryPurchaseClient(StubPurchasesERPNextClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_recovery_once = True
+        self.recovery_calls = 0
+
+    async def create_purchase(
+        self,
+        purchase: PurchaseCreate,
+        *,
+        actor: AuthenticatedUser,
+        idempotency_key: str | None = None,
+    ) -> Purchase:
+        created = await super().create_purchase(
+            purchase,
+            actor=actor,
+            idempotency_key=idempotency_key,
+        )
+        for line in created.lines:
+            self.buying_prices[line.product_id] = line.unit_price
+        raise ERPNextUnavailableError("draft price restore failed")
+
+    async def recover_created_purchase(self, idempotency_key: str | None) -> Purchase | None:
+        self.recovery_calls += 1
+        if self.fail_recovery_once:
+            self.fail_recovery_once = False
+            raise ERPNextUnavailableError("draft price still not restored")
+        recovered = await super().recover_created_purchase(idempotency_key)
+        if recovered is not None:
+            for line in recovered.lines:
+                self.buying_prices[line.product_id] = "510.00"
+        return recovered
+
+
+class MissingAmbiguousPurchaseCreateClient(StubPurchasesERPNextClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.recovery_calls = 0
+
+    async def create_purchase(
+        self,
+        purchase: PurchaseCreate,
+        *,
+        actor: AuthenticatedUser,
+        idempotency_key: str | None = None,
+    ) -> Purchase:
+        _ = purchase, actor, idempotency_key
+        self.create_purchase_calls += 1
+        raise ERPNextAmbiguousCreateError("lost response without external document")
+
+    async def recover_created_purchase(self, idempotency_key: str | None) -> Purchase | None:
+        _ = idempotency_key
+        self.recovery_calls += 1
+        return None
+
+
 class PurchaseRouteFailuresClient(StubPurchasesERPNextClient):
     async def list_purchases(self, **kwargs: object) -> PurchaseList:
         _ = kwargs
@@ -641,8 +698,9 @@ async def test_supplier_create_keeps_idempotency_key_until_delayed_recovery(
             json=payload,
         )
 
-    assert first_response.status_code == 503
+    assert first_response.status_code == 201
     assert second_response.status_code == 201
+    assert first_response.json()["id"] == second_response.json()["id"]
     assert second_response.json()["name"] == "Delayed Supplier Recovery"
     assert erpnext_client.create_supplier_calls == 1
     assert erpnext_client.recovery_calls >= 3
@@ -797,11 +855,97 @@ async def test_purchase_create_keeps_idempotency_key_until_delayed_recovery(
             json=payload,
         )
 
-    assert first_response.status_code == 503
+    assert first_response.status_code == 201
     assert second_response.status_code == 201
+    assert first_response.json()["id"] == second_response.json()["id"]
     assert second_response.json()["supplier"]["id"] == supplier["id"]
     assert erpnext_client.create_purchase_calls == 1
     assert erpnext_client.recovery_calls >= 3
+
+
+@pytest.mark.anyio
+async def test_purchase_create_does_not_complete_until_draft_price_is_restored(
+    tmp_path: Path,
+) -> None:
+    erpnext_client = DraftPriceRecoveryPurchaseClient()
+    app = make_app(erpnext_client, tmp_path)
+    key = str(uuid4())
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        supplier = await create_supplier_via_api(client, tmp_path)
+        payload = {
+            "supplier_id": supplier["id"],
+            "warehouse_id": "Stores - MR",
+            "posting_date": "2026-06-30",
+            "lines": [
+                {"product_id": "QA-MILK-001", "quantity": "1.000", "unit_price": "600.00"}
+            ],
+        }
+        first_response = await client.post(
+            "/purchases",
+            headers=auth_headers(tmp_path, idempotency_key=key),
+            json=payload,
+        )
+        assert erpnext_client.buying_prices["QA-MILK-001"] == "600.00"
+        second_response = await client.post(
+            "/purchases",
+            headers=auth_headers(tmp_path, idempotency_key=key),
+            json=payload,
+        )
+
+    assert first_response.status_code == 503
+    assert first_response.json()["error"]["code"] == "ERPNEXT_UNAVAILABLE"
+    assert second_response.status_code == 201
+    assert second_response.json()["supplier"]["id"] == supplier["id"]
+    assert erpnext_client.buying_prices["QA-MILK-001"] == "510.00"
+    assert erpnext_client.create_purchase_calls == 1
+    assert erpnext_client.recovery_calls == 2
+
+
+@pytest.mark.anyio
+async def test_ambiguous_purchase_create_without_external_document_becomes_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(purchases_router_module, "CREATE_RECOVERY_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(purchases_router_module, "CREATE_RECOVERY_POLL_SECONDS", 0.001)
+    erpnext_client = MissingAmbiguousPurchaseCreateClient()
+    app = make_app(erpnext_client, tmp_path)
+    key = str(uuid4())
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        supplier = await create_supplier_via_api(client, tmp_path)
+        payload = {
+            "supplier_id": supplier["id"],
+            "warehouse_id": "Stores - MR",
+            "posting_date": "2026-06-30",
+            "lines": [
+                {"product_id": "QA-MILK-001", "quantity": "1.000", "unit_price": "600.00"}
+            ],
+        }
+        first_response = await client.post(
+            "/purchases",
+            headers=auth_headers(tmp_path, idempotency_key=key),
+            json=payload,
+        )
+        second_response = await client.post(
+            "/purchases",
+            headers=auth_headers(tmp_path, idempotency_key=key),
+            json=payload,
+        )
+
+    assert first_response.status_code == 503
+    assert first_response.json()["error"]["code"] == "ERPNEXT_UNAVAILABLE"
+    assert second_response.status_code == 503
+    assert second_response.json() == first_response.json()
+    assert erpnext_client.create_purchase_calls == 1
+    assert erpnext_client.recovery_calls >= 1
 
 
 @pytest.mark.anyio

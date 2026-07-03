@@ -1157,6 +1157,46 @@ async def test_update_supplier_uses_frappe_save_expected_updated_at_conflict() -
 
 
 @pytest.mark.anyio
+async def test_update_supplier_maps_frappe_query_deadlock_to_changed_conflict() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/resource/Supplier/SUP-00001":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "name": "SUP-00001",
+                        "supplier_name": "Supplier",
+                        "supplier_details": "{}",
+                        "disabled": 0,
+                        "modified": "2026-06-30T08:00:00Z",
+                    }
+                },
+            )
+        if request.url.path == "/api/method/frappe.client.save":
+            return httpx.Response(
+                500,
+                json={
+                    "exception": "frappe.exceptions.QueryDeadlockError",
+                    "message": "Deadlock found when trying to get lock; try restarting transaction",
+                },
+            )
+        return httpx.Response(404)
+
+    client = ERPNextClient(make_settings(), transport=httpx.MockTransport(handler))
+
+    with pytest.raises(ERPNextConflictError) as exc_info:
+        await client.update_supplier(
+            "SUP-00001",
+            SupplierUpdate(
+                expected_updated_at=datetime(2026, 6, 30, 8, 0, tzinfo=UTC),
+                phone="+7 701 111 22 33",
+            ),
+        )
+
+    assert exc_info.value.code == "SUPPLIER_CHANGED"
+
+
+@pytest.mark.anyio
 async def test_update_purchase_uses_frappe_save_expected_updated_at_conflict() -> None:
     metadata = {
         "myretail_purchase": {
@@ -1294,6 +1334,34 @@ async def test_update_purchase_uses_frappe_save_expected_updated_at_conflict() -
 
 
 @pytest.mark.anyio
+async def test_purchase_save_maps_frappe_query_deadlock_to_changed_conflict() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/method/frappe.client.save":
+            return httpx.Response(
+                500,
+                json={
+                    "exception": "frappe.exceptions.QueryDeadlockError",
+                    "message": "Deadlock found when trying to get lock; try restarting transaction",
+                },
+            )
+        return httpx.Response(404)
+
+    client = ERPNextClient(make_settings(), transport=httpx.MockTransport(handler))
+
+    with pytest.raises(ERPNextConflictError) as exc_info:
+        await client._save_document_with_modified_check(
+            "Purchase Receipt",
+            "PREC-00001",
+            row={"name": "PREC-00001", "modified": "2026-06-30T08:00:00Z"},
+            updates={},
+            conflict_code="PURCHASE_CHANGED",
+            field_name="expected_updated_at",
+        )
+
+    assert exc_info.value.code == "PURCHASE_CHANGED"
+
+
+@pytest.mark.anyio
 async def test_create_purchase_draft_restores_erpnext_auto_buying_price() -> None:
     state = {"price": "510.00", "purchase_created": False}
     restored_prices: list[str] = []
@@ -1409,6 +1477,8 @@ async def test_create_purchase_draft_restores_erpnext_auto_buying_price() -> Non
             "/api/resource/Purchase%20Receipt",
             "/api/resource/Purchase Receipt",
         }:
+            body = json.loads(request.content)
+            purchase_doc["remarks"] = body["remarks"]
             state["purchase_created"] = True
             state["price"] = "778.00"
             return httpx.Response(200, json={"data": {"name": "PREC-00001"}})
@@ -1441,6 +1511,95 @@ async def test_create_purchase_draft_restores_erpnext_auto_buying_price() -> Non
     assert state["purchase_created"] is True
     assert state["price"] == "510.00"
     assert restored_prices == ["510.00"]
+    created_metadata = json.loads(str(purchase_doc["remarks"]))["myretail_purchase"]
+    assert created_metadata["draft_price_snapshots"] == {
+        "QA-MILK-001": {"exists": True, "price": "510.00"}
+    }
+
+
+@pytest.mark.anyio
+async def test_recover_created_purchase_restores_draft_price_before_returning() -> None:
+    state = {"price": "778.00", "restore_calls": 0}
+    metadata = {
+        "myretail_purchase": {
+            "create_idempotency_key": "purchase-create-key",
+            "draft_price_snapshots": {
+                "QA-MILK-001": {"exists": True, "price": "510.00"}
+            },
+            "created_by": {"email": "owner@example.com", "full_name": "Owner"},
+            "created_at": "2026-06-30T08:00:00Z",
+            "lines": [
+                {
+                    "product_id": "QA-MILK-001",
+                    "sku": "QA-MILK-001",
+                    "name": "Milk",
+                    "unit": "Nos",
+                    "quantity": "1.000",
+                    "unit_price": "778.00",
+                    "line_total": "778.00",
+                }
+            ],
+        }
+    }
+    purchase_doc = {
+        "name": "PREC-00001",
+        "supplier": "SUP-00001",
+        "supplier_name": "Supplier",
+        "set_warehouse": "Stores - MR",
+        "posting_date": "2026-06-30",
+        "docstatus": 0,
+        "owner": "owner@example.com",
+        "creation": "2026-06-30T08:00:00Z",
+        "modified": "2026-06-30T08:00:00Z",
+        "currency": "KZT",
+        "remarks": json.dumps(metadata, separators=(",", ":")),
+        "items": [],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path in {
+            "/api/resource/Purchase%20Receipt",
+            "/api/resource/Purchase Receipt",
+        }:
+            return httpx.Response(200, json={"data": [purchase_doc]})
+        if request.url.path in {"/api/resource/Item%20Price", "/api/resource/Item Price"}:
+            return httpx.Response(
+                200,
+                json={"data": [{"name": "PRICE-BUY", "price_list_rate": state["price"]}]},
+            )
+        if request.url.path in {
+            "/api/resource/Item%20Price/PRICE-BUY",
+            "/api/resource/Item Price/PRICE-BUY",
+        }:
+            state["restore_calls"] += 1
+            state["price"] = json.loads(request.content)["price_list_rate"]
+            return httpx.Response(200, json={"data": {}})
+        if request.url.path == "/api/resource/Comment":
+            return httpx.Response(200, json={"data": []})
+        if request.url.path == "/api/resource/Warehouse":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "name": "Stores - MR",
+                            "warehouse_name": "Stores",
+                            "disabled": 0,
+                            "is_group": 0,
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(404)
+
+    client = ERPNextClient(make_settings(), transport=httpx.MockTransport(handler))
+
+    recovered = await client.recover_created_purchase("purchase-create-key")
+
+    assert recovered is not None
+    assert recovered.id == "PREC-00001"
+    assert state["price"] == "510.00"
+    assert state["restore_calls"] == 1
 
 
 @pytest.mark.anyio
