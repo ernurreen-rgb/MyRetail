@@ -52,6 +52,7 @@ const dangerButtonClass =
 
 const SUPPLIER_PAGE_SIZE = 10;
 const PURCHASE_PAGE_SIZE = 10;
+const LOOKUP_PAGE_SIZE = 20;
 
 const purchaseStatusLabels: Record<PurchaseStatus, string> = {
   draft: "Черновик",
@@ -128,6 +129,93 @@ function ErrorState({
       <button type="button" onClick={onRetry} className={`${secondaryButtonClass} mt-4`}>
         Повторить запрос
       </button>
+    </div>
+  );
+}
+
+function LookupSearchControls({
+  label,
+  value,
+  placeholder,
+  isLoading,
+  error,
+  currentPage,
+  totalPages,
+  count,
+  hasPrevious,
+  hasNext,
+  onChange,
+  onSearch,
+  onPrevious,
+  onNext,
+}: {
+  label: string;
+  value: string;
+  placeholder: string;
+  isLoading: boolean;
+  error: string | null;
+  currentPage: number;
+  totalPages: number;
+  count: number;
+  hasPrevious: boolean;
+  hasNext: boolean;
+  onChange: (value: string) => void;
+  onSearch: () => void;
+  onPrevious: () => void;
+  onNext: () => void;
+}) {
+  return (
+    <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
+      <div className="grid gap-3 md:grid-cols-[1fr_auto]">
+        <label className="block">
+          <span className="text-sm font-semibold">{label}</span>
+          <input
+            value={value}
+            onChange={(event) => onChange(event.target.value)}
+            className={inputClass}
+            type="search"
+            placeholder={placeholder}
+          />
+        </label>
+        <div className="flex items-end">
+          <button
+            type="button"
+            onClick={onSearch}
+            className={secondaryButtonClass}
+            disabled={isLoading}
+          >
+            Найти
+          </button>
+        </div>
+      </div>
+      <div className="mt-3 flex flex-wrap items-center justify-between gap-3 text-sm text-[var(--muted)]">
+        <span>
+          Страница {currentPage} из {totalPages}. Найдено: {count}
+        </span>
+        <div className="flex gap-2">
+          <button
+            type="button"
+            className={secondaryButtonClass}
+            disabled={!hasPrevious || isLoading}
+            onClick={onPrevious}
+          >
+            Назад
+          </button>
+          <button
+            type="button"
+            className={secondaryButtonClass}
+            disabled={!hasNext || isLoading}
+            onClick={onNext}
+          >
+            Вперёд
+          </button>
+        </div>
+      </div>
+      {error ? (
+        <p className="mt-3 text-sm text-red-700 dark:text-red-300" role="alert">
+          {error}
+        </p>
+      ) : null}
     </div>
   );
 }
@@ -308,11 +396,29 @@ export function PurchaseManager({
   const [isLoadingSuppliers, setIsLoadingSuppliers] = useState(canManage);
   const [suppliersError, setSuppliersError] = useState<string | null>(null);
 
-  const [activeSuppliers, setActiveSuppliers] = useState<Supplier[]>([]);
-  const [allSuppliers, setAllSuppliers] = useState<Supplier[]>([]);
   const [options, setOptions] = useState<PurchaseOptions | null>(null);
-  const [products, setProducts] = useState<Product[]>([]);
   const [lookupsError, setLookupsError] = useState<string | null>(null);
+  const [activeSupplierOptions, setActiveSupplierOptions] = useState<Supplier[]>([]);
+  const [activeSupplierLookupCount, setActiveSupplierLookupCount] = useState(0);
+  const [activeSupplierLookupOffset, setActiveSupplierLookupOffset] = useState(0);
+  const [activeSupplierLookupQuery, setActiveSupplierLookupQuery] = useState("");
+  const [appliedActiveSupplierLookupQuery, setAppliedActiveSupplierLookupQuery] = useState("");
+  const [activeSupplierLookupError, setActiveSupplierLookupError] = useState<string | null>(null);
+  const [isLoadingActiveSupplierLookup, setIsLoadingActiveSupplierLookup] = useState(canManage);
+  const [allSupplierOptions, setAllSupplierOptions] = useState<Supplier[]>([]);
+  const [allSupplierLookupCount, setAllSupplierLookupCount] = useState(0);
+  const [allSupplierLookupOffset, setAllSupplierLookupOffset] = useState(0);
+  const [allSupplierLookupQuery, setAllSupplierLookupQuery] = useState("");
+  const [appliedAllSupplierLookupQuery, setAppliedAllSupplierLookupQuery] = useState("");
+  const [allSupplierLookupError, setAllSupplierLookupError] = useState<string | null>(null);
+  const [isLoadingAllSupplierLookup, setIsLoadingAllSupplierLookup] = useState(canManage);
+  const [productOptions, setProductOptions] = useState<Product[]>([]);
+  const [productLookupCount, setProductLookupCount] = useState(0);
+  const [productLookupOffset, setProductLookupOffset] = useState(0);
+  const [productLookupQuery, setProductLookupQuery] = useState("");
+  const [appliedProductLookupQuery, setAppliedProductLookupQuery] = useState("");
+  const [productLookupError, setProductLookupError] = useState<string | null>(null);
+  const [isLoadingProductLookup, setIsLoadingProductLookup] = useState(canManage);
 
   const [purchases, setPurchases] = useState<PurchaseSummary[]>([]);
   const [purchaseCount, setPurchaseCount] = useState(0);
@@ -336,11 +442,17 @@ export function PurchaseManager({
   const [cancelForm, setCancelForm] = useState<CancelFormState | null>(null);
   const [isSubmittingPurchase, setIsSubmittingPurchase] = useState(false);
   const [submitIdempotencyKey, setSubmitIdempotencyKey] = useState(createIdempotencyKey);
+  const [invoiceDuplicateWarning, setInvoiceDuplicateWarning] = useState<string | null>(null);
+  const [isCheckingInvoiceDuplicate, setIsCheckingInvoiceDuplicate] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
 
   const supplierRequestId = useRef(0);
   const purchaseRequestId = useRef(0);
   const detailRequestId = useRef(0);
+  const activeSupplierLookupRequestId = useRef(0);
+  const allSupplierLookupRequestId = useRef(0);
+  const productLookupRequestId = useRef(0);
+  const invoiceDuplicateRequestId = useRef(0);
 
   const activeWarehouses = useMemo(
     () => options?.warehouses.filter((warehouse) => warehouse.is_active) ?? [],
@@ -354,6 +466,27 @@ export function PurchaseManager({
   const purchaseTotalPages = Math.max(1, Math.ceil(purchaseCount / PURCHASE_PAGE_SIZE));
   const hasPreviousPurchasePage = purchaseOffset > 0;
   const hasNextPurchasePage = purchaseOffset + purchases.length < purchaseCount;
+  const activeSupplierLookupCurrentPage =
+    Math.floor(activeSupplierLookupOffset / LOOKUP_PAGE_SIZE) + 1;
+  const activeSupplierLookupTotalPages = Math.max(
+    1,
+    Math.ceil(activeSupplierLookupCount / LOOKUP_PAGE_SIZE),
+  );
+  const hasPreviousActiveSupplierLookupPage = activeSupplierLookupOffset > 0;
+  const hasNextActiveSupplierLookupPage =
+    activeSupplierLookupOffset + activeSupplierOptions.length < activeSupplierLookupCount;
+  const allSupplierLookupCurrentPage = Math.floor(allSupplierLookupOffset / LOOKUP_PAGE_SIZE) + 1;
+  const allSupplierLookupTotalPages = Math.max(
+    1,
+    Math.ceil(allSupplierLookupCount / LOOKUP_PAGE_SIZE),
+  );
+  const hasPreviousAllSupplierLookupPage = allSupplierLookupOffset > 0;
+  const hasNextAllSupplierLookupPage =
+    allSupplierLookupOffset + allSupplierOptions.length < allSupplierLookupCount;
+  const productLookupCurrentPage = Math.floor(productLookupOffset / LOOKUP_PAGE_SIZE) + 1;
+  const productLookupTotalPages = Math.max(1, Math.ceil(productLookupCount / LOOKUP_PAGE_SIZE));
+  const hasPreviousProductLookupPage = productLookupOffset > 0;
+  const hasNextProductLookupPage = productLookupOffset + productOptions.length < productLookupCount;
   const roleLabel = userRoles.length > 0 ? userRoles.join(", ") : "без роли";
 
   async function refreshSuppliers(next?: {
@@ -391,16 +524,99 @@ export function PurchaseManager({
     setIsLoadingSuppliers(false);
   }
 
+  async function refreshActiveSupplierOptions(next?: { q?: string; offset?: number }) {
+    const nextQuery = next?.q ?? appliedActiveSupplierLookupQuery;
+    const nextOffset = next?.offset ?? activeSupplierLookupOffset;
+    const requestId = ++activeSupplierLookupRequestId.current;
+
+    setIsLoadingActiveSupplierLookup(true);
+    setActiveSupplierLookupError(null);
+
+    const result = await listSuppliers({
+      q: nextQuery,
+      status: "active",
+      limit: LOOKUP_PAGE_SIZE,
+      offset: nextOffset,
+    });
+
+    if (requestId !== activeSupplierLookupRequestId.current) {
+      return;
+    }
+
+    if (result.status === "success") {
+      setActiveSupplierOptions(result.data.items);
+      setActiveSupplierLookupCount(result.data.count);
+      setActiveSupplierLookupOffset(result.data.offset);
+    } else {
+      setActiveSupplierLookupError(result.error.message);
+    }
+
+    setIsLoadingActiveSupplierLookup(false);
+  }
+
+  async function refreshAllSupplierOptions(next?: { q?: string; offset?: number }) {
+    const nextQuery = next?.q ?? appliedAllSupplierLookupQuery;
+    const nextOffset = next?.offset ?? allSupplierLookupOffset;
+    const requestId = ++allSupplierLookupRequestId.current;
+
+    setIsLoadingAllSupplierLookup(true);
+    setAllSupplierLookupError(null);
+
+    const result = await listSuppliers({
+      q: nextQuery,
+      status: "all",
+      limit: LOOKUP_PAGE_SIZE,
+      offset: nextOffset,
+    });
+
+    if (requestId !== allSupplierLookupRequestId.current) {
+      return;
+    }
+
+    if (result.status === "success") {
+      setAllSupplierOptions(result.data.items);
+      setAllSupplierLookupCount(result.data.count);
+      setAllSupplierLookupOffset(result.data.offset);
+    } else {
+      setAllSupplierLookupError(result.error.message);
+    }
+
+    setIsLoadingAllSupplierLookup(false);
+  }
+
+  async function refreshProductOptions(next?: { q?: string; offset?: number }) {
+    const nextQuery = next?.q ?? appliedProductLookupQuery;
+    const nextOffset = next?.offset ?? productLookupOffset;
+    const requestId = ++productLookupRequestId.current;
+
+    setIsLoadingProductLookup(true);
+    setProductLookupError(null);
+
+    const result = await listProducts({
+      q: nextQuery,
+      limit: LOOKUP_PAGE_SIZE,
+      offset: nextOffset,
+    });
+
+    if (requestId !== productLookupRequestId.current) {
+      return;
+    }
+
+    if (result.status === "success") {
+      setProductOptions(result.data.items);
+      setProductLookupCount(result.data.count);
+      setProductLookupOffset(result.data.offset);
+    } else {
+      setProductLookupError(result.error.message);
+    }
+
+    setIsLoadingProductLookup(false);
+  }
+
   async function refreshLookups() {
     setLookupsError(null);
 
-    const [optionsResult, activeSuppliersResult, allSuppliersResult, productsResult] =
-      await Promise.all([
-        getPurchaseOptions(),
-        listSuppliers({ status: "active", limit: 100, offset: 0 }),
-        listSuppliers({ status: "all", limit: 100, offset: 0 }),
-        listProducts({ limit: 100, offset: 0 }),
-      ]);
+    const optionsResult = await getPurchaseOptions();
 
     const lookupErrors: string[] = [];
 
@@ -410,25 +626,13 @@ export function PurchaseManager({
       lookupErrors.push(optionsResult.error.message);
     }
 
-    if (activeSuppliersResult.status === "success") {
-      setActiveSuppliers(activeSuppliersResult.data.items);
-    } else {
-      lookupErrors.push(activeSuppliersResult.error.message);
-    }
-
-    if (allSuppliersResult.status === "success") {
-      setAllSuppliers(allSuppliersResult.data.items);
-    } else {
-      lookupErrors.push(allSuppliersResult.error.message);
-    }
-
-    if (productsResult.status === "success") {
-      setProducts(productsResult.data.items);
-    } else {
-      lookupErrors.push(productsResult.error.message);
-    }
-
     setLookupsError(lookupErrors[0] ?? null);
+
+    await Promise.all([
+      refreshActiveSupplierOptions(),
+      refreshAllSupplierOptions(),
+      refreshProductOptions(),
+    ]);
   }
 
   async function refreshPurchases(next?: {
@@ -539,6 +743,24 @@ export function PurchaseManager({
   async function handleSupplierStatus(nextStatus: SupplierStatusFilter) {
     setSupplierStatus(nextStatus);
     await refreshSuppliers({ status: nextStatus, offset: 0 });
+  }
+
+  async function handleActiveSupplierLookupSearch() {
+    const normalizedQuery = activeSupplierLookupQuery.trim();
+    setAppliedActiveSupplierLookupQuery(normalizedQuery);
+    await refreshActiveSupplierOptions({ q: normalizedQuery, offset: 0 });
+  }
+
+  async function handleAllSupplierLookupSearch() {
+    const normalizedQuery = allSupplierLookupQuery.trim();
+    setAppliedAllSupplierLookupQuery(normalizedQuery);
+    await refreshAllSupplierOptions({ q: normalizedQuery, offset: 0 });
+  }
+
+  async function handleProductLookupSearch() {
+    const normalizedQuery = productLookupQuery.trim();
+    setAppliedProductLookupQuery(normalizedQuery);
+    await refreshProductOptions({ q: normalizedQuery, offset: 0 });
   }
 
   function openSupplierCreateForm() {
@@ -697,11 +919,12 @@ export function PurchaseManager({
       return;
     }
 
+    setInvoiceDuplicateWarning(null);
     setPurchaseForm({
       mode: "create",
       purchase: null,
       values: emptyPurchaseFormValues({
-        supplier_id: activeSuppliers[0]?.id ?? "",
+        supplier_id: activeSupplierOptions[0]?.id ?? "",
         warehouse_id: getDefaultWarehouseId(options),
       }),
       idempotencyKey: createIdempotencyKey(),
@@ -722,6 +945,7 @@ export function PurchaseManager({
       return;
     }
 
+    setInvoiceDuplicateWarning(null);
     setPurchaseForm({
       mode: "edit",
       purchase,
@@ -739,10 +963,15 @@ export function PurchaseManager({
       return;
     }
 
+    setInvoiceDuplicateWarning(null);
     setPurchaseForm(null);
   }
 
   function updatePurchaseField(field: keyof Omit<PurchaseFormValues, "lines">, value: string) {
+    if (field === "supplier_id" || field === "supplier_invoice_number") {
+      setInvoiceDuplicateWarning(null);
+    }
+
     setPurchaseForm((current) => {
       if (!current) {
         return current;
@@ -829,6 +1058,98 @@ export function PurchaseManager({
     });
   }
 
+  async function checkInvoiceDuplicate(values: PurchaseFormValues, currentPurchaseId?: string) {
+    const supplierId = values.supplier_id.trim();
+    const invoiceNumber = values.supplier_invoice_number.trim();
+
+    if (!supplierId || !invoiceNumber) {
+      setInvoiceDuplicateWarning(null);
+      return;
+    }
+
+    const requestId = ++invoiceDuplicateRequestId.current;
+    setIsCheckingInvoiceDuplicate(true);
+
+    const result = await listPurchases({
+      q: invoiceNumber,
+      supplierId,
+      limit: 5,
+      offset: 0,
+    });
+
+    if (requestId !== invoiceDuplicateRequestId.current) {
+      return;
+    }
+
+    if (result.status === "success") {
+      const duplicate = result.data.items.find(
+        (purchase) =>
+          purchase.id !== currentPurchaseId &&
+          purchase.supplier.id === supplierId &&
+          purchase.supplier_invoice_number?.trim() === invoiceNumber,
+      );
+
+      setInvoiceDuplicateWarning(
+        duplicate
+          ? `У этого поставщика уже есть закупка ${duplicate.id} с номером накладной ${invoiceNumber}. Проверьте, не дубликат ли это.`
+          : null,
+      );
+    } else {
+      setInvoiceDuplicateWarning(null);
+    }
+
+    setIsCheckingInvoiceDuplicate(false);
+  }
+
+  async function refreshChangedPurchaseForm() {
+    if (!purchaseForm?.purchase) {
+      return;
+    }
+
+    const result = await getPurchase(purchaseForm.purchase.id);
+
+    if (result.status === "success") {
+      const freshPurchase = result.data;
+      setSelectedPurchase(freshPurchase);
+      setSubmitIdempotencyKey(createIdempotencyKey());
+      setInvoiceDuplicateWarning(null);
+
+      if (freshPurchase.status === "draft") {
+        setPurchaseForm((current) =>
+          current?.purchase?.id === freshPurchase.id
+            ? {
+                ...current,
+                purchase: freshPurchase,
+                values: purchaseToFormValues(freshPurchase),
+                idempotencyKey: createIdempotencyKey(),
+                fieldErrors: {},
+                error: null,
+                isSaving: false,
+                isDirty: false,
+              }
+            : current,
+        );
+        setNotice(`Документ ${freshPurchase.id} обновлён, форма пересобрана.`);
+      } else {
+        setPurchaseForm(null);
+        setNotice(
+          `Документ ${freshPurchase.id} уже не черновик (${purchaseStatusLabels[freshPurchase.status]}), форма закрыта.`,
+        );
+      }
+    } else {
+      setPurchaseForm((current) =>
+        current
+          ? {
+              ...current,
+              isSaving: false,
+              error: result.error.message,
+              fieldErrors: result.error.fields,
+            }
+          : current,
+      );
+    }
+  }
+
   async function handleSavePurchase(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
@@ -846,6 +1167,8 @@ export function PurchaseManager({
     setPurchaseForm((current) =>
       current ? { ...current, isSaving: true, error: null, fieldErrors: {} } : current,
     );
+
+    await checkInvoiceDuplicate(purchaseForm.values, purchaseForm.purchase?.id);
 
     const result =
       purchaseForm.mode === "create"
@@ -1280,10 +1603,37 @@ export function PurchaseManager({
               type="button"
               onClick={openPurchaseCreateForm}
               className={primaryButtonClass}
-              disabled={activeSuppliers.length === 0 || activeWarehouses.length === 0}
+              disabled={activeSupplierLookupCount === 0 || activeWarehouses.length === 0}
             >
               Новый черновик
             </button>
+          </div>
+
+          <div className="mb-4">
+            <LookupSearchControls
+              label="Поиск поставщика для фильтра"
+              value={allSupplierLookupQuery}
+              placeholder="Название, БИН, контакт, телефон"
+              isLoading={isLoadingAllSupplierLookup}
+              error={allSupplierLookupError}
+              currentPage={allSupplierLookupCurrentPage}
+              totalPages={allSupplierLookupTotalPages}
+              count={allSupplierLookupCount}
+              hasPrevious={hasPreviousAllSupplierLookupPage}
+              hasNext={hasNextAllSupplierLookupPage}
+              onChange={setAllSupplierLookupQuery}
+              onSearch={() => void handleAllSupplierLookupSearch()}
+              onPrevious={() =>
+                void refreshAllSupplierOptions({
+                  offset: Math.max(0, allSupplierLookupOffset - LOOKUP_PAGE_SIZE),
+                })
+              }
+              onNext={() =>
+                void refreshAllSupplierOptions({
+                  offset: allSupplierLookupOffset + LOOKUP_PAGE_SIZE,
+                })
+              }
+            />
           </div>
 
           <form onSubmit={handlePurchaseSearch} className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
@@ -1305,7 +1655,11 @@ export function PurchaseManager({
                 className={inputClass}
               >
                 <option value="">Все поставщики</option>
-                {allSuppliers.map((supplier) => (
+                {purchaseSupplierId &&
+                !allSupplierOptions.some((supplier) => supplier.id === purchaseSupplierId) ? (
+                  <option value={purchaseSupplierId}>Выбранный поставщик: {purchaseSupplierId}</option>
+                ) : null}
+                {allSupplierOptions.map((supplier) => (
                   <option key={supplier.id} value={supplier.id}>
                     {supplier.name}
                     {supplier.is_active ? "" : " (архив)"}
@@ -1627,6 +1981,33 @@ export function PurchaseManager({
               ) : null}
             </div>
 
+            <div className="mb-4">
+              <LookupSearchControls
+                label="Поиск активного поставщика для закупки"
+                value={activeSupplierLookupQuery}
+                placeholder="Название, БИН, контакт, телефон"
+                isLoading={isLoadingActiveSupplierLookup}
+                error={activeSupplierLookupError}
+                currentPage={activeSupplierLookupCurrentPage}
+                totalPages={activeSupplierLookupTotalPages}
+                count={activeSupplierLookupCount}
+                hasPrevious={hasPreviousActiveSupplierLookupPage}
+                hasNext={hasNextActiveSupplierLookupPage}
+                onChange={setActiveSupplierLookupQuery}
+                onSearch={() => void handleActiveSupplierLookupSearch()}
+                onPrevious={() =>
+                  void refreshActiveSupplierOptions({
+                    offset: Math.max(0, activeSupplierLookupOffset - LOOKUP_PAGE_SIZE),
+                  })
+                }
+                onNext={() =>
+                  void refreshActiveSupplierOptions({
+                    offset: activeSupplierLookupOffset + LOOKUP_PAGE_SIZE,
+                  })
+                }
+              />
+            </div>
+
             <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
               <label className="block">
                 <span className="text-sm font-semibold">Поставщик *</span>
@@ -1637,7 +2018,15 @@ export function PurchaseManager({
                   disabled={purchaseForm.isSaving}
                 >
                   <option value="">Выберите активного поставщика</option>
-                  {activeSuppliers.map((supplier) => (
+                  {purchaseForm.values.supplier_id &&
+                  !activeSupplierOptions.some(
+                    (supplier) => supplier.id === purchaseForm.values.supplier_id,
+                  ) ? (
+                    <option value={purchaseForm.values.supplier_id}>
+                      Текущий поставщик: {purchaseForm.values.supplier_id}
+                    </option>
+                  ) : null}
+                  {activeSupplierOptions.map((supplier) => (
                     <option key={supplier.id} value={supplier.id}>
                       {supplier.name}
                     </option>
@@ -1673,20 +2062,47 @@ export function PurchaseManager({
                 />
                 <FieldError message={getFieldError(purchaseForm.fieldErrors, "posting_date")} />
               </label>
-              <label className="block">
-                <span className="text-sm font-semibold">Номер накладной</span>
-                <input
-                  value={purchaseForm.values.supplier_invoice_number}
-                  onChange={(event) =>
-                    updatePurchaseField("supplier_invoice_number", event.target.value)
-                  }
-                  className={inputClass}
-                  disabled={purchaseForm.isSaving}
-                />
-                <FieldError
-                  message={getFieldError(purchaseForm.fieldErrors, "supplier_invoice_number")}
-                />
-              </label>
+              <div className="block">
+                <label className="block">
+                  <span className="text-sm font-semibold">Номер накладной</span>
+                  <input
+                    value={purchaseForm.values.supplier_invoice_number}
+                    onChange={(event) =>
+                      updatePurchaseField("supplier_invoice_number", event.target.value)
+                    }
+                    className={inputClass}
+                    disabled={purchaseForm.isSaving}
+                  />
+                  <FieldError
+                    message={getFieldError(purchaseForm.fieldErrors, "supplier_invoice_number")}
+                  />
+                </label>
+                <div className="mt-3 flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    className={secondaryButtonClass}
+                    disabled={
+                      purchaseForm.isSaving ||
+                      isCheckingInvoiceDuplicate ||
+                      !purchaseForm.values.supplier_id ||
+                      !purchaseForm.values.supplier_invoice_number.trim()
+                    }
+                    onClick={() =>
+                      void checkInvoiceDuplicate(purchaseForm.values, purchaseForm.purchase?.id)
+                    }
+                  >
+                    {isCheckingInvoiceDuplicate ? "Проверяем…" : "Проверить номер"}
+                  </button>
+                </div>
+                {invoiceDuplicateWarning ? (
+                  <p
+                    className="mt-3 rounded-xl border border-[var(--warning)] bg-[var(--warning-soft)] p-3 text-sm text-[var(--warning)]"
+                    role="alert"
+                  >
+                    {invoiceDuplicateWarning}
+                  </p>
+                ) : null}
+              </div>
               <label className="block">
                 <span className="text-sm font-semibold">Дата накладной</span>
                 <input
@@ -1732,6 +2148,33 @@ export function PurchaseManager({
                 </button>
               </div>
 
+              <div className="mb-4">
+                <LookupSearchControls
+                  label="Поиск товара для строк"
+                  value={productLookupQuery}
+                  placeholder="SKU, название, штрихкод"
+                  isLoading={isLoadingProductLookup}
+                  error={productLookupError}
+                  currentPage={productLookupCurrentPage}
+                  totalPages={productLookupTotalPages}
+                  count={productLookupCount}
+                  hasPrevious={hasPreviousProductLookupPage}
+                  hasNext={hasNextProductLookupPage}
+                  onChange={setProductLookupQuery}
+                  onSearch={() => void handleProductLookupSearch()}
+                  onPrevious={() =>
+                    void refreshProductOptions({
+                      offset: Math.max(0, productLookupOffset - LOOKUP_PAGE_SIZE),
+                    })
+                  }
+                  onNext={() =>
+                    void refreshProductOptions({
+                      offset: productLookupOffset + LOOKUP_PAGE_SIZE,
+                    })
+                  }
+                />
+              </div>
+
               <div className="grid gap-3">
                 {purchaseForm.values.lines.map((line, index) => (
                   <div
@@ -1749,7 +2192,11 @@ export function PurchaseManager({
                         disabled={purchaseForm.isSaving}
                       >
                         <option value="">Выберите товар</option>
-                        {products.map((product) => (
+                        {line.product_id &&
+                        !productOptions.some((product) => product.id === line.product_id) ? (
+                          <option value={line.product_id}>Текущий товар: {line.product_id}</option>
+                        ) : null}
+                        {productOptions.map((product) => (
                           <option key={product.id} value={product.id}>
                             {product.sku} — {product.name}
                           </option>
@@ -1832,9 +2279,7 @@ export function PurchaseManager({
                 {purchaseForm.error.includes("измен") ? (
                   <button
                     type="button"
-                    onClick={() =>
-                      purchaseForm.purchase && void loadPurchaseDetail(purchaseForm.purchase.id)
-                    }
+                    onClick={() => void refreshChangedPurchaseForm()}
                     className={`${secondaryButtonClass} mt-3 block`}
                   >
                     Обновить документ
