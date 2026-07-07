@@ -11,8 +11,16 @@ from myretail_api.config import Settings, get_settings
 from myretail_api.dependencies import get_erpnext_client, get_pos_store
 from myretail_api.main import create_app
 from myretail_api.models.auth import AuthenticatedUser
-from myretail_api.models.pos import POSProduct, POSProductList, Register
+from myretail_api.models.pos import (
+    POSProduct,
+    POSProductList,
+    Register,
+    SaleCreateRequest,
+    ShiftCloseRequest,
+    ShiftOpenRequest,
+)
 from myretail_api.models.stock import WarehouseRef
+from myretail_api.pos_service import _request_hash
 from myretail_api.pos_store import POSStore
 from myretail_api.security import create_access_token
 
@@ -152,16 +160,22 @@ class StubPOSErpnextClient:
             self.sales.append(invoice)
             return invoice
 
-    async def recover_pos_opening(self, tenant: str, idempotency_key: str) -> str | None:
-        _ = tenant, idempotency_key
+    async def recover_pos_opening(
+        self, tenant: str, operation: str, user_email: str, idempotency_key: str
+    ) -> str | None:
+        _ = tenant, operation, user_email, idempotency_key
         return None
 
-    async def recover_pos_closing(self, tenant: str, idempotency_key: str) -> str | None:
-        _ = tenant, idempotency_key
+    async def recover_pos_closing(
+        self, tenant: str, operation: str, user_email: str, idempotency_key: str
+    ) -> str | None:
+        _ = tenant, operation, user_email, idempotency_key
         return None
 
-    async def recover_pos_sale(self, tenant: str, idempotency_key: str) -> str | None:
-        _ = tenant, idempotency_key
+    async def recover_pos_sale(
+        self, tenant: str, operation: str, user_email: str, idempotency_key: str
+    ) -> str | None:
+        _ = tenant, operation, user_email, idempotency_key
         return None
 
 
@@ -175,11 +189,37 @@ class FlakySaleERPNextClient(StubPOSErpnextClient):
         self.created_key = str(kwargs["idempotency_key"])
         raise ERPNextAmbiguousCreateError("lost response after sales invoice")
 
-    async def recover_pos_sale(self, tenant: str, idempotency_key: str) -> str | None:
-        _ = tenant
+    async def recover_pos_sale(
+        self, tenant: str, operation: str, user_email: str, idempotency_key: str
+    ) -> str | None:
+        _ = tenant, operation, user_email
         if idempotency_key == self.created_key:
             return self.sales[-1]
         return None
+
+
+class RecoveringSaleERPNextClient(StubPOSErpnextClient):
+    async def recover_pos_sale(
+        self, tenant: str, operation: str, user_email: str, idempotency_key: str
+    ) -> str | None:
+        _ = tenant, operation, user_email, idempotency_key
+        return "SINV-RECOVERED"
+
+
+class RecoveringOpenERPNextClient(StubPOSErpnextClient):
+    async def recover_pos_opening(
+        self, tenant: str, operation: str, user_email: str, idempotency_key: str
+    ) -> str | None:
+        _ = tenant, operation, user_email, idempotency_key
+        return "OPEN-RECOVERED"
+
+
+class RecoveringCloseERPNextClient(StubPOSErpnextClient):
+    async def recover_pos_closing(
+        self, tenant: str, operation: str, user_email: str, idempotency_key: str
+    ) -> str | None:
+        _ = tenant, operation, user_email, idempotency_key
+        return "CLOSE-RECOVERED"
 
 
 def make_settings(tmp_path: Path) -> Settings:
@@ -316,6 +356,89 @@ async def test_held_receipt_has_no_stock_side_effect_and_blocks_close(tmp_path: 
     assert erpnext.products["SKU-1"].available == "5.000"
     assert close.status_code == 409
     assert close.json()["error"]["code"] == "SHIFT_HAS_HELD_RECEIPTS"
+
+
+@pytest.mark.anyio
+async def test_stale_held_receipt_processing_retries_without_external_recovery(
+    tmp_path: Path,
+) -> None:
+    erpnext = StubPOSErpnextClient()
+    app = make_app(erpnext, tmp_path)
+    key = str(uuid4())
+    request_body = {
+        "shift_id": "",
+        "label": "stale",
+        "lines": [{"product_id": "SKU-1", "quantity": "1.000", "discount_percent": "0.00"}],
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        shift = await open_shift(client, tmp_path)
+        request_body["shift_id"] = str(shift["id"])
+        POSStore(tmp_path / "pos.sqlite3").begin_idempotency(
+            tenant="myretail",
+            operation="create_held_receipt",
+            user_email="cashier@example.kz",
+            key=key,
+            request_hash=_request_hash("create_held_receipt", request_body),
+            lease_seconds=-1,
+        )
+        first = await client.post(
+            "/pos/held-receipts",
+            headers=auth_headers(tmp_path, key=key),
+            json=request_body,
+        )
+        retry = await client.post(
+            "/pos/held-receipts",
+            headers=auth_headers(tmp_path, key=key),
+            json=request_body,
+        )
+
+    assert first.status_code == 201
+    assert retry.status_code == 201
+    assert retry.json()["id"] == first.json()["id"]
+    assert erpnext.sales == []
+
+
+@pytest.mark.anyio
+async def test_stale_open_shift_processing_with_external_side_effect_returns_terminal_503(
+    tmp_path: Path,
+) -> None:
+    erpnext = RecoveringOpenERPNextClient()
+    app = make_app(erpnext, tmp_path)
+    key = str(uuid4())
+    request_body = {"register_id": "POS-1", "opening_cash": "10000.00"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        POSStore(tmp_path / "pos.sqlite3").begin_idempotency(
+            tenant="myretail",
+            operation="open_shift",
+            user_email="cashier@example.kz",
+            key=key,
+            request_hash=_request_hash(
+                "open_shift", ShiftOpenRequest(**request_body).model_dump(mode="json")
+            ),
+            lease_seconds=-1,
+        )
+        first = await client.post(
+            "/pos/shifts",
+            headers=auth_headers(tmp_path, key=key),
+            json=request_body,
+        )
+        retry = await client.post(
+            "/pos/shifts",
+            headers=auth_headers(tmp_path, key=key),
+            json=request_body,
+        )
+
+    assert first.status_code == 503
+    assert retry.status_code == 503
+    assert first.json()["error"]["code"] == "ERPNEXT_RECOVERY_PENDING"
+    assert retry.json()["error"]["fields"]["erpnext_opening_id"] == "OPEN-RECOVERED"
+    assert erpnext.openings == []
 
 
 @pytest.mark.anyio
@@ -465,3 +588,136 @@ async def test_sale_recovers_ambiguous_erpnext_create_without_duplicate(tmp_path
     assert response.json()["receipt_number"] == "SINV-1"
     assert erpnext.sales == ["SINV-1"]
     assert erpnext.products["SKU-1"].available == "4.000"
+
+
+@pytest.mark.anyio
+async def test_same_idempotency_key_is_scoped_per_authenticated_user(tmp_path: Path) -> None:
+    erpnext = StubPOSErpnextClient()
+    app = make_app(erpnext, tmp_path)
+    sale_key = str(uuid4())
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        first_shift = await open_shift(client, tmp_path, register_id="POS-1", email="a@example.kz")
+        second_shift = await open_shift(
+            client, tmp_path, register_id="POS-2", email="b@example.kz"
+        )
+        first = await client.post(
+            "/pos/sales",
+            headers=auth_headers(tmp_path, email="a@example.kz", key=sale_key),
+            json={
+                "shift_id": first_shift["id"],
+                "lines": [{"product_id": "SKU-1", "quantity": "1.000", "discount_percent": "0.00"}],
+                "cash_received": "100.00",
+            },
+        )
+        second = await client.post(
+            "/pos/sales",
+            headers=auth_headers(tmp_path, email="b@example.kz", key=sale_key),
+            json={
+                "shift_id": second_shift["id"],
+                "lines": [{"product_id": "SKU-1", "quantity": "1.000", "discount_percent": "0.00"}],
+                "cash_received": "100.00",
+            },
+        )
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert first.json()["receipt_number"] == "SINV-1"
+    assert second.json()["receipt_number"] == "SINV-2"
+    assert erpnext.products["SKU-1"].available == "3.000"
+
+
+@pytest.mark.anyio
+async def test_stale_sale_processing_with_external_side_effect_returns_terminal_503(
+    tmp_path: Path,
+) -> None:
+    erpnext = RecoveringSaleERPNextClient()
+    app = make_app(erpnext, tmp_path)
+    key = str(uuid4())
+    request_body = {
+        "shift_id": "",
+        "lines": [{"product_id": "SKU-1", "quantity": "1.000", "discount_percent": "0.00"}],
+        "cash_received": "100.00",
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        shift = await open_shift(client, tmp_path)
+        request_body["shift_id"] = str(shift["id"])
+        POSStore(tmp_path / "pos.sqlite3").begin_idempotency(
+            tenant="myretail",
+            operation="create_sale",
+            user_email="cashier@example.kz",
+            key=key,
+            request_hash=_request_hash(
+                "create_sale", SaleCreateRequest(**request_body).model_dump(mode="json")
+            ),
+            lease_seconds=-1,
+        )
+        first = await client.post(
+            "/pos/sales",
+            headers=auth_headers(tmp_path, key=key),
+            json=request_body,
+        )
+        retry = await client.post(
+            "/pos/sales",
+            headers=auth_headers(tmp_path, key=key),
+            json=request_body,
+        )
+
+    assert first.status_code == 503
+    assert retry.status_code == 503
+    assert first.json()["error"]["code"] == "ERPNEXT_RECOVERY_PENDING"
+    assert retry.json()["error"]["code"] == "ERPNEXT_RECOVERY_PENDING"
+    assert erpnext.sales == []
+
+
+@pytest.mark.anyio
+async def test_stale_close_shift_processing_with_external_side_effect_returns_terminal_503(
+    tmp_path: Path,
+) -> None:
+    erpnext = RecoveringCloseERPNextClient()
+    app = make_app(erpnext, tmp_path)
+    key = str(uuid4())
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        shift = await open_shift(client, tmp_path)
+        request_body = {
+            "actual_cash": "10000.00",
+            "expected_updated_at": shift["updated_at"],
+        }
+        POSStore(tmp_path / "pos.sqlite3").begin_idempotency(
+            tenant="myretail",
+            operation="close_shift",
+            user_email="cashier@example.kz",
+            key=key,
+            request_hash=_request_hash(
+                "close_shift",
+                {
+                    "shift_id": shift["id"],
+                    **ShiftCloseRequest(**request_body).model_dump(mode="json"),
+                },
+            ),
+            lease_seconds=-1,
+        )
+        first = await client.post(
+            f"/pos/shifts/{shift['id']}/close",
+            headers=auth_headers(tmp_path, key=key),
+            json=request_body,
+        )
+        retry = await client.post(
+            f"/pos/shifts/{shift['id']}/close",
+            headers=auth_headers(tmp_path, key=key),
+            json=request_body,
+        )
+
+    assert first.status_code == 503
+    assert retry.status_code == 503
+    assert first.json()["error"]["code"] == "ERPNEXT_RECOVERY_PENDING"
+    assert retry.json()["error"]["fields"]["erpnext_closing_id"] == "CLOSE-RECOVERED"
+    assert erpnext.closings == []

@@ -1,3 +1,4 @@
+import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -166,6 +167,7 @@ class ERPNextClient:
         self._buying_price_list = settings.erpnext_buying_price_list
         self._company = settings.erpnext_company
         self._pos_user = settings.erpnext_pos_user
+        self._pos_user_map = settings.erpnext_pos_user_map
         self._currency = settings.default_currency
 
     async def authenticate_user(self, *, email: str, password: str) -> ERPNextUser:
@@ -384,7 +386,9 @@ class ERPNextClient:
             "myretail_shift_id": shift_id,
             "myretail_register_id": register.id,
             "myretail_cashier_email": cashier.email,
-            "myretail_open_idempotency_key": idempotency_key,
+            "myretail_open_idempotency_key": self._pos_idempotency_marker(
+                tenant, "open_shift", cashier.email, idempotency_key
+            ),
         }
         try:
             body = await self._request_json(
@@ -470,7 +474,9 @@ class ERPNextClient:
             "myretail_shift_id": shift.id,
             "myretail_register_id": shift.register.id,
             "myretail_cashier_email": shift.cashier.email,
-            "myretail_close_idempotency_key": idempotency_key,
+            "myretail_close_idempotency_key": self._pos_idempotency_marker(
+                tenant, "close_shift", shift.cashier.email, idempotency_key
+            ),
         }
         try:
             body = await self._request_json(
@@ -534,7 +540,9 @@ class ERPNextClient:
             "account_for_change_amount": "Cash - MRD",
             "myretail_tenant": tenant,
             "myretail_sale_id": sale_id,
-            "myretail_sale_idempotency_key": idempotency_key,
+            "myretail_sale_idempotency_key": self._pos_idempotency_marker(
+                tenant, "create_sale", shift.cashier.email, idempotency_key
+            ),
             "myretail_shift_id": shift.id,
             "myretail_register_id": shift.register.id,
             "myretail_cashier_email": shift.cashier.email,
@@ -543,7 +551,9 @@ class ERPNextClient:
                     "myretail_pos": {
                         "tenant": tenant,
                         "sale_id": sale_id,
-                        "idempotency_key": idempotency_key,
+                        "idempotency_marker": self._pos_idempotency_marker(
+                            tenant, "create_sale", shift.cashier.email, idempotency_key
+                        ),
                     }
                 },
                 ensure_ascii=False,
@@ -574,47 +584,46 @@ class ERPNextClient:
                 ) from exc
             raise
 
-    async def recover_pos_opening(self, tenant: str, idempotency_key: str) -> str | None:
+    async def recover_pos_opening(
+        self, tenant: str, operation: str, user_email: str, idempotency_key: str
+    ) -> str | None:
+        marker = self._pos_idempotency_marker(tenant, operation, user_email, idempotency_key)
         rows = await self._query_resource(
             "POS Opening Entry",
             fields=["name"],
             filters=[
                 ["POS Opening Entry", "myretail_tenant", "=", tenant],
-                [
-                    "POS Opening Entry",
-                    "myretail_open_idempotency_key",
-                    "like",
-                    f"%{idempotency_key}%",
-                ],
+                ["POS Opening Entry", "myretail_open_idempotency_key", "=", marker],
             ],
             limit=1,
         )
         return str(rows[0]["name"]) if rows else None
 
-    async def recover_pos_closing(self, tenant: str, idempotency_key: str) -> str | None:
+    async def recover_pos_closing(
+        self, tenant: str, operation: str, user_email: str, idempotency_key: str
+    ) -> str | None:
+        marker = self._pos_idempotency_marker(tenant, operation, user_email, idempotency_key)
         rows = await self._query_resource(
             "POS Closing Entry",
             fields=["name"],
             filters=[
                 ["POS Closing Entry", "myretail_tenant", "=", tenant],
-                [
-                    "POS Closing Entry",
-                    "myretail_close_idempotency_key",
-                    "like",
-                    f"%{idempotency_key}%",
-                ],
+                ["POS Closing Entry", "myretail_close_idempotency_key", "=", marker],
             ],
             limit=1,
         )
         return str(rows[0]["name"]) if rows else None
 
-    async def recover_pos_sale(self, tenant: str, idempotency_key: str) -> str | None:
+    async def recover_pos_sale(
+        self, tenant: str, operation: str, user_email: str, idempotency_key: str
+    ) -> str | None:
+        marker = self._pos_idempotency_marker(tenant, operation, user_email, idempotency_key)
         rows = await self._query_resource(
             "Sales Invoice",
             fields=["name"],
             filters=[
                 ["Sales Invoice", "myretail_tenant", "=", tenant],
-                ["Sales Invoice", "myretail_sale_idempotency_key", "like", f"%{idempotency_key}%"],
+                ["Sales Invoice", "myretail_sale_idempotency_key", "=", marker],
             ],
             limit=1,
         )
@@ -2785,8 +2794,14 @@ class ERPNextClient:
         return str(rows[0]["name"])
 
     def _pos_user_for_register(self, register_id: str) -> str:
-        _ = register_id
-        return self._pos_user
+        return self._pos_user_map.get(register_id, self._pos_user)
+
+    @staticmethod
+    def _pos_idempotency_marker(
+        tenant: str, operation: str, user_email: str, idempotency_key: str
+    ) -> str:
+        raw = f"{tenant}:{operation}:{user_email}:{idempotency_key}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     async def _list_options(self, doctype: str) -> list[ProductOption]:
         rows = await self._query_resource(doctype, fields=["name"], limit=1000)

@@ -399,20 +399,57 @@ foreach ($definition in $customFieldDefinitions) {
     }
 }
 
-$encodedUser = [Uri]::EscapeDataString($serviceUser)
+function Ensure-ErpUser {
+    param(
+        [Parameter(Mandatory)][string]$Email,
+        [Parameter(Mandatory)][string]$FirstName
+    )
+
+    $encodedUser = [Uri]::EscapeDataString($Email)
+    try {
+        Invoke-ErpRequest -Method Get -Uri "$baseUrl/api/resource/User/$encodedUser" -Session $session | Out-Null
+    }
+    catch {
+        if ($_.Exception.Response.StatusCode.value__ -ne 404) { throw }
+        Invoke-ErpRequest -Method Post -Uri "$baseUrl/api/resource/User" -Session $session -Body @{
+            email = $Email
+            first_name = $FirstName
+            enabled = 1
+            user_type = "System User"
+            send_welcome_email = 0
+            roles = @(@{ role = $serviceRole })
+        } | Out-Null
+    }
+}
+
+Ensure-ErpUser -Email $serviceUser -FirstName "MyRetail API"
+
+$posProfileNames = @()
 try {
-    Invoke-ErpRequest -Method Get -Uri "$baseUrl/api/resource/User/$encodedUser" -Session $session | Out-Null
+    $posProfileFields = [Uri]::EscapeDataString('["name"]')
+    $posProfileFilters = [Uri]::EscapeDataString((@(@("POS Profile", "disabled", "=", 0)) | ConvertTo-Json -Compress))
+    $profiles = Invoke-ErpRequest `
+        -Method Get `
+        -Uri "$baseUrl/api/resource/POS%20Profile?fields=$posProfileFields&filters=$posProfileFilters&limit_page_length=100" `
+        -Session $session
+    foreach ($profile in $profiles.data) {
+        if ($profile.name) {
+            $posProfileNames += $profile.name
+        }
+    }
 }
 catch {
-    if ($_.Exception.Response.StatusCode.value__ -ne 404) { throw }
-    Invoke-ErpRequest -Method Post -Uri "$baseUrl/api/resource/User" -Session $session -Body @{
-        email = $serviceUser
-        first_name = "MyRetail API"
-        enabled = 1
-        user_type = "System User"
-        send_welcome_email = 0
-        roles = @(@{ role = $serviceRole })
-    } | Out-Null
+    $posProfileNames = @()
+}
+if ($posProfileNames.Count -eq 0) {
+    $posProfileNames = @("POS-1", "POS-2")
+}
+
+$posUserMap = @{}
+for ($index = 0; $index -lt $posProfileNames.Count; $index++) {
+    $posUser = "myretail-pos-$($index + 1)@local.test"
+    Ensure-ErpUser -Email $posUser -FirstName "MyRetail POS $($index + 1)"
+    $posUserMap[$posProfileNames[$index]] = $posUser
 }
 
 $keys = Invoke-RestMethod `
@@ -467,6 +504,7 @@ $apiEnv = @(
     "MYRETAIL_ERPNEXT_BUYING_PRICE_LIST=$(Get-ApiSetting -Name 'MYRETAIL_ERPNEXT_BUYING_PRICE_LIST' -Default 'Standard Buying')"
     "MYRETAIL_ERPNEXT_COMPANY=$(Get-ApiSetting -Name 'MYRETAIL_ERPNEXT_COMPANY' -Default 'MyRetail Demo')"
     "MYRETAIL_ERPNEXT_POS_USER=$(Get-ApiSetting -Name 'MYRETAIL_ERPNEXT_POS_USER' -Default $serviceUser)"
+    "MYRETAIL_ERPNEXT_POS_USER_MAP=$(Get-ApiSetting -Name 'MYRETAIL_ERPNEXT_POS_USER_MAP' -Default ($posUserMap | ConvertTo-Json -Compress))"
     "MYRETAIL_DEFAULT_CURRENCY=$(Get-ApiSetting -Name 'MYRETAIL_DEFAULT_CURRENCY' -Default 'KZT')"
 ) -join [Environment]::NewLine
 

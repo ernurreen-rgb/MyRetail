@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     erpnext_buying_price_list: str = "Standard Buying"
     erpnext_company: str = "MyRetail Demo"
     erpnext_pos_user: str = "myretail-api@local.test"
+    erpnext_pos_user_map: dict[str, str] = Field(default_factory=dict)
     default_currency: str = "KZT"
     stock_idempotency_db_path: Path = API_ROOT / "tmp" / "stock_idempotency.sqlite3"
     pos_db_path: Path = API_ROOT / "tmp" / "pos.sqlite3"

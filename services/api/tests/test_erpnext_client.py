@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 from datetime import UTC, date, datetime
 
@@ -16,6 +17,7 @@ from myretail_api.clients.erpnext import (
 )
 from myretail_api.config import Settings
 from myretail_api.models.auth import AuthenticatedUser
+from myretail_api.models.pos import Register
 from myretail_api.models.products import ProductCreate, ProductUpdate
 from myretail_api.models.purchases import (
     PurchaseCancelRequest,
@@ -24,7 +26,7 @@ from myretail_api.models.purchases import (
     PurchaseUpdate,
     SupplierUpdate,
 )
-from myretail_api.models.stock import StockMovementCancelRequest, StockMovementCreate
+from myretail_api.models.stock import StockMovementCancelRequest, StockMovementCreate, WarehouseRef
 
 
 @pytest.fixture
@@ -38,6 +40,75 @@ def make_settings() -> Settings:
         erpnext_api_key=SecretStr("test-key"),
         erpnext_api_secret=SecretStr("test-secret"),
     )
+
+
+@pytest.mark.anyio
+async def test_pos_opening_uses_register_scoped_erpnext_user_and_marker() -> None:
+    captured_payloads: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path in {
+            "/api/resource/POS%20Opening%20Entry",
+            "/api/resource/POS Opening Entry",
+        }:
+            payload = json.loads(request.content)
+            captured_payloads.append(payload)
+            return httpx.Response(200, json={"data": {**payload, "name": "POS-OPE-1"}})
+        if request.url.path == "/api/method/frappe.client.submit":
+            payload = json.loads(request.content)
+            return httpx.Response(200, json={"message": {**payload["doc"], "docstatus": 1}})
+        return httpx.Response(404)
+
+    settings = Settings(
+        erpnext_base_url="http://erpnext.test",
+        erpnext_api_key=SecretStr("test-key"),
+        erpnext_api_secret=SecretStr("test-secret"),
+        erpnext_pos_user="fallback@example.test",
+        erpnext_pos_user_map={"POS-A": "pos-a@example.test", "POS-B": "pos-b@example.test"},
+    )
+    client = ERPNextClient(settings, transport=httpx.MockTransport(handler))
+    cashier = AuthenticatedUser(email="cashier@example.kz", full_name="Cashier", roles=["Cashier"])
+
+    await client.create_pos_opening(
+        tenant="myretail",
+        shift_id="SHIFT-1",
+        register=Register(
+            id="POS-B",
+            name="POS B",
+            warehouse=WarehouseRef(id="WH-1", name="Warehouse"),
+        ),
+        cashier=cashier,
+        opening_cash="1000.00",
+        idempotency_key="00000000-0000-0000-0000-000000000001",
+    )
+
+    marker = hashlib.sha256(
+        b"myretail:open_shift:cashier@example.kz:00000000-0000-0000-0000-000000000001"
+    ).hexdigest()
+    assert captured_payloads[0]["user"] == "pos-b@example.test"
+    assert captured_payloads[0]["myretail_open_idempotency_key"] == marker
+    assert "00000000-0000-0000-0000-000000000001" not in json.dumps(captured_payloads[0])
+
+
+@pytest.mark.anyio
+async def test_pos_recovery_uses_exact_scoped_marker_filter() -> None:
+    seen_filters: list[list[object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path in {"/api/resource/Sales%20Invoice", "/api/resource/Sales Invoice"}:
+            seen_filters.append(json.loads(request.url.params["filters"]))
+            return httpx.Response(200, json={"data": [{"name": "SINV-1"}]})
+        return httpx.Response(404)
+
+    client = ERPNextClient(make_settings(), transport=httpx.MockTransport(handler))
+    key = "00000000-0000-0000-0000-000000000001"
+
+    recovered = await client.recover_pos_sale("myretail", "create_sale", "cashier@example.kz", key)
+
+    marker = hashlib.sha256(f"myretail:create_sale:cashier@example.kz:{key}".encode()).hexdigest()
+    assert recovered == "SINV-1"
+    assert ["Sales Invoice", "myretail_sale_idempotency_key", "=", marker] in seen_filters[0]
+    assert all("like" not in str(filter_part).lower() for filter_part in seen_filters[0])
 
 
 @pytest.mark.anyio

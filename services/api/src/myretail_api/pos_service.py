@@ -305,7 +305,9 @@ class POSService:
                 )
             )
         except ERPNextAmbiguousCreateError:
-            opening_id = await self._erpnext.recover_pos_opening(context.tenant, key)
+            opening_id = await self._erpnext.recover_pos_opening(
+                context.tenant, "open_shift", context.user.email, key
+            )
             if opening_id is None:
                 raise
         try:
@@ -357,7 +359,9 @@ class POSService:
                 )
             )
         except ERPNextAmbiguousCreateError:
-            closing_id = await self._erpnext.recover_pos_closing(context.tenant, key)
+            closing_id = await self._erpnext.recover_pos_closing(
+                context.tenant, "close_shift", shift.cashier.email, key
+            )
             if closing_id is None:
                 raise
         closed_at = _now()
@@ -444,7 +448,9 @@ class POSService:
                 )
             )
         except ERPNextAmbiguousCreateError:
-            invoice_id = await self._erpnext.recover_pos_sale(context.tenant, key)
+            invoice_id = await self._erpnext.recover_pos_sale(
+                context.tenant, "create_sale", context.user.email, key
+            )
             if invoice_id is None:
                 raise
         now = _now()
@@ -624,6 +630,35 @@ class POSService:
             ) from exc
         if begin.record is not None:
             return begin.record.status_code, begin.record.response_body
+        if begin.acquired and begin.expired and recover is not None:
+            try:
+                recovered = await recover()
+            except POSApiError as exc:
+                if exc.status_code >= 500:
+                    body = _error_response_body(exc)
+                    self._store.complete_idempotency(
+                        tenant=context.tenant,
+                        operation=operation,
+                        user_email=context.user.email,
+                        key=key,
+                        request_hash=request_hash,
+                        status_code=exc.status_code,
+                        response_body=body,
+                    )
+                    return exc.status_code, body
+                raise
+            if recovered is not None:
+                body = jsonable_encoder(recovered)
+                self._store.complete_idempotency(
+                    tenant=context.tenant,
+                    operation=operation,
+                    user_email=context.user.email,
+                    key=key,
+                    request_hash=request_hash,
+                    status_code=success_status,
+                    response_body=body,
+                )
+                return success_status, body
         if not begin.acquired:
             record = await self._wait_completed(context, operation, key, request_hash)
             if record is not None:
@@ -724,27 +759,63 @@ class POSService:
         return None
 
     async def _recover_open_shift(self, context: TenantContext, key: str) -> Shift | None:
-        opening_id = await self._erpnext.recover_pos_opening(context.tenant, key)
+        opening_id = await self._erpnext.recover_pos_opening(
+            context.tenant, "open_shift", context.user.email, key
+        )
         if opening_id is None:
             return None
-        _ = opening_id
-        return None
+        raise POSApiError(
+            503,
+            "ERPNEXT_RECOVERY_PENDING",
+            (
+                "ERPNext РґРѕРєСѓРјРµРЅС‚ РЅР°Р№РґРµРЅ, "
+                "Р»РѕРєР°Р»СЊРЅРѕРµ СЃРѕСЃС‚РѕСЏРЅРёРµ С‚СЂРµР±СѓРµС‚ "
+                "РІРѕСЃСЃС‚Р°РЅРѕРІР»РµРЅРёСЏ"
+            ),
+            {"erpnext_opening_id": opening_id},
+        )
 
     async def _recover_close_shift(
         self, context: TenantContext, shift_id: str, key: str
     ) -> Shift | None:
-        closing_id = await self._erpnext.recover_pos_closing(context.tenant, key)
+        row = self._store.get_shift(context.tenant, shift_id)
+        if row is None:
+            return None
+        shift = self._to_shift(row)
+        closing_id = await self._erpnext.recover_pos_closing(
+            context.tenant, "close_shift", shift.cashier.email, key
+        )
         if closing_id is None:
             return None
-        row = self._store.get_shift(context.tenant, shift_id)
-        return self._to_shift(row) if row else None
+        if shift.status == "closed":
+            return shift
+        raise POSApiError(
+            503,
+            "ERPNEXT_RECOVERY_PENDING",
+            (
+                "ERPNext РґРѕРєСѓРјРµРЅС‚ РЅР°Р№РґРµРЅ, "
+                "Р»РѕРєР°Р»СЊРЅРѕРµ СЃРѕСЃС‚РѕСЏРЅРёРµ С‚СЂРµР±СѓРµС‚ "
+                "РІРѕСЃСЃС‚Р°РЅРѕРІР»РµРЅРёСЏ"
+            ),
+            {"erpnext_closing_id": closing_id},
+        )
 
     async def _recover_sale(self, context: TenantContext, key: str) -> Sale | None:
-        invoice = await self._erpnext.recover_pos_sale(context.tenant, key)
+        invoice = await self._erpnext.recover_pos_sale(
+            context.tenant, "create_sale", context.user.email, key
+        )
         if invoice is None:
             return None
-        _ = invoice
-        return None
+        raise POSApiError(
+            503,
+            "ERPNEXT_RECOVERY_PENDING",
+            (
+                "ERPNext РґРѕРєСѓРјРµРЅС‚ РЅР°Р№РґРµРЅ, "
+                "Р»РѕРєР°Р»СЊРЅРѕРµ СЃРѕСЃС‚РѕСЏРЅРёРµ С‚СЂРµР±СѓРµС‚ "
+                "РІРѕСЃСЃС‚Р°РЅРѕРІР»РµРЅРёСЏ"
+            ),
+            {"erpnext_sales_invoice_id": invoice},
+        )
 
     async def _call_erp(self, call: Any) -> Any:
         try:
@@ -860,6 +931,10 @@ def _request_hash(operation: str, payload: dict[str, object]) -> str:
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _error_response_body(exc: POSApiError) -> dict[str, object]:
+    return {"error": {"code": exc.code, "message": exc.message, "fields": exc.fields}}
 
 
 def _now() -> str:

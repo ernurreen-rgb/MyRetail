@@ -30,6 +30,7 @@ class POSIdempotencyRecord:
 class POSIdempotencyBeginResult:
     acquired: bool
     record: POSIdempotencyRecord | None = None
+    expired: bool = False
 
 
 class POSStore:
@@ -82,6 +83,17 @@ class POSStore:
                     acquired=False,
                     record=_record_from_row(row[2], row[3]),
                 )
+            if _parse_timestamp(str(row[4])) <= time.time():
+                connection.execute(
+                    """
+                    UPDATE pos_idempotency
+                    SET lease_until = ?, updated_at = ?
+                    WHERE tenant = ? AND operation = ? AND user_email = ? AND idempotency_key = ?
+                    """,
+                    (lease_until, now, tenant, operation, user_email, key),
+                )
+                connection.commit()
+                return POSIdempotencyBeginResult(acquired=True, expired=True)
             connection.execute(
                 """
                 UPDATE pos_idempotency
@@ -574,6 +586,10 @@ def _now() -> str:
 
 def _timestamp(value: float) -> str:
     return datetime.fromtimestamp(value, UTC).isoformat().replace("+00:00", "Z")
+
+
+def _parse_timestamp(value: str) -> float:
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
 
 
 def _money_add(left: str, right: str) -> str:
