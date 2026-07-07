@@ -19,6 +19,15 @@ def test_bootstrap_api_user_grants_minimal_stock_permissions() -> None:
         "Item",
         "Item Barcode",
         "Item Price",
+        "POS Profile",
+        "POS Opening Entry",
+        "POS Opening Entry Detail",
+        "POS Closing Entry",
+        "POS Closing Entry Detail",
+        "POS Closing Entry Taxes",
+        "Sales Invoice",
+        "Sales Invoice Item",
+        "Sales Invoice Payment",
     ]:
         assert f'parent = "{doctype}"' in script
 
@@ -43,6 +52,17 @@ def test_bootstrap_api_user_grants_minimal_stock_permissions() -> None:
     assert "write = 1" in purchase_receipt_block
     assert "submit = 1" in purchase_receipt_block
     assert "cancel = 1" in purchase_receipt_block
+
+    for fieldname in [
+        "myretail_sale_idempotency_key",
+        "myretail_open_idempotency_key",
+        "myretail_close_idempotency_key",
+        "myretail_shift_id",
+        "myretail_register_id",
+        "myretail_cashier_email",
+    ]:
+        assert fieldname in script
+    assert "MYRETAIL_ERPNEXT_POS_USER" in script
 
 
 def test_stock_qa_data_scripts_seed_balances_and_reservation() -> None:

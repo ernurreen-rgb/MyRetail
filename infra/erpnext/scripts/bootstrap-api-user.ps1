@@ -105,6 +105,26 @@ $permissionDefinitions = @(
         select = 1
     },
     @{
+        parent = "Company"
+        read = 1
+        select = 1
+    },
+    @{
+        parent = "Customer"
+        read = 1
+        select = 1
+    },
+    @{
+        parent = "Customer Group"
+        read = 1
+        select = 1
+    },
+    @{
+        parent = "Territory"
+        read = 1
+        select = 1
+    },
+    @{
         parent = "Item"
         read = 1
         select = 1
@@ -131,6 +151,115 @@ $permissionDefinitions = @(
         parent = "Bin"
         read = 1
         select = 1
+    },
+    @{
+        parent = "Account"
+        read = 1
+        select = 1
+    },
+    @{
+        parent = "Cost Center"
+        read = 1
+        select = 1
+    },
+    @{
+        parent = "Mode of Payment"
+        read = 1
+        select = 1
+    },
+    @{
+        parent = "Price List"
+        read = 1
+        select = 1
+    },
+    @{
+        parent = "UOM"
+        read = 1
+        select = 1
+    },
+    @{
+        parent = "POS Profile"
+        read = 1
+        select = 1
+    },
+    @{
+        parent = "POS Profile User"
+        read = 1
+        select = 1
+    },
+    @{
+        parent = "POS Payment Method"
+        read = 1
+        select = 1
+    },
+    @{
+        parent = "POS Opening Entry"
+        read = 1
+        select = 1
+        create = 1
+        write = 1
+        submit = 1
+        cancel = 1
+    },
+    @{
+        parent = "POS Opening Entry Detail"
+        read = 1
+        select = 1
+        create = 1
+        write = 1
+    },
+    @{
+        parent = "POS Closing Entry"
+        read = 1
+        select = 1
+        create = 1
+        write = 1
+        submit = 1
+        cancel = 1
+    },
+    @{
+        parent = "POS Closing Entry Detail"
+        read = 1
+        select = 1
+        create = 1
+        write = 1
+    },
+    @{
+        parent = "POS Closing Entry Taxes"
+        read = 1
+        select = 1
+        create = 1
+        write = 1
+    },
+    @{
+        parent = "Sales Invoice"
+        read = 1
+        select = 1
+        create = 1
+        write = 1
+        submit = 1
+        cancel = 1
+    },
+    @{
+        parent = "Sales Invoice Item"
+        read = 1
+        select = 1
+        create = 1
+        write = 1
+    },
+    @{
+        parent = "Sales Invoice Payment"
+        read = 1
+        select = 1
+        create = 1
+        write = 1
+    },
+    @{
+        parent = "Sales Invoice Reference"
+        read = 1
+        select = 1
+        create = 1
+        write = 1
     },
     @{
         parent = "Stock Entry"
@@ -215,6 +344,61 @@ foreach ($definition in $permissionDefinitions) {
         -Body $permissionBody | Out-Null
 }
 
+$customFieldDefinitions = @(
+    @{ dt = "Sales Invoice"; fieldname = "myretail_tenant"; label = "MyRetail Tenant"; unique = 0 },
+    @{ dt = "Sales Invoice"; fieldname = "myretail_sale_id"; label = "MyRetail Sale ID"; unique = 1 },
+    @{ dt = "Sales Invoice"; fieldname = "myretail_sale_idempotency_key"; label = "MyRetail Sale Idempotency Key"; unique = 1 },
+    @{ dt = "Sales Invoice"; fieldname = "myretail_shift_id"; label = "MyRetail Shift ID"; unique = 0 },
+    @{ dt = "Sales Invoice"; fieldname = "myretail_register_id"; label = "MyRetail Register ID"; unique = 0 },
+    @{ dt = "Sales Invoice"; fieldname = "myretail_cashier_email"; label = "MyRetail Cashier Email"; unique = 0 },
+    @{ dt = "POS Opening Entry"; fieldname = "myretail_tenant"; label = "MyRetail Tenant"; unique = 0 },
+    @{ dt = "POS Opening Entry"; fieldname = "myretail_shift_id"; label = "MyRetail Shift ID"; unique = 1 },
+    @{ dt = "POS Opening Entry"; fieldname = "myretail_register_id"; label = "MyRetail Register ID"; unique = 0 },
+    @{ dt = "POS Opening Entry"; fieldname = "myretail_cashier_email"; label = "MyRetail Cashier Email"; unique = 0 },
+    @{ dt = "POS Opening Entry"; fieldname = "myretail_open_idempotency_key"; label = "MyRetail Open Idempotency Key"; unique = 1 },
+    @{ dt = "POS Closing Entry"; fieldname = "myretail_tenant"; label = "MyRetail Tenant"; unique = 0 },
+    @{ dt = "POS Closing Entry"; fieldname = "myretail_shift_id"; label = "MyRetail Shift ID"; unique = 0 },
+    @{ dt = "POS Closing Entry"; fieldname = "myretail_close_idempotency_key"; label = "MyRetail Close Idempotency Key"; unique = 1 },
+    @{ dt = "POS Closing Entry"; fieldname = "myretail_register_id"; label = "MyRetail Register ID"; unique = 0 },
+    @{ dt = "POS Closing Entry"; fieldname = "myretail_cashier_email"; label = "MyRetail Cashier Email"; unique = 0 }
+)
+
+foreach ($definition in $customFieldDefinitions) {
+    $fieldName = "$($definition.dt)-$($definition.fieldname)"
+    $encodedFieldName = [Uri]::EscapeDataString($fieldName)
+    $fieldBody = @{
+        dt = $definition.dt
+        fieldname = $definition.fieldname
+        label = $definition.label
+        fieldtype = "Data"
+        insert_after = "remarks"
+        unique = $definition.unique
+        no_copy = 1
+        allow_on_submit = 1
+    }
+
+    try {
+        Invoke-ErpRequest `
+            -Method Get `
+            -Uri "$baseUrl/api/resource/Custom%20Field/$encodedFieldName" `
+            -Session $session | Out-Null
+        Invoke-ErpRequest `
+            -Method Put `
+            -Uri "$baseUrl/api/resource/Custom%20Field/$encodedFieldName" `
+            -Session $session `
+            -Body $fieldBody | Out-Null
+    }
+    catch {
+        if ($_.Exception.Response.StatusCode.value__ -ne 404) { throw }
+        $fieldBody["doctype"] = "Custom Field"
+        Invoke-ErpRequest `
+            -Method Post `
+            -Uri "$baseUrl/api/resource/Custom%20Field" `
+            -Session $session `
+            -Body $fieldBody | Out-Null
+    }
+}
+
 $encodedUser = [Uri]::EscapeDataString($serviceUser)
 try {
     Invoke-ErpRequest -Method Get -Uri "$baseUrl/api/resource/User/$encodedUser" -Session $session | Out-Null
@@ -282,6 +466,7 @@ $apiEnv = @(
     "MYRETAIL_ERPNEXT_SELLING_PRICE_LIST=$(Get-ApiSetting -Name 'MYRETAIL_ERPNEXT_SELLING_PRICE_LIST' -Default 'Standard Selling')"
     "MYRETAIL_ERPNEXT_BUYING_PRICE_LIST=$(Get-ApiSetting -Name 'MYRETAIL_ERPNEXT_BUYING_PRICE_LIST' -Default 'Standard Buying')"
     "MYRETAIL_ERPNEXT_COMPANY=$(Get-ApiSetting -Name 'MYRETAIL_ERPNEXT_COMPANY' -Default 'MyRetail Demo')"
+    "MYRETAIL_ERPNEXT_POS_USER=$(Get-ApiSetting -Name 'MYRETAIL_ERPNEXT_POS_USER' -Default $serviceUser)"
     "MYRETAIL_DEFAULT_CURRENCY=$(Get-ApiSetting -Name 'MYRETAIL_DEFAULT_CURRENCY' -Default 'KZT')"
 ) -join [Environment]::NewLine
 

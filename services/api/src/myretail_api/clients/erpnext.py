@@ -10,6 +10,7 @@ import httpx
 
 from myretail_api.config import Settings
 from myretail_api.models.auth import AuthenticatedUser
+from myretail_api.models.pos import POSProduct, POSProductList, Register, SaleLine, Shift
 from myretail_api.models.products import (
     Product,
     ProductCreate,
@@ -164,6 +165,7 @@ class ERPNextClient:
         self._selling_price_list = settings.erpnext_selling_price_list
         self._buying_price_list = settings.erpnext_buying_price_list
         self._company = settings.erpnext_company
+        self._pos_user = settings.erpnext_pos_user
         self._currency = settings.default_currency
 
     async def authenticate_user(self, *, email: str, password: str) -> ERPNextUser:
@@ -263,6 +265,361 @@ class ERPNextClient:
             purchase_price=purchase_price,
         )
 
+    async def list_pos_registers(self, tenant: str) -> list[Register]:
+        _ = tenant
+        rows = await self._query_resource(
+            "POS Profile",
+            fields=["name", "warehouse", "currency", "disabled"],
+            filters=[["POS Profile", "disabled", "=", 0]],
+            limit=100,
+            order_by="name asc",
+        )
+        registers: list[Register] = []
+        for row in rows:
+            name = str(row.get("name") or "")
+            warehouse_id = str(row.get("warehouse") or "")
+            if not name or not warehouse_id:
+                continue
+            registers.append(
+                Register(
+                    id=name,
+                    name=name,
+                    warehouse=WarehouseRef(id=warehouse_id, name=warehouse_id),
+                    currency=str(row.get("currency") or self._currency),
+                    payment_methods=["cash"],
+                    is_active=not bool(row.get("disabled")),
+                )
+            )
+        return registers
+
+    async def list_pos_products(
+        self,
+        *,
+        tenant: str,
+        register: Register,
+        q: str | None,
+        barcode: str | None,
+        limit: int,
+        offset: int,
+    ) -> POSProductList:
+        _ = tenant
+        if barcode:
+            parents = await self._find_barcode_exact_parents(barcode)
+            if not parents:
+                raise ERPNextProductNotFoundError("POS product barcode not found")
+            product = await self.get_pos_product(
+                tenant, register.id, parents[0], register.warehouse.id
+            )
+            if not product.is_active:
+                raise ERPNextConflictError(
+                    "PRODUCT_INACTIVE", "Товар неактивен", {"product_id": product.id}
+                )
+            if Decimal(product.sale_price) <= 0:
+                raise ERPNextConflictError(
+                    "PRODUCT_WITHOUT_PRICE", "У товара нет цены", {"product_id": product.id}
+                )
+            return POSProductList(items=[product], count=1, limit=limit, offset=offset)
+
+        rows, count = await self._list_product_rows(
+            q=q,
+            limit=limit,
+            offset=offset,
+            include_archived=False,
+        )
+        item_codes = [str(row.get("name") or "") for row in rows if row.get("name")]
+        items = [
+            await self.get_pos_product(tenant, register.id, item_code, register.warehouse.id)
+            for item_code in item_codes
+        ]
+        return POSProductList(items=items, count=count, limit=limit, offset=offset)
+
+    async def get_pos_product(
+        self,
+        tenant: str,
+        register_id: str,
+        product_id: str,
+        warehouse_id: str,
+    ) -> POSProduct:
+        _ = tenant, register_id
+        item = await self._get_item(product_id)
+        item_code = str(item.get("name") or product_id)
+        sale_price = await self._get_item_price(item_code, self._selling_price_list)
+        quantities = await self._get_stock_quantities(item_code, warehouse_id)
+        stock_uom = str(item.get("stock_uom") or "")
+        return POSProduct(
+            id=item_code,
+            sku=item_code,
+            name=str(item.get("item_name") or item_code),
+            barcode=self._first_barcode(item.get("barcodes"))
+            or await self._get_first_item_barcode(item_code),
+            unit=stock_uom,
+            sale_price=sale_price or "0.00",
+            currency=self._currency,
+            available=format_quantity(quantities.available),
+            is_active=not self._is_disabled(item),
+            allows_fractional_quantity=stock_uom.lower() not in {"nos", "шт", "pcs", "piece"},
+        )
+
+    async def create_pos_opening(
+        self,
+        *,
+        tenant: str,
+        shift_id: str,
+        register: Register,
+        cashier: AuthenticatedUser,
+        opening_cash: str,
+        idempotency_key: str,
+    ) -> str:
+        payload = {
+            "doctype": "POS Opening Entry",
+            "period_start_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "posting_date": date.today().isoformat(),
+            "company": self._company,
+            "pos_profile": register.id,
+            "user": self._pos_user_for_register(register.id),
+            "balance_details": [
+                {"mode_of_payment": "Cash", "opening_amount": float(Decimal(opening_cash))}
+            ],
+            "myretail_tenant": tenant,
+            "myretail_shift_id": shift_id,
+            "myretail_register_id": register.id,
+            "myretail_cashier_email": cashier.email,
+            "myretail_open_idempotency_key": idempotency_key,
+        }
+        try:
+            body = await self._request_json(
+                "POST", "/api/resource/POS Opening Entry", json_payload=payload
+            )
+            doc = body.get("data")
+            if not isinstance(doc, Mapping):
+                raise ERPNextUnavailableError("ERPNext POS opening response is invalid")
+            submitted = await self._submit_doc(doc)
+            return str(submitted.get("name") or doc.get("name"))
+        except ERPNextTimeoutError as exc:
+            raise ERPNextAmbiguousCreateError("POS opening may have been created") from exc
+
+    async def create_pos_closing(
+        self,
+        *,
+        tenant: str,
+        shift: Shift,
+        actual_cash: str,
+        difference: str,
+        idempotency_key: str,
+    ) -> str:
+        data = await self._call_method(
+            "erpnext.accounts.doctype.pos_closing_entry.pos_closing_entry.get_invoices",
+            {
+                "start": shift.opened_at.strftime("%Y-%m-%d %H:%M:%S"),
+                "end": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "pos_profile": shift.register.id,
+                "user": self._pos_user_for_register(shift.register.id),
+            },
+        )
+        invoices = data.get("invoices") if isinstance(data, Mapping) else []
+        payments = data.get("payments") if isinstance(data, Mapping) else []
+        sales_invoices = [
+            {
+                "sales_invoice": invoice["name"],
+                "posting_date": invoice.get("posting_date"),
+                "customer": invoice.get("customer"),
+                "is_return": invoice.get("is_return") or 0,
+                "return_against": invoice.get("return_against"),
+                "grand_total": invoice.get("grand_total") or 0,
+            }
+            for invoice in invoices
+            if isinstance(invoice, Mapping) and invoice.get("doctype") == "Sales Invoice"
+        ]
+        payment_reconciliation = [
+            {
+                "mode_of_payment": payment.get("mode_of_payment") or "Cash",
+                "opening_amount": float(Decimal(shift.opening_cash)),
+                "expected_amount": float(Decimal(shift.expected_cash)),
+                "closing_amount": float(Decimal(actual_cash)),
+                "difference": float(Decimal(difference)),
+            }
+            for payment in payments
+            if isinstance(payment, Mapping)
+        ] or [
+            {
+                "mode_of_payment": "Cash",
+                "opening_amount": float(Decimal(shift.opening_cash)),
+                "expected_amount": float(Decimal(shift.expected_cash)),
+                "closing_amount": float(Decimal(actual_cash)),
+                "difference": float(Decimal(difference)),
+            }
+        ]
+        payload = {
+            "doctype": "POS Closing Entry",
+            "period_start_date": shift.opened_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "period_end_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "posting_date": date.today().isoformat(),
+            "posting_time": datetime.now().strftime("%H:%M:%S"),
+            "company": self._company,
+            "pos_profile": shift.register.id,
+            "user": self._pos_user_for_register(shift.register.id),
+            "pos_opening_entry": await self._find_opening_name(tenant, shift.id),
+            "grand_total": float(Decimal(shift.sales_total)),
+            "net_total": float(Decimal(shift.sales_total)),
+            "total_quantity": 0,
+            "sales_invoices": sales_invoices,
+            "pos_invoices": [],
+            "payment_reconciliation": payment_reconciliation,
+            "taxes": [],
+            "myretail_tenant": tenant,
+            "myretail_shift_id": shift.id,
+            "myretail_register_id": shift.register.id,
+            "myretail_cashier_email": shift.cashier.email,
+            "myretail_close_idempotency_key": idempotency_key,
+        }
+        try:
+            body = await self._request_json(
+                "POST", "/api/resource/POS Closing Entry", json_payload=payload
+            )
+            doc = body.get("data")
+            if not isinstance(doc, Mapping):
+                raise ERPNextUnavailableError("ERPNext POS closing response is invalid")
+            submitted = await self._submit_doc(doc)
+            return str(submitted.get("name") or doc.get("name"))
+        except ERPNextTimeoutError as exc:
+            raise ERPNextAmbiguousCreateError("POS closing may have been created") from exc
+
+    async def create_pos_sales_invoice(
+        self,
+        *,
+        tenant: str,
+        sale_id: str,
+        shift: Shift,
+        lines: list[SaleLine],
+        subtotal: str,
+        discount_total: str,
+        grand_total: str,
+        cash_received: str,
+        change: str,
+        idempotency_key: str,
+    ) -> str:
+        _ = subtotal, discount_total
+        payload = {
+            "doctype": "Sales Invoice",
+            "naming_series": "ACC-SINV-.YYYY.-",
+            "is_pos": 1,
+            "is_created_using_pos": 1,
+            "pos_profile": shift.register.id,
+            "company": self._company,
+            "customer": "Walk-in Customer",
+            "posting_date": date.today().isoformat(),
+            "posting_time": datetime.now().strftime("%H:%M:%S"),
+            "set_posting_time": 1,
+            "currency": self._currency,
+            "conversion_rate": 1,
+            "selling_price_list": self._selling_price_list,
+            "price_list_currency": self._currency,
+            "plc_conversion_rate": 1,
+            "update_stock": 1,
+            "set_warehouse": shift.warehouse.id,
+            "items": [
+                {
+                    "item_code": line.product_id,
+                    "qty": float(Decimal(line.quantity)),
+                    "rate": float(Decimal(line.unit_price)),
+                    "warehouse": shift.warehouse.id,
+                    "discount_percentage": float(Decimal(line.discount_percent)),
+                }
+                for line in lines
+            ],
+            "payments": [{"mode_of_payment": "Cash", "amount": float(Decimal(cash_received))}],
+            "paid_amount": float(Decimal(cash_received)),
+            "base_paid_amount": float(Decimal(cash_received)),
+            "change_amount": float(Decimal(change)),
+            "account_for_change_amount": "Cash - MRD",
+            "myretail_tenant": tenant,
+            "myretail_sale_id": sale_id,
+            "myretail_sale_idempotency_key": idempotency_key,
+            "myretail_shift_id": shift.id,
+            "myretail_register_id": shift.register.id,
+            "myretail_cashier_email": shift.cashier.email,
+            "remarks": json.dumps(
+                {
+                    "myretail_pos": {
+                        "tenant": tenant,
+                        "sale_id": sale_id,
+                        "idempotency_key": idempotency_key,
+                    }
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        }
+        try:
+            body = await self._request_json(
+                "POST", "/api/resource/Sales Invoice", json_payload=payload
+            )
+            doc = body.get("data")
+            if not isinstance(doc, Mapping):
+                raise ERPNextUnavailableError("ERPNext Sales Invoice response is invalid")
+            submitted = await self._submit_doc(doc)
+            return str(submitted.get("name") or doc.get("name"))
+        except ERPNextTimeoutError as exc:
+            raise ERPNextAmbiguousCreateError("Sales Invoice may have been created") from exc
+        except ERPNextValidationError as exc:
+            message = exc.message.lower()
+            if (
+                "negative" in message
+                or "недостат" in message
+                or "querydeadlockerror" in message
+                or "deadlock" in message
+            ):
+                raise ERPNextConflictError(
+                    "INSUFFICIENT_STOCK", "Недостаточно товара на складе"
+                ) from exc
+            raise
+
+    async def recover_pos_opening(self, tenant: str, idempotency_key: str) -> str | None:
+        rows = await self._query_resource(
+            "POS Opening Entry",
+            fields=["name"],
+            filters=[
+                ["POS Opening Entry", "myretail_tenant", "=", tenant],
+                [
+                    "POS Opening Entry",
+                    "myretail_open_idempotency_key",
+                    "like",
+                    f"%{idempotency_key}%",
+                ],
+            ],
+            limit=1,
+        )
+        return str(rows[0]["name"]) if rows else None
+
+    async def recover_pos_closing(self, tenant: str, idempotency_key: str) -> str | None:
+        rows = await self._query_resource(
+            "POS Closing Entry",
+            fields=["name"],
+            filters=[
+                ["POS Closing Entry", "myretail_tenant", "=", tenant],
+                [
+                    "POS Closing Entry",
+                    "myretail_close_idempotency_key",
+                    "like",
+                    f"%{idempotency_key}%",
+                ],
+            ],
+            limit=1,
+        )
+        return str(rows[0]["name"]) if rows else None
+
+    async def recover_pos_sale(self, tenant: str, idempotency_key: str) -> str | None:
+        rows = await self._query_resource(
+            "Sales Invoice",
+            fields=["name"],
+            filters=[
+                ["Sales Invoice", "myretail_tenant", "=", tenant],
+                ["Sales Invoice", "myretail_sale_idempotency_key", "like", f"%{idempotency_key}%"],
+            ],
+            limit=1,
+        )
+        return str(rows[0]["name"]) if rows else None
+
     async def list_product_options(self) -> ProductOptions:
         categories = await self._list_options("Item Group")
         brands = await self._list_options("Brand")
@@ -338,12 +695,12 @@ class ERPNextClient:
 
         price_snapshots: dict[tuple[str, bool], Mapping[str, Any] | None] = {}
         if "sale_price" in update_fields:
-            price_snapshots[(self._selling_price_list, False)] = (
-                await self._get_item_price_record(item_code, self._selling_price_list)
+            price_snapshots[(self._selling_price_list, False)] = await self._get_item_price_record(
+                item_code, self._selling_price_list
             )
         if "purchase_price" in update_fields:
-            price_snapshots[(self._buying_price_list, True)] = (
-                await self._get_item_price_record(item_code, self._buying_price_list)
+            price_snapshots[(self._buying_price_list, True)] = await self._get_item_price_record(
+                item_code, self._buying_price_list
             )
 
         try:
@@ -834,9 +1191,11 @@ class ERPNextClient:
         create_idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         update_fields = supplier.model_dump(exclude={"expected_updated_at"}, exclude_unset=True)
-        metadata = dict(self._extract_myretail_supplier_metadata(
-            original.get("supplier_details") if original is not None else None
-        ))
+        metadata = dict(
+            self._extract_myretail_supplier_metadata(
+                original.get("supplier_details") if original is not None else None
+            )
+        )
         if create_idempotency_key is not None:
             metadata["create_idempotency_key"] = create_idempotency_key
         for field in ("contact_name", "phone", "email", "address"):
@@ -1120,9 +1479,7 @@ class ERPNextClient:
         )
         data = payload.get("data")
         if not isinstance(data, Mapping):
-            raise ERPNextUnavailableError(
-                "ERPNext Purchase Receipt response does not contain data"
-            )
+            raise ERPNextUnavailableError("ERPNext Purchase Receipt response does not contain data")
         return data
 
     async def _save_document_with_modified_check(
@@ -1457,9 +1814,7 @@ class ERPNextClient:
             supplier_invoice_number=metadata.get("supplier_invoice_number")
             if isinstance(metadata.get("supplier_invoice_number"), str)
             else None,
-            supplier_invoice_date=self._parse_optional_date(
-                metadata.get("supplier_invoice_date")
-            ),
+            supplier_invoice_date=self._parse_optional_date(metadata.get("supplier_invoice_date")),
             currency=str(row.get("currency") or self._currency),
             comment=metadata.get("comment") if isinstance(metadata.get("comment"), str) else None,
             subtotal=self._format_money(row.get("net_total") or subtotal),
@@ -1494,9 +1849,7 @@ class ERPNextClient:
             supplier_invoice_number=metadata.get("supplier_invoice_number")
             if isinstance(metadata.get("supplier_invoice_number"), str)
             else None,
-            supplier_invoice_date=self._parse_optional_date(
-                metadata.get("supplier_invoice_date")
-            ),
+            supplier_invoice_date=self._parse_optional_date(metadata.get("supplier_invoice_date")),
             currency=str(row.get("currency") or self._currency),
             subtotal=subtotal,
             total=self._format_money(row.get("grand_total") or subtotal),
@@ -1770,13 +2123,9 @@ class ERPNextClient:
         filters: list[list[Any]] = []
         parent_ids: set[str] | None = None
         if warehouse_id is not None:
-            parent_ids = set(
-                await self._find_stock_entry_parents_by_warehouse(warehouse_id)
-            )
+            parent_ids = set(await self._find_stock_entry_parents_by_warehouse(warehouse_id))
         if product_id is not None:
-            product_parent_ids = set(
-                await self._find_stock_entry_parents_by_product(product_id)
-            )
+            product_parent_ids = set(await self._find_stock_entry_parents_by_product(product_id))
             parent_ids = (
                 product_parent_ids
                 if parent_ids is None
@@ -2062,11 +2411,7 @@ class ERPNextClient:
             parent_doctype="Stock Entry",
         )
         return sorted(
-            {
-                parent
-                for row in rows
-                if isinstance((parent := row.get("parent")), str) and parent
-            }
+            {parent for row in rows if isinstance((parent := row.get("parent")), str) and parent}
         )
 
     async def _find_stock_entry_parents_by_warehouse(
@@ -2084,11 +2429,7 @@ class ERPNextClient:
             parent_doctype="Stock Entry",
         )
         return sorted(
-            {
-                parent
-                for row in rows
-                if isinstance((parent := row.get("parent")), str) and parent
-            }
+            {parent for row in rows if isinstance((parent := row.get("parent")), str) and parent}
         )
 
     async def _get_stock_movement_cancellation(
@@ -2355,11 +2696,7 @@ class ERPNextClient:
                 or_filters=or_filters,
             )
             return len(
-                {
-                    name
-                    for row in rows
-                    if isinstance((name := row.get("name")), str) and name
-                }
+                {name for row in rows if isinstance((name := row.get("name")), str) and name}
             )
 
         payload = await self._request_json(
@@ -2383,12 +2720,73 @@ class ERPNextClient:
             parent_doctype="Item",
         )
         return sorted(
-            {
-                parent
-                for row in rows
-                if isinstance((parent := row.get("parent")), str) and parent
-            }
+            {parent for row in rows if isinstance((parent := row.get("parent")), str) and parent}
         )
+
+    async def _find_barcode_exact_parents(self, barcode: str) -> list[str]:
+        rows = await self._query_resource(
+            "Item Barcode",
+            fields=["parent"],
+            filters=[["Item Barcode", "barcode", "=", barcode]],
+            limit=2,
+            parent_doctype="Item",
+        )
+        return sorted(
+            {parent for row in rows if isinstance((parent := row.get("parent")), str) and parent}
+        )
+
+    async def _get_first_item_barcode(self, item_code: str) -> str | None:
+        rows = await self._query_resource(
+            "Item Barcode",
+            fields=["barcode"],
+            filters=[["Item Barcode", "parent", "=", item_code]],
+            limit=1,
+            parent_doctype="Item",
+        )
+        if not rows:
+            return None
+        barcode = rows[0].get("barcode")
+        return str(barcode) if barcode else None
+
+    async def _submit_doc(self, doc: Mapping[str, Any]) -> Mapping[str, Any]:
+        body = await self._request_json(
+            "POST",
+            "/api/method/frappe.client.submit",
+            json_payload={"doc": dict(doc)},
+        )
+        submitted = body.get("message") or body.get("data")
+        if not isinstance(submitted, Mapping):
+            raise ERPNextUnavailableError("ERPNext submit response is invalid")
+        return submitted
+
+    async def _call_method(self, method_path: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        body = await self._request_json(
+            "POST",
+            f"/api/method/{method_path}",
+            json_payload=payload,
+        )
+        message = body.get("message")
+        if not isinstance(message, Mapping):
+            raise ERPNextUnavailableError("ERPNext method response is invalid")
+        return message
+
+    async def _find_opening_name(self, tenant: str, shift_id: str) -> str:
+        rows = await self._query_resource(
+            "POS Opening Entry",
+            fields=["name"],
+            filters=[
+                ["POS Opening Entry", "myretail_tenant", "=", tenant],
+                ["POS Opening Entry", "myretail_shift_id", "=", shift_id],
+            ],
+            limit=1,
+        )
+        if not rows:
+            raise ERPNextConflictError("SHIFT_NOT_FOUND", "Смена не найдена")
+        return str(rows[0]["name"])
+
+    def _pos_user_for_register(self, register_id: str) -> str:
+        _ = register_id
+        return self._pos_user
 
     async def _list_options(self, doctype: str) -> list[ProductOption]:
         rows = await self._query_resource(doctype, fields=["name"], limit=1000)
@@ -2465,10 +2863,7 @@ class ERPNextClient:
                     adjustment_direction = direction
                 elif adjustment_direction != direction:
                     raise ERPNextValidationError(
-                        (
-                            "Корректировка не должна смешивать "
-                            "увеличение и уменьшение остатка"
-                        ),
+                        ("Корректировка не должна смешивать увеличение и уменьшение остатка"),
                         {
                             f"lines.{index}.counted_quantity": (
                                 "Оформите увеличение и уменьшение отдельными документами"
@@ -2946,9 +3341,7 @@ class ERPNextClient:
             raise ERPNextConflictError(
                 "INSUFFICIENT_STOCK",
                 "Недостаточно доступного остатка.",
-                {
-                    f"lines.{index}.{field_name}": f"Доступно {format_quantity(available)}"
-                },
+                {f"lines.{index}.{field_name}": f"Доступно {format_quantity(available)}"},
             )
 
     @staticmethod
@@ -3106,10 +3499,7 @@ class ERPNextClient:
             raise ERPNextProductNotFoundError("ERPNext Item was not found")
         if response.status_code in {408, 504}:
             raise ERPNextTimeoutError("ERPNext request timed out")
-        if (
-            timestamp_conflict_code is not None
-            and self._is_concurrency_conflict_response(response)
-        ):
+        if timestamp_conflict_code is not None and self._is_concurrency_conflict_response(response):
             raise ERPNextConflictError(
                 timestamp_conflict_code,
                 "Данные изменены, обновите страницу",

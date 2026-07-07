@@ -6,6 +6,7 @@ from myretail_api.clients.erpnext import ERPNextClient, ERPNextConfigurationErro
 from myretail_api.config import Settings, get_settings
 from myretail_api.idempotency import IdempotencyStore, StockIdempotencyStore
 from myretail_api.models.auth import TenantContext
+from myretail_api.pos_store import POSStore
 from myretail_api.security import AuthConfigurationError, TokenValidationError, parse_access_token
 
 
@@ -29,6 +30,10 @@ def get_purchases_idempotency_store(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> IdempotencyStore:
     return IdempotencyStore(settings.stock_idempotency_db_path)
+
+
+def get_pos_store(settings: Annotated[Settings, Depends(get_settings)]) -> POSStore:
+    return POSStore(settings.pos_db_path)
 
 
 def require_tenant_context(
