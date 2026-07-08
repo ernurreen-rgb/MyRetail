@@ -64,9 +64,14 @@ def test_bootstrap_api_user_grants_minimal_stock_permissions() -> None:
         assert fieldname in script
     assert "MYRETAIL_ERPNEXT_POS_USER" in script
     assert "MYRETAIL_ERPNEXT_POS_USER_MAP" in script
+    assert "MYRETAIL_ERPNEXT_POS_CREDENTIALS_MAP" in script
     assert "Ensure-ErpUser" in script
-    assert "myretail-pos-$($index + 1)@local.test" in script
+    assert "Get-ProfileUserEmail" in script
+    assert "myretail-pos-$hash@local.test" in script
     assert "POS%20Profile?fields=" in script
+    assert "applicable_for_users" in script
+    assert "generate_keys" in script
+    assert "$posCredentialMap" in script
 
 
 def test_stock_qa_data_scripts_seed_balances_and_reservation() -> None:

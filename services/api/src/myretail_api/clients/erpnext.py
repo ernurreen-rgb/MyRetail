@@ -168,6 +168,7 @@ class ERPNextClient:
         self._company = settings.erpnext_company
         self._pos_user = settings.erpnext_pos_user
         self._pos_user_map = settings.erpnext_pos_user_map
+        self._pos_credentials_map = settings.erpnext_pos_credentials_map
         self._currency = settings.default_currency
 
     async def authenticate_user(self, *, email: str, password: str) -> ERPNextUser:
@@ -372,6 +373,7 @@ class ERPNextClient:
         opening_cash: str,
         idempotency_key: str,
     ) -> str:
+        pos_headers = self._pos_headers_for_register(register.id)
         payload = {
             "doctype": "POS Opening Entry",
             "period_start_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -392,15 +394,29 @@ class ERPNextClient:
         }
         try:
             body = await self._request_json(
-                "POST", "/api/resource/POS Opening Entry", json_payload=payload
+                "POST",
+                "/api/resource/POS Opening Entry",
+                json_payload=payload,
+                headers=pos_headers,
             )
             doc = body.get("data")
             if not isinstance(doc, Mapping):
                 raise ERPNextUnavailableError("ERPNext POS opening response is invalid")
-            submitted = await self._submit_doc(doc)
+            submitted = await self._submit_doc(doc, headers=pos_headers)
             return str(submitted.get("name") or doc.get("name"))
         except ERPNextTimeoutError as exc:
             raise ERPNextAmbiguousCreateError("POS opening may have been created") from exc
+        except ERPNextValidationError:
+            recovered = await self.recover_pos_opening(
+                tenant, "open_shift", cashier.email, idempotency_key
+            )
+            if recovered is not None:
+                return recovered
+            try:
+                return await self._find_opening_name(tenant, shift_id)
+            except ERPNextConflictError:
+                pass
+            raise
 
     async def create_pos_closing(
         self,
@@ -411,6 +427,7 @@ class ERPNextClient:
         difference: str,
         idempotency_key: str,
     ) -> str:
+        pos_headers = self._pos_headers_for_register(shift.register.id)
         data = await self._call_method(
             "erpnext.accounts.doctype.pos_closing_entry.pos_closing_entry.get_invoices",
             {
@@ -419,6 +436,7 @@ class ERPNextClient:
                 "pos_profile": shift.register.id,
                 "user": self._pos_user_for_register(shift.register.id),
             },
+            headers=pos_headers,
         )
         invoices = data.get("invoices") if isinstance(data, Mapping) else []
         payments = data.get("payments") if isinstance(data, Mapping) else []
@@ -480,15 +498,25 @@ class ERPNextClient:
         }
         try:
             body = await self._request_json(
-                "POST", "/api/resource/POS Closing Entry", json_payload=payload
+                "POST",
+                "/api/resource/POS Closing Entry",
+                json_payload=payload,
+                headers=pos_headers,
             )
             doc = body.get("data")
             if not isinstance(doc, Mapping):
                 raise ERPNextUnavailableError("ERPNext POS closing response is invalid")
-            submitted = await self._submit_doc(doc)
+            submitted = await self._submit_doc(doc, headers=pos_headers)
             return str(submitted.get("name") or doc.get("name"))
         except ERPNextTimeoutError as exc:
             raise ERPNextAmbiguousCreateError("POS closing may have been created") from exc
+        except ERPNextValidationError:
+            recovered = await self.recover_pos_closing(
+                tenant, "close_shift", shift.cashier.email, idempotency_key
+            )
+            if recovered is not None:
+                return recovered
+            raise
 
     async def create_pos_sales_invoice(
         self,
@@ -505,6 +533,7 @@ class ERPNextClient:
         idempotency_key: str,
     ) -> str:
         _ = subtotal, discount_total
+        pos_headers = self._pos_headers_for_register(shift.register.id)
         payload = {
             "doctype": "Sales Invoice",
             "naming_series": "ACC-SINV-.YYYY.-",
@@ -562,16 +591,24 @@ class ERPNextClient:
         }
         try:
             body = await self._request_json(
-                "POST", "/api/resource/Sales Invoice", json_payload=payload
+                "POST",
+                "/api/resource/Sales Invoice",
+                json_payload=payload,
+                headers=pos_headers,
             )
             doc = body.get("data")
             if not isinstance(doc, Mapping):
                 raise ERPNextUnavailableError("ERPNext Sales Invoice response is invalid")
-            submitted = await self._submit_doc(doc)
+            submitted = await self._submit_doc(doc, headers=pos_headers)
             return str(submitted.get("name") or doc.get("name"))
         except ERPNextTimeoutError as exc:
             raise ERPNextAmbiguousCreateError("Sales Invoice may have been created") from exc
         except ERPNextValidationError as exc:
+            recovered = await self.recover_pos_sale(
+                tenant, "create_sale", shift.cashier.email, idempotency_key
+            )
+            if recovered is not None:
+                return recovered
             message = exc.message.lower()
             if (
                 "negative" in message
@@ -2757,22 +2794,32 @@ class ERPNextClient:
         barcode = rows[0].get("barcode")
         return str(barcode) if barcode else None
 
-    async def _submit_doc(self, doc: Mapping[str, Any]) -> Mapping[str, Any]:
+    async def _submit_doc(
+        self, doc: Mapping[str, Any], *, headers: Mapping[str, str] | None = None
+    ) -> Mapping[str, Any]:
         body = await self._request_json(
             "POST",
             "/api/method/frappe.client.submit",
             json_payload={"doc": dict(doc)},
+            headers=headers,
         )
         submitted = body.get("message") or body.get("data")
         if not isinstance(submitted, Mapping):
             raise ERPNextUnavailableError("ERPNext submit response is invalid")
         return submitted
 
-    async def _call_method(self, method_path: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    async def _call_method(
+        self,
+        method_path: str,
+        payload: Mapping[str, Any],
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> Mapping[str, Any]:
         body = await self._request_json(
             "POST",
             f"/api/method/{method_path}",
             json_payload=payload,
+            headers=headers,
         )
         message = body.get("message")
         if not isinstance(message, Mapping):
@@ -2795,6 +2842,15 @@ class ERPNextClient:
 
     def _pos_user_for_register(self, register_id: str) -> str:
         return self._pos_user_map.get(register_id, self._pos_user)
+
+    def _pos_headers_for_register(self, register_id: str) -> Mapping[str, str]:
+        token = self._pos_credentials_map.get(register_id)
+        if not token:
+            return self._headers
+        return {
+            "Accept": "application/json",
+            "Authorization": f"token {token}",
+        }
 
     @staticmethod
     def _pos_idempotency_marker(
@@ -3487,13 +3543,14 @@ class ERPNextClient:
         *,
         params: dict[str, str] | None = None,
         json_payload: Mapping[str, Any] | None = None,
+        headers: Mapping[str, str] | None = None,
         timestamp_conflict_code: str | None = None,
         timestamp_conflict_fields: dict[str, str] | None = None,
     ) -> Mapping[str, Any]:
         try:
             async with httpx.AsyncClient(
                 base_url=self._base_url,
-                headers=self._headers,
+                headers=headers or self._headers,
                 timeout=self._timeout,
                 transport=self._transport,
             ) as client:
@@ -3521,6 +3578,17 @@ class ERPNextClient:
                 timestamp_conflict_fields,
             )
         if response.status_code >= 500:
+            if self._is_concurrency_conflict_response(response):
+                raise ERPNextConflictError(
+                    "QUERY_DEADLOCK",
+                    "ERPNext РѕС‚РєР»РѕРЅРёР» РєРѕРЅРєСѓСЂРµРЅС‚РЅСѓСЋ РѕРїРµСЂР°С†РёСЋ",
+                )
+            message = self._extract_error_message(response)
+            if "querydeadlockerror" in message.lower() or "deadlock" in message.lower():
+                raise ERPNextConflictError(
+                    "QUERY_DEADLOCK",
+                    "ERPNext РѕС‚РєР»РѕРЅРёР» РєРѕРЅРєСѓСЂРµРЅС‚РЅСѓСЋ РѕРїРµСЂР°С†РёСЋ",
+                )
             raise ERPNextUnavailableError("ERPNext returned a server error")
 
         try:

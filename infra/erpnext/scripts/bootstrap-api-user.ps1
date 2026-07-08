@@ -422,12 +422,27 @@ function Ensure-ErpUser {
     }
 }
 
+function Get-ProfileUserEmail {
+    param([Parameter(Mandatory)][string]$ProfileName)
+
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($ProfileName)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hashBytes = $sha256.ComputeHash($bytes)
+    }
+    finally {
+        $sha256.Dispose()
+    }
+    $hash = -join ($hashBytes[0..5] | ForEach-Object { $_.ToString("x2") })
+    return "myretail-pos-$hash@local.test"
+}
+
 Ensure-ErpUser -Email $serviceUser -FirstName "MyRetail API"
 
 $posProfileNames = @()
 try {
     $posProfileFields = [Uri]::EscapeDataString('["name"]')
-    $posProfileFilters = [Uri]::EscapeDataString((@(@("POS Profile", "disabled", "=", 0)) | ConvertTo-Json -Compress))
+    $posProfileFilters = [Uri]::EscapeDataString('[["POS Profile","disabled","=",0]]')
     $profiles = Invoke-ErpRequest `
         -Method Get `
         -Uri "$baseUrl/api/resource/POS%20Profile?fields=$posProfileFields&filters=$posProfileFilters&limit_page_length=100" `
@@ -441,15 +456,43 @@ try {
 catch {
     $posProfileNames = @()
 }
-if ($posProfileNames.Count -eq 0) {
-    $posProfileNames = @("POS-1", "POS-2")
-}
-
 $posUserMap = @{}
+$posCredentialMap = @{}
 for ($index = 0; $index -lt $posProfileNames.Count; $index++) {
-    $posUser = "myretail-pos-$($index + 1)@local.test"
+    $posUser = Get-ProfileUserEmail -ProfileName $posProfileNames[$index]
     Ensure-ErpUser -Email $posUser -FirstName "MyRetail POS $($index + 1)"
     $posUserMap[$posProfileNames[$index]] = $posUser
+
+    $posKeys = Invoke-RestMethod `
+        -Method Post `
+        -Uri "$baseUrl/api/method/frappe.core.doctype.user.user.generate_keys" `
+        -WebSession $session `
+        -ContentType "application/x-www-form-urlencoded" `
+        -Body @{ user = $posUser }
+    if (-not $posKeys.message.api_key -or -not $posKeys.message.api_secret) {
+        throw "ERPNext did not return POS user API keys"
+    }
+    $posCredentialMap[$posProfileNames[$index]] = "$($posKeys.message.api_key):$($posKeys.message.api_secret)"
+
+    $encodedProfileName = [Uri]::EscapeDataString($posProfileNames[$index])
+    $profile = Invoke-ErpRequest `
+        -Method Get `
+        -Uri "$baseUrl/api/resource/POS%20Profile/$encodedProfileName" `
+        -Session $session
+    $profileUsers = @()
+    if ($profile.data.applicable_for_users) {
+        foreach ($profileUser in $profile.data.applicable_for_users) {
+            if ($profileUser.user -and $profileUser.user -ne $posUser) {
+                $profileUsers += @{ user = $profileUser.user; default = $profileUser.default }
+            }
+        }
+    }
+    $profileUsers += @{ user = $posUser; default = 0 }
+    Invoke-ErpRequest `
+        -Method Put `
+        -Uri "$baseUrl/api/resource/POS%20Profile/$encodedProfileName" `
+        -Session $session `
+        -Body @{ applicable_for_users = $profileUsers } | Out-Null
 }
 
 $keys = Invoke-RestMethod `
@@ -504,7 +547,8 @@ $apiEnv = @(
     "MYRETAIL_ERPNEXT_BUYING_PRICE_LIST=$(Get-ApiSetting -Name 'MYRETAIL_ERPNEXT_BUYING_PRICE_LIST' -Default 'Standard Buying')"
     "MYRETAIL_ERPNEXT_COMPANY=$(Get-ApiSetting -Name 'MYRETAIL_ERPNEXT_COMPANY' -Default 'MyRetail Demo')"
     "MYRETAIL_ERPNEXT_POS_USER=$(Get-ApiSetting -Name 'MYRETAIL_ERPNEXT_POS_USER' -Default $serviceUser)"
-    "MYRETAIL_ERPNEXT_POS_USER_MAP=$(Get-ApiSetting -Name 'MYRETAIL_ERPNEXT_POS_USER_MAP' -Default ($posUserMap | ConvertTo-Json -Compress))"
+    "MYRETAIL_ERPNEXT_POS_USER_MAP=$($posUserMap | ConvertTo-Json -Compress)"
+    "MYRETAIL_ERPNEXT_POS_CREDENTIALS_MAP=$($posCredentialMap | ConvertTo-Json -Compress)"
     "MYRETAIL_DEFAULT_CURRENCY=$(Get-ApiSetting -Name 'MYRETAIL_DEFAULT_CURRENCY' -Default 'KZT')"
 ) -join [Environment]::NewLine
 
