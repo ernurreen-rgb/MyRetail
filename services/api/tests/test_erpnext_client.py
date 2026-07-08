@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 from datetime import UTC, date, datetime
 
@@ -16,6 +17,7 @@ from myretail_api.clients.erpnext import (
 )
 from myretail_api.config import Settings
 from myretail_api.models.auth import AuthenticatedUser
+from myretail_api.models.pos import CashierRef, Register, SaleLine, Shift, ShiftRegisterRef
 from myretail_api.models.products import ProductCreate, ProductUpdate
 from myretail_api.models.purchases import (
     PurchaseCancelRequest,
@@ -24,7 +26,7 @@ from myretail_api.models.purchases import (
     PurchaseUpdate,
     SupplierUpdate,
 )
-from myretail_api.models.stock import StockMovementCancelRequest, StockMovementCreate
+from myretail_api.models.stock import StockMovementCancelRequest, StockMovementCreate, WarehouseRef
 
 
 @pytest.fixture
@@ -38,6 +40,255 @@ def make_settings() -> Settings:
         erpnext_api_key=SecretStr("test-key"),
         erpnext_api_secret=SecretStr("test-secret"),
     )
+
+
+@pytest.mark.anyio
+async def test_pos_opening_uses_register_scoped_erpnext_user_and_marker() -> None:
+    captured_payloads: list[dict[str, object]] = []
+    captured_auth: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_auth.append(request.headers["Authorization"])
+        if request.url.path in {
+            "/api/resource/POS%20Opening%20Entry",
+            "/api/resource/POS Opening Entry",
+        }:
+            payload = json.loads(request.content)
+            captured_payloads.append(payload)
+            return httpx.Response(200, json={"data": {**payload, "name": "POS-OPE-1"}})
+        if request.url.path == "/api/method/frappe.client.submit":
+            payload = json.loads(request.content)
+            return httpx.Response(200, json={"message": {**payload["doc"], "docstatus": 1}})
+        return httpx.Response(404)
+
+    settings = Settings(
+        erpnext_base_url="http://erpnext.test",
+        erpnext_api_key=SecretStr("test-key"),
+        erpnext_api_secret=SecretStr("test-secret"),
+        erpnext_pos_user="fallback@example.test",
+        erpnext_pos_user_map={"POS-A": "pos-a@example.test", "POS-B": "pos-b@example.test"},
+        erpnext_pos_credentials_map={"POS-B": "pos-key:pos-secret"},
+    )
+    client = ERPNextClient(settings, transport=httpx.MockTransport(handler))
+    cashier = AuthenticatedUser(email="cashier@example.kz", full_name="Cashier", roles=["Cashier"])
+
+    await client.create_pos_opening(
+        tenant="myretail",
+        shift_id="SHIFT-1",
+        register=Register(
+            id="POS-B",
+            name="POS B",
+            warehouse=WarehouseRef(id="WH-1", name="Warehouse"),
+        ),
+        cashier=cashier,
+        opening_cash="1000.00",
+        idempotency_key="00000000-0000-0000-0000-000000000001",
+    )
+
+    marker = hashlib.sha256(
+        b"myretail:open_shift:cashier@example.kz:00000000-0000-0000-0000-000000000001"
+    ).hexdigest()
+    assert captured_payloads[0]["user"] == "pos-b@example.test"
+    assert captured_payloads[0]["myretail_open_idempotency_key"] == marker
+    assert "00000000-0000-0000-0000-000000000001" not in json.dumps(captured_payloads[0])
+    assert captured_auth == ["token pos-key:pos-secret", "token pos-key:pos-secret"]
+
+
+@pytest.mark.anyio
+async def test_pos_sale_and_closing_use_same_register_scoped_erpnext_identity() -> None:
+    sale_auth: list[str] = []
+    closing_auth: list[str] = []
+    get_invoices_payloads: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path in {"/api/resource/Sales%20Invoice", "/api/resource/Sales Invoice"}:
+            sale_auth.append(request.headers["Authorization"])
+            payload = json.loads(request.content)
+            return httpx.Response(200, json={"data": {**payload, "name": "SINV-1"}})
+        if request.url.path == "/api/method/frappe.client.submit":
+            payload = json.loads(request.content)
+            if payload["doc"]["doctype"] == "POS Closing Entry":
+                closing_auth.append(request.headers["Authorization"])
+            else:
+                sale_auth.append(request.headers["Authorization"])
+            return httpx.Response(200, json={"message": {**payload["doc"], "docstatus": 1}})
+        if "get_invoices" in request.url.path:
+            closing_auth.append(request.headers["Authorization"])
+            payload = json.loads(request.content)
+            get_invoices_payloads.append(payload)
+            return httpx.Response(
+                200,
+                json={
+                    "message": {
+                        "invoices": [
+                            {
+                                "doctype": "Sales Invoice",
+                                "name": "SINV-1",
+                                "posting_date": "2026-07-08",
+                                "customer": "Walk-in Customer",
+                                "grand_total": 100,
+                            }
+                        ],
+                        "payments": [{"mode_of_payment": "Cash", "amount": 100}],
+                    }
+                },
+            )
+        if request.url.path in {
+            "/api/resource/POS%20Opening%20Entry",
+            "/api/resource/POS Opening Entry",
+        }:
+            assert request.headers["Authorization"] == "token test-key:test-secret"
+            return httpx.Response(200, json={"data": [{"name": "OPEN-1"}]})
+        if request.url.path in {
+            "/api/resource/POS%20Closing%20Entry",
+            "/api/resource/POS Closing Entry",
+        }:
+            closing_auth.append(request.headers["Authorization"])
+            payload = json.loads(request.content)
+            return httpx.Response(200, json={"data": {**payload, "name": "CLOSE-1"}})
+        return httpx.Response(404)
+
+    settings = Settings(
+        erpnext_base_url="http://erpnext.test",
+        erpnext_api_key=SecretStr("test-key"),
+        erpnext_api_secret=SecretStr("test-secret"),
+        erpnext_pos_user_map={"POS-B": "pos-b@example.test"},
+        erpnext_pos_credentials_map={"POS-B": "pos-key:pos-secret"},
+    )
+    client = ERPNextClient(settings, transport=httpx.MockTransport(handler))
+    shift = Shift(
+        id="SHIFT-1",
+        register=ShiftRegisterRef(id="POS-B", name="POS B"),
+        warehouse=WarehouseRef(id="WH-1", name="Warehouse"),
+        cashier=CashierRef(email="cashier@example.kz", full_name="Cashier"),
+        status="open",
+        opening_cash="10000.00",
+        sales_total="100.00",
+        expected_cash="10100.00",
+        opened_at=datetime(2026, 7, 8, 10, 0, tzinfo=UTC),
+        updated_at=datetime(2026, 7, 8, 10, 1, tzinfo=UTC),
+    )
+
+    invoice = await client.create_pos_sales_invoice(
+        tenant="myretail",
+        sale_id="SALE-1",
+        shift=shift,
+        lines=[
+            SaleLine(
+                product_id="SKU-1",
+                sku="SKU-1",
+                name="Milk",
+                unit="Nos",
+                quantity="1.000",
+                unit_price="100.00",
+                subtotal="100.00",
+                discount_percent="0.00",
+                discount_amount="0.00",
+                total="100.00",
+            )
+        ],
+        subtotal="100.00",
+        discount_total="0.00",
+        grand_total="100.00",
+        cash_received="100.00",
+        change="0.00",
+        idempotency_key="00000000-0000-0000-0000-000000000001",
+    )
+    closing = await client.create_pos_closing(
+        tenant="myretail",
+        shift=shift,
+        actual_cash="10100.00",
+        difference="0.00",
+        idempotency_key="00000000-0000-0000-0000-000000000002",
+    )
+
+    assert invoice == "SINV-1"
+    assert closing == "CLOSE-1"
+    assert sale_auth == ["token pos-key:pos-secret", "token pos-key:pos-secret"]
+    assert closing_auth == [
+        "token pos-key:pos-secret",
+        "token pos-key:pos-secret",
+        "token pos-key:pos-secret",
+    ]
+    assert get_invoices_payloads[0]["user"] == "pos-b@example.test"
+
+
+@pytest.mark.anyio
+async def test_pos_sale_maps_erpnext_500_query_deadlock_to_conflict() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path in {"/api/resource/Sales%20Invoice", "/api/resource/Sales Invoice"}:
+            return httpx.Response(
+                500,
+                json={
+                    "exc_type": "QueryDeadlockError",
+                    "exception": "frappe.QueryDeadlockError: deadlock",
+                },
+            )
+        return httpx.Response(404)
+
+    client = ERPNextClient(make_settings(), transport=httpx.MockTransport(handler))
+    shift = Shift(
+        id="SHIFT-1",
+        register=ShiftRegisterRef(id="POS-B", name="POS B"),
+        warehouse=WarehouseRef(id="WH-1", name="Warehouse"),
+        cashier=CashierRef(email="cashier@example.kz", full_name="Cashier"),
+        status="open",
+        opening_cash="10000.00",
+        sales_total="0.00",
+        expected_cash="10000.00",
+        opened_at=datetime(2026, 7, 8, 10, 0, tzinfo=UTC),
+        updated_at=datetime(2026, 7, 8, 10, 1, tzinfo=UTC),
+    )
+
+    with pytest.raises(ERPNextConflictError) as exc_info:
+        await client.create_pos_sales_invoice(
+            tenant="myretail",
+            sale_id="SALE-1",
+            shift=shift,
+            lines=[
+                SaleLine(
+                    product_id="SKU-1",
+                    sku="SKU-1",
+                    name="Milk",
+                    unit="Nos",
+                    quantity="1.000",
+                    unit_price="100.00",
+                    subtotal="100.00",
+                    discount_percent="0.00",
+                    discount_amount="0.00",
+                    total="100.00",
+                )
+            ],
+            subtotal="100.00",
+            discount_total="0.00",
+            grand_total="100.00",
+            cash_received="100.00",
+            change="0.00",
+            idempotency_key="00000000-0000-0000-0000-000000000001",
+        )
+
+    assert exc_info.value.code == "QUERY_DEADLOCK"
+
+
+@pytest.mark.anyio
+async def test_pos_recovery_uses_exact_scoped_marker_filter() -> None:
+    seen_filters: list[list[object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path in {"/api/resource/Sales%20Invoice", "/api/resource/Sales Invoice"}:
+            seen_filters.append(json.loads(request.url.params["filters"]))
+            return httpx.Response(200, json={"data": [{"name": "SINV-1"}]})
+        return httpx.Response(404)
+
+    client = ERPNextClient(make_settings(), transport=httpx.MockTransport(handler))
+    key = "00000000-0000-0000-0000-000000000001"
+
+    recovered = await client.recover_pos_sale("myretail", "create_sale", "cashier@example.kz", key)
+
+    marker = hashlib.sha256(f"myretail:create_sale:cashier@example.kz:{key}".encode()).hexdigest()
+    assert recovered == "SINV-1"
+    assert ["Sales Invoice", "myretail_sale_idempotency_key", "=", marker] in seen_filters[0]
+    assert all("like" not in str(filter_part).lower() for filter_part in seen_filters[0])
 
 
 @pytest.mark.anyio

@@ -105,6 +105,26 @@ $permissionDefinitions = @(
         select = 1
     },
     @{
+        parent = "Company"
+        read = 1
+        select = 1
+    },
+    @{
+        parent = "Customer"
+        read = 1
+        select = 1
+    },
+    @{
+        parent = "Customer Group"
+        read = 1
+        select = 1
+    },
+    @{
+        parent = "Territory"
+        read = 1
+        select = 1
+    },
+    @{
         parent = "Item"
         read = 1
         select = 1
@@ -131,6 +151,115 @@ $permissionDefinitions = @(
         parent = "Bin"
         read = 1
         select = 1
+    },
+    @{
+        parent = "Account"
+        read = 1
+        select = 1
+    },
+    @{
+        parent = "Cost Center"
+        read = 1
+        select = 1
+    },
+    @{
+        parent = "Mode of Payment"
+        read = 1
+        select = 1
+    },
+    @{
+        parent = "Price List"
+        read = 1
+        select = 1
+    },
+    @{
+        parent = "UOM"
+        read = 1
+        select = 1
+    },
+    @{
+        parent = "POS Profile"
+        read = 1
+        select = 1
+    },
+    @{
+        parent = "POS Profile User"
+        read = 1
+        select = 1
+    },
+    @{
+        parent = "POS Payment Method"
+        read = 1
+        select = 1
+    },
+    @{
+        parent = "POS Opening Entry"
+        read = 1
+        select = 1
+        create = 1
+        write = 1
+        submit = 1
+        cancel = 1
+    },
+    @{
+        parent = "POS Opening Entry Detail"
+        read = 1
+        select = 1
+        create = 1
+        write = 1
+    },
+    @{
+        parent = "POS Closing Entry"
+        read = 1
+        select = 1
+        create = 1
+        write = 1
+        submit = 1
+        cancel = 1
+    },
+    @{
+        parent = "POS Closing Entry Detail"
+        read = 1
+        select = 1
+        create = 1
+        write = 1
+    },
+    @{
+        parent = "POS Closing Entry Taxes"
+        read = 1
+        select = 1
+        create = 1
+        write = 1
+    },
+    @{
+        parent = "Sales Invoice"
+        read = 1
+        select = 1
+        create = 1
+        write = 1
+        submit = 1
+        cancel = 1
+    },
+    @{
+        parent = "Sales Invoice Item"
+        read = 1
+        select = 1
+        create = 1
+        write = 1
+    },
+    @{
+        parent = "Sales Invoice Payment"
+        read = 1
+        select = 1
+        create = 1
+        write = 1
+    },
+    @{
+        parent = "Sales Invoice Reference"
+        read = 1
+        select = 1
+        create = 1
+        write = 1
     },
     @{
         parent = "Stock Entry"
@@ -215,20 +344,155 @@ foreach ($definition in $permissionDefinitions) {
         -Body $permissionBody | Out-Null
 }
 
-$encodedUser = [Uri]::EscapeDataString($serviceUser)
+$customFieldDefinitions = @(
+    @{ dt = "Sales Invoice"; fieldname = "myretail_tenant"; label = "MyRetail Tenant"; unique = 0 },
+    @{ dt = "Sales Invoice"; fieldname = "myretail_sale_id"; label = "MyRetail Sale ID"; unique = 1 },
+    @{ dt = "Sales Invoice"; fieldname = "myretail_sale_idempotency_key"; label = "MyRetail Sale Idempotency Key"; unique = 1 },
+    @{ dt = "Sales Invoice"; fieldname = "myretail_shift_id"; label = "MyRetail Shift ID"; unique = 0 },
+    @{ dt = "Sales Invoice"; fieldname = "myretail_register_id"; label = "MyRetail Register ID"; unique = 0 },
+    @{ dt = "Sales Invoice"; fieldname = "myretail_cashier_email"; label = "MyRetail Cashier Email"; unique = 0 },
+    @{ dt = "POS Opening Entry"; fieldname = "myretail_tenant"; label = "MyRetail Tenant"; unique = 0 },
+    @{ dt = "POS Opening Entry"; fieldname = "myretail_shift_id"; label = "MyRetail Shift ID"; unique = 1 },
+    @{ dt = "POS Opening Entry"; fieldname = "myretail_register_id"; label = "MyRetail Register ID"; unique = 0 },
+    @{ dt = "POS Opening Entry"; fieldname = "myretail_cashier_email"; label = "MyRetail Cashier Email"; unique = 0 },
+    @{ dt = "POS Opening Entry"; fieldname = "myretail_open_idempotency_key"; label = "MyRetail Open Idempotency Key"; unique = 1 },
+    @{ dt = "POS Closing Entry"; fieldname = "myretail_tenant"; label = "MyRetail Tenant"; unique = 0 },
+    @{ dt = "POS Closing Entry"; fieldname = "myretail_shift_id"; label = "MyRetail Shift ID"; unique = 0 },
+    @{ dt = "POS Closing Entry"; fieldname = "myretail_close_idempotency_key"; label = "MyRetail Close Idempotency Key"; unique = 1 },
+    @{ dt = "POS Closing Entry"; fieldname = "myretail_register_id"; label = "MyRetail Register ID"; unique = 0 },
+    @{ dt = "POS Closing Entry"; fieldname = "myretail_cashier_email"; label = "MyRetail Cashier Email"; unique = 0 }
+)
+
+foreach ($definition in $customFieldDefinitions) {
+    $fieldName = "$($definition.dt)-$($definition.fieldname)"
+    $encodedFieldName = [Uri]::EscapeDataString($fieldName)
+    $fieldBody = @{
+        dt = $definition.dt
+        fieldname = $definition.fieldname
+        label = $definition.label
+        fieldtype = "Data"
+        insert_after = "remarks"
+        unique = $definition.unique
+        no_copy = 1
+        allow_on_submit = 1
+    }
+
+    try {
+        Invoke-ErpRequest `
+            -Method Get `
+            -Uri "$baseUrl/api/resource/Custom%20Field/$encodedFieldName" `
+            -Session $session | Out-Null
+        Invoke-ErpRequest `
+            -Method Put `
+            -Uri "$baseUrl/api/resource/Custom%20Field/$encodedFieldName" `
+            -Session $session `
+            -Body $fieldBody | Out-Null
+    }
+    catch {
+        if ($_.Exception.Response.StatusCode.value__ -ne 404) { throw }
+        $fieldBody["doctype"] = "Custom Field"
+        Invoke-ErpRequest `
+            -Method Post `
+            -Uri "$baseUrl/api/resource/Custom%20Field" `
+            -Session $session `
+            -Body $fieldBody | Out-Null
+    }
+}
+
+function Ensure-ErpUser {
+    param(
+        [Parameter(Mandatory)][string]$Email,
+        [Parameter(Mandatory)][string]$FirstName
+    )
+
+    $encodedUser = [Uri]::EscapeDataString($Email)
+    try {
+        Invoke-ErpRequest -Method Get -Uri "$baseUrl/api/resource/User/$encodedUser" -Session $session | Out-Null
+    }
+    catch {
+        if ($_.Exception.Response.StatusCode.value__ -ne 404) { throw }
+        Invoke-ErpRequest -Method Post -Uri "$baseUrl/api/resource/User" -Session $session -Body @{
+            email = $Email
+            first_name = $FirstName
+            enabled = 1
+            user_type = "System User"
+            send_welcome_email = 0
+            roles = @(@{ role = $serviceRole })
+        } | Out-Null
+    }
+}
+
+function Get-ProfileUserEmail {
+    param([Parameter(Mandatory)][string]$ProfileName)
+
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($ProfileName)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hashBytes = $sha256.ComputeHash($bytes)
+    }
+    finally {
+        $sha256.Dispose()
+    }
+    $hash = -join ($hashBytes[0..5] | ForEach-Object { $_.ToString("x2") })
+    return "myretail-pos-$hash@local.test"
+}
+
+Ensure-ErpUser -Email $serviceUser -FirstName "MyRetail API"
+
+$posProfileNames = @()
 try {
-    Invoke-ErpRequest -Method Get -Uri "$baseUrl/api/resource/User/$encodedUser" -Session $session | Out-Null
+    $posProfileFields = [Uri]::EscapeDataString('["name"]')
+    $posProfileFilters = [Uri]::EscapeDataString('[["POS Profile","disabled","=",0]]')
+    $profiles = Invoke-ErpRequest `
+        -Method Get `
+        -Uri "$baseUrl/api/resource/POS%20Profile?fields=$posProfileFields&filters=$posProfileFilters&limit_page_length=100" `
+        -Session $session
+    foreach ($profile in $profiles.data) {
+        if ($profile.name) {
+            $posProfileNames += $profile.name
+        }
+    }
 }
 catch {
-    if ($_.Exception.Response.StatusCode.value__ -ne 404) { throw }
-    Invoke-ErpRequest -Method Post -Uri "$baseUrl/api/resource/User" -Session $session -Body @{
-        email = $serviceUser
-        first_name = "MyRetail API"
-        enabled = 1
-        user_type = "System User"
-        send_welcome_email = 0
-        roles = @(@{ role = $serviceRole })
-    } | Out-Null
+    $posProfileNames = @()
+}
+$posUserMap = @{}
+$posCredentialMap = @{}
+for ($index = 0; $index -lt $posProfileNames.Count; $index++) {
+    $posUser = Get-ProfileUserEmail -ProfileName $posProfileNames[$index]
+    Ensure-ErpUser -Email $posUser -FirstName "MyRetail POS $($index + 1)"
+    $posUserMap[$posProfileNames[$index]] = $posUser
+
+    $posKeys = Invoke-RestMethod `
+        -Method Post `
+        -Uri "$baseUrl/api/method/frappe.core.doctype.user.user.generate_keys" `
+        -WebSession $session `
+        -ContentType "application/x-www-form-urlencoded" `
+        -Body @{ user = $posUser }
+    if (-not $posKeys.message.api_key -or -not $posKeys.message.api_secret) {
+        throw "ERPNext did not return POS user API keys"
+    }
+    $posCredentialMap[$posProfileNames[$index]] = "$($posKeys.message.api_key):$($posKeys.message.api_secret)"
+
+    $encodedProfileName = [Uri]::EscapeDataString($posProfileNames[$index])
+    $profile = Invoke-ErpRequest `
+        -Method Get `
+        -Uri "$baseUrl/api/resource/POS%20Profile/$encodedProfileName" `
+        -Session $session
+    $profileUsers = @()
+    if ($profile.data.applicable_for_users) {
+        foreach ($profileUser in $profile.data.applicable_for_users) {
+            if ($profileUser.user -and $profileUser.user -ne $posUser) {
+                $profileUsers += @{ user = $profileUser.user; default = $profileUser.default }
+            }
+        }
+    }
+    $profileUsers += @{ user = $posUser; default = 0 }
+    Invoke-ErpRequest `
+        -Method Put `
+        -Uri "$baseUrl/api/resource/POS%20Profile/$encodedProfileName" `
+        -Session $session `
+        -Body @{ applicable_for_users = $profileUsers } | Out-Null
 }
 
 $keys = Invoke-RestMethod `
@@ -282,6 +546,9 @@ $apiEnv = @(
     "MYRETAIL_ERPNEXT_SELLING_PRICE_LIST=$(Get-ApiSetting -Name 'MYRETAIL_ERPNEXT_SELLING_PRICE_LIST' -Default 'Standard Selling')"
     "MYRETAIL_ERPNEXT_BUYING_PRICE_LIST=$(Get-ApiSetting -Name 'MYRETAIL_ERPNEXT_BUYING_PRICE_LIST' -Default 'Standard Buying')"
     "MYRETAIL_ERPNEXT_COMPANY=$(Get-ApiSetting -Name 'MYRETAIL_ERPNEXT_COMPANY' -Default 'MyRetail Demo')"
+    "MYRETAIL_ERPNEXT_POS_USER=$(Get-ApiSetting -Name 'MYRETAIL_ERPNEXT_POS_USER' -Default $serviceUser)"
+    "MYRETAIL_ERPNEXT_POS_USER_MAP=$($posUserMap | ConvertTo-Json -Compress)"
+    "MYRETAIL_ERPNEXT_POS_CREDENTIALS_MAP=$($posCredentialMap | ConvertTo-Json -Compress)"
     "MYRETAIL_DEFAULT_CURRENCY=$(Get-ApiSetting -Name 'MYRETAIL_DEFAULT_CURRENCY' -Default 'KZT')"
 ) -join [Environment]::NewLine
 

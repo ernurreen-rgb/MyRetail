@@ -8,6 +8,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from myretail_api.routers.auth import router as auth_router
 from myretail_api.routers.health import router as health_router
+from myretail_api.routers.pos import router as pos_router
 from myretail_api.routers.products import router as products_router
 from myretail_api.routers.purchases import purchases_router, suppliers_router
 from myretail_api.routers.stock import router as stock_router
@@ -24,6 +25,7 @@ def create_app() -> FastAPI:
     app.include_router(auth_router)
     app.include_router(health_router)
     app.include_router(products_router)
+    app.include_router(pos_router)
     app.include_router(stock_router)
     app.include_router(suppliers_router)
     app.include_router(purchases_router)
@@ -90,6 +92,7 @@ async def product_validation_exception_handler(
 def _uses_api_error_contract(path: str) -> bool:
     return (
         path.startswith("/products")
+        or path.startswith("/pos")
         or path.startswith("/stock")
         or _uses_purchase_error_contract(path)
     )
@@ -98,6 +101,8 @@ def _uses_api_error_contract(path: str) -> bool:
 def _validation_message(path: str) -> str:
     if _uses_purchase_error_contract(path):
         return "Проверьте поля закупки"
+    if path.startswith("/pos"):
+        return "Проверьте поля кассового запроса"
     if path.startswith("/stock"):
         return "Проверьте поля складской операции"
     return "Проверьте поля товара"
