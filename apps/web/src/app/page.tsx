@@ -1,13 +1,14 @@
 import { redirect } from "next/navigation";
 import Link from "next/link";
 
-import { canManagePurchases } from "@/lib/auth";
+import { canManagePurchases, canUsePOS } from "@/lib/auth";
 import { getProducts } from "@/lib/products-server";
 import { getAuthSession } from "@/lib/session";
 
 export const dynamic = "force-dynamic";
 
 const modules = [
+  "Касса",
   "Товары",
   "Склад",
   "Закупки",
@@ -44,9 +45,18 @@ export default async function Home() {
   const productsReady = products.status === "ready";
   const productsCount = productsReady ? products.data.count : 0;
   const canSeePurchases = canManagePurchases(session.user.roles);
-  const visibleModules = canSeePurchases
-    ? modules
-    : modules.filter((module) => module !== "Закупки");
+  const canSeePOS = canUsePOS(session.user.roles);
+  const visibleModules = modules.filter((module) => {
+    if (module === "Закупки") {
+      return canSeePurchases;
+    }
+
+    if (module === "Касса") {
+      return canSeePOS;
+    }
+
+    return true;
+  });
 
   const services = [
     {
@@ -181,6 +191,14 @@ export default async function Home() {
               >
                 Открыть склад
               </Link>
+              {canSeePOS ? (
+                <Link
+                  href="/pos"
+                  className="w-fit rounded-full border border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-sm font-semibold transition hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                >
+                  Открыть кассу
+                </Link>
+              ) : null}
               {canSeePurchases ? (
                 <Link
                   href="/purchases"
