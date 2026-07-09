@@ -1,4 +1,6 @@
 import asyncio
+import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -276,6 +278,40 @@ async def open_shift(
     )
     assert response.status_code == 201, response.text
     return response.json()
+
+
+async def create_sale(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    *,
+    shift_id: str,
+    email: str = "cashier@example.kz",
+    product_id: str = "SKU-1",
+) -> dict[str, object]:
+    response = await client.post(
+        "/pos/sales",
+        headers=auth_headers(tmp_path, email=email, key=str(uuid4())),
+        json={
+            "shift_id": shift_id,
+            "lines": [{"product_id": product_id, "quantity": "1.000", "discount_percent": "0.00"}],
+            "cash_received": "100.00",
+        },
+    )
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def set_sale_created_at(tmp_path: Path, sale_id: str, value: str) -> None:
+    with sqlite3.connect(tmp_path / "pos.sqlite3") as connection:
+        connection.execute(
+            "UPDATE pos_sales SET created_at = ? WHERE id = ?",
+            (value, sale_id),
+        )
+        connection.commit()
+
+
+def utc_timestamp(year: int, month: int, day: int, hour: int = 12) -> str:
+    return datetime(year, month, day, hour, tzinfo=UTC).isoformat().replace("+00:00", "Z")
 
 
 @pytest.mark.anyio
@@ -721,3 +757,275 @@ async def test_stale_close_shift_processing_with_external_side_effect_returns_te
     assert first.json()["error"]["code"] == "ERPNEXT_RECOVERY_PENDING"
     assert retry.json()["error"]["fields"]["erpnext_closing_id"] == "CLOSE-RECOVERED"
     assert erpnext.closings == []
+
+
+@pytest.mark.anyio
+async def test_sales_history_q_filters_by_sale_id_and_receipt_number(tmp_path: Path) -> None:
+    app = make_app(StubPOSErpnextClient(), tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        shift = await open_shift(client, tmp_path)
+        first = await create_sale(client, tmp_path, shift_id=str(shift["id"]))
+        second = await create_sale(client, tmp_path, shift_id=str(shift["id"]))
+        by_id = await client.get(
+            "/pos/sales",
+            headers=auth_headers(tmp_path),
+            params={"q": first["id"]},
+        )
+        by_receipt = await client.get(
+            "/pos/sales",
+            headers=auth_headers(tmp_path),
+            params={"q": second["receipt_number"]},
+        )
+
+    assert by_id.status_code == 200
+    assert by_id.json()["count"] == 1
+    assert by_id.json()["items"][0]["id"] == first["id"]
+    assert by_receipt.status_code == 200
+    assert by_receipt.json()["count"] == 1
+    assert by_receipt.json()["items"][0]["receipt_number"] == second["receipt_number"]
+
+
+@pytest.mark.anyio
+async def test_sales_history_q_filters_by_register_and_cashier(tmp_path: Path) -> None:
+    app = make_app(StubPOSErpnextClient(), tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        first_shift = await open_shift(client, tmp_path, register_id="POS-1", email="a@example.kz")
+        second_shift = await open_shift(
+            client, tmp_path, register_id="POS-2", email="b@example.kz"
+        )
+        first = await create_sale(
+            client, tmp_path, shift_id=str(first_shift["id"]), email="a@example.kz"
+        )
+        second = await create_sale(
+            client, tmp_path, shift_id=str(second_shift["id"]), email="b@example.kz"
+        )
+        by_register = await client.get(
+            "/pos/sales",
+            headers=auth_headers(tmp_path, email="owner@example.kz", roles=["Owner"]),
+            params={"q": "POS-2"},
+        )
+        by_cashier = await client.get(
+            "/pos/sales",
+            headers=auth_headers(tmp_path, email="owner@example.kz", roles=["Owner"]),
+            params={"q": "a@example.kz"},
+        )
+
+    assert by_register.status_code == 200
+    assert by_register.json()["count"] == 1
+    assert by_register.json()["items"][0]["id"] == second["id"]
+    assert by_cashier.status_code == 200
+    assert by_cashier.json()["count"] == 1
+    assert by_cashier.json()["items"][0]["id"] == first["id"]
+
+
+@pytest.mark.anyio
+async def test_sales_history_date_from_filters_created_at_inclusively(tmp_path: Path) -> None:
+    app = make_app(StubPOSErpnextClient(), tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        shift = await open_shift(client, tmp_path)
+        old_sale = await create_sale(client, tmp_path, shift_id=str(shift["id"]))
+        new_sale = await create_sale(client, tmp_path, shift_id=str(shift["id"]))
+        set_sale_created_at(tmp_path, str(old_sale["id"]), utc_timestamp(2026, 7, 1))
+        set_sale_created_at(tmp_path, str(new_sale["id"]), utc_timestamp(2026, 7, 3))
+        response = await client.get(
+            "/pos/sales",
+            headers=auth_headers(tmp_path),
+            params={"date_from": "2026-07-02"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["count"] == 1
+    assert response.json()["items"][0]["id"] == new_sale["id"]
+
+
+@pytest.mark.anyio
+async def test_sales_history_date_to_filters_created_at_inclusively_by_date(tmp_path: Path) -> None:
+    app = make_app(StubPOSErpnextClient(), tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        included = await open_shift(client, tmp_path)
+        old_sale = await create_sale(client, tmp_path, shift_id=str(included["id"]))
+        new_sale = await create_sale(client, tmp_path, shift_id=str(included["id"]))
+        set_sale_created_at(tmp_path, str(old_sale["id"]), utc_timestamp(2026, 7, 2, 23))
+        set_sale_created_at(tmp_path, str(new_sale["id"]), utc_timestamp(2026, 7, 3, 0))
+        response = await client.get(
+            "/pos/sales",
+            headers=auth_headers(tmp_path),
+            params={"date_to": "2026-07-02"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["count"] == 1
+    assert response.json()["items"][0]["id"] == old_sale["id"]
+
+
+@pytest.mark.anyio
+async def test_sales_history_date_range_filters_created_at(tmp_path: Path) -> None:
+    app = make_app(StubPOSErpnextClient(), tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        shift = await open_shift(client, tmp_path)
+        before = await create_sale(client, tmp_path, shift_id=str(shift["id"]))
+        inside = await create_sale(client, tmp_path, shift_id=str(shift["id"]))
+        after = await create_sale(client, tmp_path, shift_id=str(shift["id"]))
+        set_sale_created_at(tmp_path, str(before["id"]), utc_timestamp(2026, 7, 1))
+        set_sale_created_at(tmp_path, str(inside["id"]), utc_timestamp(2026, 7, 2))
+        set_sale_created_at(tmp_path, str(after["id"]), utc_timestamp(2026, 7, 4))
+        response = await client.get(
+            "/pos/sales",
+            headers=auth_headers(tmp_path),
+            params={"date_from": "2026-07-02", "date_to": "2026-07-03"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["count"] == 1
+    assert response.json()["items"][0]["id"] == inside["id"]
+
+
+@pytest.mark.anyio
+async def test_sales_history_register_id_combines_with_date_filters(tmp_path: Path) -> None:
+    app = make_app(StubPOSErpnextClient(), tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        first_shift = await open_shift(client, tmp_path, register_id="POS-1", email="a@example.kz")
+        second_shift = await open_shift(
+            client, tmp_path, register_id="POS-2", email="b@example.kz"
+        )
+        first = await create_sale(
+            client, tmp_path, shift_id=str(first_shift["id"]), email="a@example.kz"
+        )
+        second = await create_sale(
+            client, tmp_path, shift_id=str(second_shift["id"]), email="b@example.kz"
+        )
+        set_sale_created_at(tmp_path, str(first["id"]), utc_timestamp(2026, 7, 2))
+        set_sale_created_at(tmp_path, str(second["id"]), utc_timestamp(2026, 7, 2))
+        response = await client.get(
+            "/pos/sales",
+            headers=auth_headers(tmp_path, email="owner@example.kz", roles=["Owner"]),
+            params={"register_id": "POS-2", "date_from": "2026-07-02", "date_to": "2026-07-02"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["count"] == 1
+    assert response.json()["items"][0]["id"] == second["id"]
+
+
+@pytest.mark.anyio
+async def test_sales_history_owner_cashier_email_combines_with_date_filters(tmp_path: Path) -> None:
+    app = make_app(StubPOSErpnextClient(), tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        first_shift = await open_shift(client, tmp_path, register_id="POS-1", email="a@example.kz")
+        second_shift = await open_shift(
+            client, tmp_path, register_id="POS-2", email="b@example.kz"
+        )
+        first = await create_sale(
+            client, tmp_path, shift_id=str(first_shift["id"]), email="a@example.kz"
+        )
+        second = await create_sale(
+            client, tmp_path, shift_id=str(second_shift["id"]), email="b@example.kz"
+        )
+        set_sale_created_at(tmp_path, str(first["id"]), utc_timestamp(2026, 7, 2))
+        set_sale_created_at(tmp_path, str(second["id"]), utc_timestamp(2026, 7, 2))
+        response = await client.get(
+            "/pos/sales",
+            headers=auth_headers(tmp_path, email="owner@example.kz", roles=["Owner"]),
+            params={
+                "cashier_email": "b@example.kz",
+                "date_from": "2026-07-02",
+                "date_to": "2026-07-02",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["count"] == 1
+    assert response.json()["items"][0]["id"] == second["id"]
+
+
+@pytest.mark.anyio
+async def test_sales_history_cashier_scope_applies_before_q_and_date_filters(
+    tmp_path: Path,
+) -> None:
+    app = make_app(StubPOSErpnextClient(), tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        first_shift = await open_shift(client, tmp_path, register_id="POS-1", email="a@example.kz")
+        second_shift = await open_shift(
+            client, tmp_path, register_id="POS-2", email="b@example.kz"
+        )
+        first = await create_sale(
+            client, tmp_path, shift_id=str(first_shift["id"]), email="a@example.kz"
+        )
+        second = await create_sale(
+            client, tmp_path, shift_id=str(second_shift["id"]), email="b@example.kz"
+        )
+        set_sale_created_at(tmp_path, str(first["id"]), utc_timestamp(2026, 7, 2))
+        set_sale_created_at(tmp_path, str(second["id"]), utc_timestamp(2026, 7, 2))
+        response = await client.get(
+            "/pos/sales",
+            headers=auth_headers(tmp_path, email="a@example.kz"),
+            params={
+                "q": second["receipt_number"],
+                "cashier_email": "b@example.kz",
+                "date_from": "2026-07-02",
+                "date_to": "2026-07-02",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["count"] == 0
+    assert response.json()["items"] == []
+
+
+@pytest.mark.anyio
+async def test_sales_history_count_and_pagination_are_after_filters(tmp_path: Path) -> None:
+    app = make_app(StubPOSErpnextClient(), tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        shift = await open_shift(client, tmp_path)
+        first = await create_sale(client, tmp_path, shift_id=str(shift["id"]))
+        second = await create_sale(client, tmp_path, shift_id=str(shift["id"]))
+        third = await create_sale(client, tmp_path, shift_id=str(shift["id"]))
+        set_sale_created_at(tmp_path, str(first["id"]), utc_timestamp(2026, 7, 2, 10))
+        set_sale_created_at(tmp_path, str(second["id"]), utc_timestamp(2026, 7, 2, 11))
+        set_sale_created_at(tmp_path, str(third["id"]), utc_timestamp(2026, 7, 3, 12))
+        response = await client.get(
+            "/pos/sales",
+            headers=auth_headers(tmp_path),
+            params={
+                "q": "cashier@example.kz",
+                "date_from": "2026-07-02",
+                "date_to": "2026-07-02",
+                "limit": "1",
+                "offset": "1",
+            },
+        )
+
+    body = response.json()
+    assert response.status_code == 200
+    assert body["count"] == 2
+    assert body["limit"] == 1
+    assert body["offset"] == 1
+    assert len(body["items"]) == 1
+    assert body["items"][0]["id"] == first["id"]
+
+
+def test_openapi_sales_history_contains_v1_filters(tmp_path: Path) -> None:
+    app = make_app(StubPOSErpnextClient(), tmp_path)
+    operation = app.openapi()["paths"]["/pos/sales"]["get"]
+    params = {parameter["name"] for parameter in operation["parameters"]}
+
+    expected = {"q", "register_id", "cashier_email", "date_from", "date_to", "limit", "offset"}
+    assert expected <= params

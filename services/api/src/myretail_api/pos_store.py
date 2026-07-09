@@ -2,7 +2,8 @@ import json
 import sqlite3
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
+from datetime import time as datetime_time
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any
@@ -441,6 +442,9 @@ class POSStore:
         tenant: str,
         cashier_email: str | None,
         register_id: str | None,
+        q: str | None,
+        date_from: date | None,
+        date_to: date | None,
         limit: int,
         offset: int,
     ) -> tuple[list[dict[str, Any]], int]:
@@ -452,6 +456,25 @@ class POSStore:
         if register_id:
             filters.append("register_id = ?")
             params.append(register_id)
+        if q:
+            pattern = f"%{q.strip()}%"
+            if pattern != "%%":
+                filters.append(
+                    "("
+                    "id LIKE ? OR "
+                    "receipt_number LIKE ? OR "
+                    "cashier_email LIKE ? OR "
+                    "register_id LIKE ? OR "
+                    "register_name LIKE ?"
+                    ")"
+                )
+                params.extend([pattern, pattern, pattern, pattern, pattern])
+        if date_from:
+            filters.append("created_at >= ?")
+            params.append(_date_start(date_from))
+        if date_to:
+            filters.append("created_at < ?")
+            params.append(_date_start(date_to + timedelta(days=1)))
         where = " AND ".join(filters)
         with self._connect() as connection:
             count = connection.execute(
@@ -586,6 +609,10 @@ def _now() -> str:
 
 def _timestamp(value: float) -> str:
     return datetime.fromtimestamp(value, UTC).isoformat().replace("+00:00", "Z")
+
+
+def _date_start(value: date) -> str:
+    return datetime.combine(value, datetime_time.min, tzinfo=UTC).isoformat().replace("+00:00", "Z")
 
 
 def _parse_timestamp(value: str) -> float:

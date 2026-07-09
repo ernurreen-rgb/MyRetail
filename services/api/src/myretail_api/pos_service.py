@@ -1,7 +1,7 @@
 import asyncio
 import hashlib
 import json
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 from uuid import uuid4
@@ -252,8 +252,11 @@ class POSService:
         self,
         context: TenantContext,
         *,
+        q: str | None,
         register_id: str | None,
         cashier_email: str | None,
+        date_from: date | None,
+        date_to: date | None,
         limit: int,
         offset: int,
     ) -> SaleList:
@@ -265,6 +268,9 @@ class POSService:
             tenant=context.tenant,
             cashier_email=effective_cashier,
             register_id=register_id,
+            q=q,
+            date_from=date_from,
+            date_to=date_to,
             limit=limit,
             offset=offset,
         )

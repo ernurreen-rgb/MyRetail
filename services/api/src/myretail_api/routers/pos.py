@@ -1,3 +1,4 @@
+from datetime import date
 from typing import Annotated
 from uuid import UUID
 
@@ -162,16 +163,22 @@ async def create_sale(
 async def list_sales(
     service: Annotated[POSService, Depends(get_pos_service)],
     context: Annotated[TenantContext, Depends(require_tenant_context)],
+    q: Annotated[str | None, Query(max_length=140)] = None,
     register_id: Annotated[str | None, Query(max_length=140)] = None,
     cashier_email: Annotated[str | None, Query(max_length=140)] = None,
+    date_from: Annotated[date | None, Query()] = None,
+    date_to: Annotated[date | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> SaleList:
     return await _call(
         service.list_sales(
             context,
+            q=q,
             register_id=register_id,
             cashier_email=cashier_email,
+            date_from=date_from,
+            date_to=date_to,
             limit=limit,
             offset=offset,
         )
