@@ -213,6 +213,7 @@ class POSLineInput(BaseModel):
 class SaleLine(BaseModel):
     model_config = ConfigDict(frozen=True)
 
+    line_id: str | None = None
     product_id: str
     sku: str
     name: str
@@ -223,6 +224,8 @@ class SaleLine(BaseModel):
     discount_percent: str
     discount_amount: str
     total: str
+    returned_quantity: str = "0.000"
+    available_to_return_quantity: str = "0.000"
 
 
 class Sale(BaseModel):
@@ -243,6 +246,158 @@ class Sale(BaseModel):
     cash_received: str
     change: str
     created_at: datetime
+    return_status: Literal["none", "partial", "full"] = "none"
+    returned_total: str = "0.00"
+
+
+ReturnStatus = Literal["none", "partial", "full"]
+ReturnState = Literal["submitted", "cancelled", "pending_recovery"]
+RefundMethod = Literal["cash"]
+ReturnReason = Literal["customer_request", "cashier_error", "damaged", "other"]
+
+
+class ReturnLineInput(BaseModel):
+    line_id: str = Field(min_length=1, max_length=140)
+    quantity: str
+
+    @field_validator("line_id")
+    @classmethod
+    def strip_line_id(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Строка возврата обязательна")
+        return value
+
+    @field_validator("quantity", mode="before")
+    @classmethod
+    def normalize_return_quantity(cls, value: Any) -> str:
+        return format_quantity(parse_quantity(value))
+
+
+class ReturnCreateRequest(BaseModel):
+    sale_id: str = Field(min_length=1, max_length=140)
+    register_id: str = Field(min_length=1, max_length=140)
+    shift_id: str = Field(min_length=1, max_length=140)
+    refund_method: RefundMethod
+    reason: ReturnReason
+    comment: str | None = Field(default=None, max_length=500)
+    lines: list[ReturnLineInput] = Field(min_length=1, max_length=100)
+
+    @field_validator("sale_id", "register_id", "shift_id")
+    @classmethod
+    def strip_identifiers(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("comment", mode="before")
+    @classmethod
+    def normalize_comment(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("Комментарий должен быть строкой")
+        return value.strip() or None
+
+    @model_validator(mode="after")
+    def require_unique_lines(self) -> "ReturnCreateRequest":
+        line_ids = [line.line_id for line in self.lines]
+        if len(line_ids) != len(set(line_ids)):
+            raise ValueError("Строки возврата не должны повторяться")
+        return self
+
+
+class ReturnLine(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    line_id: str
+    item_id: str
+    item_name: str
+    quantity: str
+    unit: str
+    unit_price: str
+    line_total: str
+
+
+class ReturnOptionsLine(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    line_id: str
+    item_id: str
+    item_name: str
+    sold_quantity: str
+    already_returned_quantity: str
+    available_to_return_quantity: str
+    unit: str
+    unit_price: str
+    line_total: str
+
+
+class ReturnTotals(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    refund_total: str
+    sold_total: str | None = None
+    already_returned_total: str | None = None
+    available_to_return_total: str | None = None
+
+
+class ReturnOptions(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    sale_id: str
+    receipt_number: str
+    status: Literal["submitted"] = "submitted"
+    return_status: ReturnStatus
+    register_id: str
+    shift_id: str
+    cashier_email: str
+    created_at: datetime
+    currency: str = "KZT"
+    lines: list[ReturnOptionsLine]
+    totals: ReturnTotals
+
+
+class ReturnResponse(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    return_id: str
+    sale_id: str
+    receipt_number: str
+    return_receipt_number: str
+    state: ReturnState
+    return_status_after: ReturnStatus
+    refund_method: RefundMethod
+    reason: ReturnReason
+    comment: str | None = None
+    currency: str = "KZT"
+    register_id: str
+    shift_id: str
+    lines: list[ReturnLine]
+    totals: ReturnTotals
+    created_by: str
+    created_at: datetime
+    cancelled_by: str | None = None
+    cancelled_at: datetime | None = None
+
+
+class ReturnList(BaseModel):
+    items: list[ReturnResponse]
+    count: int
+    limit: int = 50
+    offset: int = 0
+
+
+class ReturnCancelRequest(BaseModel):
+    reason: ReturnReason
+    comment: str | None = Field(default=None, max_length=500)
+
+    @field_validator("comment", mode="before")
+    @classmethod
+    def normalize_cancel_comment(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("Комментарий должен быть строкой")
+        return value.strip() or None
 
 
 class SaleCreateRequest(BaseModel):

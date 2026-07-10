@@ -94,6 +94,8 @@ class StubPOSErpnextClient:
         self.openings: list[str] = []
         self.closings: list[str] = []
         self.sales: list[str] = []
+        self.returns: list[dict[str, object]] = []
+        self.cancelled_returns: set[str] = set()
         self.sale_lock = asyncio.Lock()
 
     async def list_pos_registers(self, tenant: str) -> list[Register]:
@@ -162,6 +164,25 @@ class StubPOSErpnextClient:
             self.sales.append(invoice)
             return invoice
 
+    async def create_pos_sales_return(self, **kwargs: object) -> str:
+        return_id = str(kwargs["return_id"])
+        invoice = f"RET-{len(self.returns) + 1}"
+        self.returns.append({"return_id": return_id, "invoice": invoice})
+        return invoice
+
+    async def recover_pos_return(
+        self, tenant: str, operation: str, user_email: str, idempotency_key: str
+    ) -> str | None:
+        _ = tenant, operation, user_email, idempotency_key
+        return None
+
+    async def cancel_pos_return(self, invoice_id: str, *, reason: str, comment: str | None) -> None:
+        _ = reason, comment
+        self.cancelled_returns.add(invoice_id)
+
+    async def get_pos_return_docstatus(self, invoice_id: str) -> int:
+        return 2 if invoice_id in self.cancelled_returns else 1
+
     async def recover_pos_opening(
         self, tenant: str, operation: str, user_email: str, idempotency_key: str
     ) -> str | None:
@@ -222,6 +243,12 @@ class RecoveringCloseERPNextClient(StubPOSErpnextClient):
     ) -> str | None:
         _ = tenant, operation, user_email, idempotency_key
         return "CLOSE-RECOVERED"
+
+
+class FlakyReturnERPNextClient(StubPOSErpnextClient):
+    async def create_pos_sales_return(self, **kwargs: object) -> str:
+        _ = await super().create_pos_sales_return(**kwargs)
+        raise ERPNextAmbiguousCreateError("lost return response")
 
 
 def make_settings(tmp_path: Path) -> Settings:
@@ -1029,3 +1056,225 @@ def test_openapi_sales_history_contains_v1_filters(tmp_path: Path) -> None:
 
     expected = {"q", "register_id", "cashier_email", "date_from", "date_to", "limit", "offset"}
     assert expected <= params
+
+
+@pytest.mark.anyio
+async def test_return_options_and_partial_return_are_idempotent_and_block_over_return(
+    tmp_path: Path,
+) -> None:
+    erpnext = StubPOSErpnextClient()
+    app = make_app(erpnext, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        shift = await open_shift(client, tmp_path)
+        sale = await create_sale(client, tmp_path, shift_id=str(shift["id"]))
+        line_id = f"{sale['id']}:line:1"
+        options = await client.get(
+            f"/pos/sales/{sale['id']}/return-options", headers=auth_headers(tmp_path)
+        )
+        body = {
+            "sale_id": sale["id"],
+            "register_id": "POS-1",
+            "shift_id": shift["id"],
+            "refund_method": "cash",
+            "reason": "customer_request",
+            "lines": [{"line_id": line_id, "quantity": "1.000"}],
+        }
+        key = str(uuid4())
+        first = await client.post(
+            "/pos/returns", headers=auth_headers(tmp_path, key=key), json=body
+        )
+        retry = await client.post(
+            "/pos/returns", headers=auth_headers(tmp_path, key=key), json=body
+        )
+        sale_detail = await client.get(
+            f"/pos/sales/{sale['id']}", headers=auth_headers(tmp_path)
+        )
+        over = await client.post(
+            "/pos/returns", headers=auth_headers(tmp_path, key=str(uuid4())), json=body
+        )
+        conflict = await client.post(
+            "/pos/returns",
+            headers=auth_headers(tmp_path, key=key),
+            json={**body, "reason": "damaged"},
+        )
+
+    assert options.status_code == 200
+    assert options.json()["lines"][0]["available_to_return_quantity"] == "1.000"
+    assert first.status_code == 201
+    assert retry.status_code == 201
+    assert retry.json()["return_id"] == first.json()["return_id"]
+    assert sale_detail.status_code == 200
+    assert sale_detail.json()["return_status"] == "full"
+    assert sale_detail.json()["lines"][0]["returned_quantity"] == "1.000"
+    assert len(erpnext.returns) == 1
+    assert over.status_code == 409
+    assert over.json()["error"]["code"] == "SALE_ALREADY_FULLY_RETURNED"
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+
+
+@pytest.mark.anyio
+async def test_repeated_partial_return_consumes_remaining_quantity(tmp_path: Path) -> None:
+    erpnext = StubPOSErpnextClient()
+    app = make_app(erpnext, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        shift = await open_shift(client, tmp_path)
+        sale = await create_sale(
+            client, tmp_path, shift_id=str(shift["id"]), product_id="WEIGHT"
+        )
+        line_id = f"{sale['id']}:line:1"
+        base = {
+            "sale_id": sale["id"],
+            "register_id": "POS-1",
+            "shift_id": shift["id"],
+            "refund_method": "cash",
+            "reason": "customer_request",
+        }
+        first = await client.post(
+            "/pos/returns",
+            headers=auth_headers(tmp_path, key=str(uuid4())),
+            json={**base, "lines": [{"line_id": line_id, "quantity": "0.400"}]},
+        )
+        options = await client.get(
+            f"/pos/sales/{sale['id']}/return-options", headers=auth_headers(tmp_path)
+        )
+        second = await client.post(
+            "/pos/returns",
+            headers=auth_headers(tmp_path, key=str(uuid4())),
+            json={**base, "lines": [{"line_id": line_id, "quantity": "0.600"}]},
+        )
+
+    assert first.status_code == 201
+    assert options.status_code == 200
+    assert options.json()["lines"][0]["already_returned_quantity"] == "0.400"
+    assert options.json()["lines"][0]["available_to_return_quantity"] == "0.600"
+    assert second.status_code == 201
+    assert len(erpnext.returns) == 2
+
+
+@pytest.mark.anyio
+async def test_return_cancel_requires_admin_and_is_idempotent(tmp_path: Path) -> None:
+    erpnext = StubPOSErpnextClient()
+    app = make_app(erpnext, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        shift = await open_shift(client, tmp_path)
+        sale = await create_sale(client, tmp_path, shift_id=str(shift["id"]))
+        body = {
+            "sale_id": sale["id"],
+            "register_id": "POS-1",
+            "shift_id": shift["id"],
+            "refund_method": "cash",
+            "reason": "cashier_error",
+            "lines": [{"line_id": f"{sale['id']}:line:1", "quantity": "1.000"}],
+        }
+        created = await client.post(
+            "/pos/returns", headers=auth_headers(tmp_path, key=str(uuid4())), json=body
+        )
+        return_id = created.json()["return_id"]
+        forbidden = await client.post(
+            f"/pos/returns/{return_id}/cancel",
+            headers=auth_headers(tmp_path, key=str(uuid4())),
+            json={"reason": "cashier_error"},
+        )
+        cancel_key = str(uuid4())
+        cancelled = await client.post(
+            f"/pos/returns/{return_id}/cancel",
+            headers=auth_headers(tmp_path, roles=["Owner"], key=cancel_key),
+            json={"reason": "cashier_error"},
+        )
+        retry = await client.post(
+            f"/pos/returns/{return_id}/cancel",
+            headers=auth_headers(tmp_path, roles=["Owner"], key=cancel_key),
+            json={"reason": "cashier_error"},
+        )
+        repeat = await client.post(
+            f"/pos/returns/{return_id}/cancel",
+            headers=auth_headers(tmp_path, roles=["Owner"], key=str(uuid4())),
+            json={"reason": "cashier_error"},
+        )
+
+    assert created.status_code == 201
+    assert forbidden.status_code == 403
+    assert forbidden.json()["error"]["code"] == "POS_FORBIDDEN"
+    assert cancelled.status_code == 200
+    assert cancelled.json()["state"] == "cancelled"
+    assert retry.status_code == 200
+    assert retry.json()["return_id"] == return_id
+    assert repeat.status_code == 409
+    assert repeat.json()["error"]["code"] == "RETURN_ALREADY_CANCELLED"
+
+
+@pytest.mark.anyio
+async def test_ambiguous_return_is_pending_recovery_without_second_create(tmp_path: Path) -> None:
+    erpnext = FlakyReturnERPNextClient()
+    app = make_app(erpnext, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        shift = await open_shift(client, tmp_path)
+        sale = await create_sale(client, tmp_path, shift_id=str(shift["id"]))
+        body = {
+            "sale_id": sale["id"],
+            "register_id": "POS-1",
+            "shift_id": shift["id"],
+            "refund_method": "cash",
+            "reason": "damaged",
+            "lines": [{"line_id": f"{sale['id']}:line:1", "quantity": "1.000"}],
+        }
+        key = str(uuid4())
+        first = await client.post(
+            "/pos/returns", headers=auth_headers(tmp_path, key=key), json=body
+        )
+        retry = await client.post(
+            "/pos/returns", headers=auth_headers(tmp_path, key=key), json=body
+        )
+
+    assert first.status_code == 503
+    assert first.json()["error"]["code"] == "RETURN_RECOVERY_REQUIRED"
+    assert retry.status_code == 503
+    assert retry.json()["error"]["code"] == "RETURN_RECOVERY_REQUIRED"
+    assert len(erpnext.returns) == 1
+
+
+@pytest.mark.anyio
+async def test_returns_history_filters_count_and_openapi(tmp_path: Path) -> None:
+    erpnext = StubPOSErpnextClient()
+    app = make_app(erpnext, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        shift = await open_shift(client, tmp_path)
+        sale = await create_sale(client, tmp_path, shift_id=str(shift["id"]))
+        body = {
+            "sale_id": sale["id"],
+            "register_id": "POS-1",
+            "shift_id": shift["id"],
+            "refund_method": "cash",
+            "reason": "other",
+            "lines": [{"line_id": f"{sale['id']}:line:1", "quantity": "1.000"}],
+        }
+        created = await client.post(
+            "/pos/returns", headers=auth_headers(tmp_path, key=str(uuid4())), json=body
+        )
+        history = await client.get(
+            "/pos/returns?q=" + created.json()["return_id"] + "&limit=1&offset=0",
+            headers=auth_headers(tmp_path),
+        )
+        detail = await client.get(
+            f"/pos/returns/{created.json()['return_id']}", headers=auth_headers(tmp_path)
+        )
+        schema = app.openapi()
+
+    assert history.status_code == 200
+    assert history.json()["count"] == 1
+    assert len(history.json()["items"]) == 1
+    assert detail.status_code == 200
+    assert "/pos/returns" in schema["paths"]
+    assert "/pos/returns/{return_id}/cancel" in schema["paths"]
+    assert "/pos/sales/{sale_id}/return-options" in schema["paths"]

@@ -15,6 +15,11 @@ from myretail_api.models.pos import (
     HeldReceiptUpdate,
     POSOptions,
     POSProductList,
+    ReturnCancelRequest,
+    ReturnCreateRequest,
+    ReturnList,
+    ReturnOptions,
+    ReturnResponse,
     Sale,
     SaleCreateRequest,
     SaleList,
@@ -192,6 +197,77 @@ async def get_sale(
     context: Annotated[TenantContext, Depends(require_tenant_context)],
 ) -> Sale:
     return await _call(service.get_sale(context, sale_id))
+
+
+@router.get("/sales/{sale_id}/return-options", response_model=ReturnOptions)
+async def get_return_options(
+    sale_id: str,
+    service: Annotated[POSService, Depends(get_pos_service)],
+    context: Annotated[TenantContext, Depends(require_tenant_context)],
+) -> ReturnOptions:
+    return await _call(service.return_options(context, sale_id))
+
+
+@router.post("/returns", response_model=ReturnResponse, status_code=status.HTTP_201_CREATED)
+async def create_return(
+    request: ReturnCreateRequest,
+    service: Annotated[POSService, Depends(get_pos_service)],
+    context: Annotated[TenantContext, Depends(require_tenant_context)],
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> JSONResponse:
+    key = _require_idempotency_key(idempotency_key)
+    return await _json_response(service.create_return(context, request, key=key))
+
+
+@router.get("/returns", response_model=ReturnList)
+async def list_returns(
+    service: Annotated[POSService, Depends(get_pos_service)],
+    context: Annotated[TenantContext, Depends(require_tenant_context)],
+    q: Annotated[str | None, Query(max_length=140)] = None,
+    sale_id: Annotated[str | None, Query(max_length=140)] = None,
+    register_id: Annotated[str | None, Query(max_length=140)] = None,
+    cashier_email: Annotated[str | None, Query(max_length=140)] = None,
+    date_from: Annotated[date | None, Query()] = None,
+    date_to: Annotated[date | None, Query()] = None,
+    state: Annotated[str | None, Query(pattern="^(submitted|cancelled|pending_recovery)$")] = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> ReturnList:
+    return await _call(
+        service.list_returns(
+            context,
+            q=q,
+            sale_id=sale_id,
+            register_id=register_id,
+            cashier_email=cashier_email,
+            date_from=date_from,
+            date_to=date_to,
+            state=state,
+            limit=limit,
+            offset=offset,
+        )
+    )
+
+
+@router.get("/returns/{return_id}", response_model=ReturnResponse)
+async def get_return(
+    return_id: str,
+    service: Annotated[POSService, Depends(get_pos_service)],
+    context: Annotated[TenantContext, Depends(require_tenant_context)],
+) -> ReturnResponse:
+    return await _call(service.get_return(context, return_id))
+
+
+@router.post("/returns/{return_id}/cancel", response_model=ReturnResponse)
+async def cancel_return(
+    return_id: str,
+    request: ReturnCancelRequest,
+    service: Annotated[POSService, Depends(get_pos_service)],
+    context: Annotated[TenantContext, Depends(require_tenant_context)],
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> JSONResponse:
+    key = _require_idempotency_key(idempotency_key)
+    return await _json_response(service.cancel_return(context, return_id, request, key=key))
 
 
 async def _json_response(call) -> JSONResponse:  # type: ignore[no-untyped-def]
