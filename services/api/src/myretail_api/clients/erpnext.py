@@ -3819,9 +3819,15 @@ class ERPNextClient:
             return "ERPNext отклонил данные товара"
 
         if isinstance(payload, Mapping):
-            message = payload.get("message") or payload.get("exception")
-            if isinstance(message, str) and message:
-                return message
+            messages = [
+                payload.get("message"),
+                payload.get("exception"),
+                payload.get("exc"),
+                payload.get("_server_messages"),
+            ]
+            text = " ".join(str(message) for message in messages if message)
+            if text:
+                return text
         return "ERPNext отклонил данные товара"
 
     @staticmethod

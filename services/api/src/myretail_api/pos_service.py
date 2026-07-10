@@ -714,6 +714,15 @@ class POSService:
         except POSStoreConflictError as exc:
             self._store.delete_pending_return(context.tenant, return_id)
             raise POSApiError(409, exc.code, exc.message, exc.fields) from exc
+        except POSApiError as exc:
+            self._store.delete_pending_return(context.tenant, return_id)
+            if shift.status == "closed" and exc.code == "VALIDATION_ERROR":
+                raise POSApiError(
+                    409,
+                    "POS_OPENING_OUTDATED",
+                    "POS Opening Entry неактуальна для cash refund",
+                ) from exc
+            raise
         except ERPNextAmbiguousCreateError:
             raise
         except Exception:
