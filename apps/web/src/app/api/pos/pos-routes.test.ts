@@ -18,6 +18,10 @@ import { GET as optionsGET } from "@/app/api/pos/options/route";
 import { GET as productsGET } from "@/app/api/pos/products/route";
 import { GET as salesGET, POST as salesPOST } from "@/app/api/pos/sales/route";
 import { GET as saleDetailGET } from "@/app/api/pos/sales/[saleId]/route";
+import { GET as returnOptionsGET } from "@/app/api/pos/sales/[saleId]/return-options/route";
+import { GET as returnsGET, POST as returnsPOST } from "@/app/api/pos/returns/route";
+import { GET as returnDetailGET } from "@/app/api/pos/returns/[returnId]/route";
+import { POST as returnCancelPOST } from "@/app/api/pos/returns/[returnId]/cancel/route";
 import { GET as currentShiftGET } from "@/app/api/pos/shifts/current/route";
 import { POST as shiftsPOST } from "@/app/api/pos/shifts/route";
 import { POST as shiftClosePOST } from "@/app/api/pos/shifts/[shiftId]/close/route";
@@ -80,9 +84,22 @@ describe("POS route handlers", () => {
       request,
       method: "POST",
     });
+
+    await returnsGET(request);
+    expect(routeDependencies.proxyPOSRequest).toHaveBeenLastCalledWith({
+      endpoint: "/pos/returns",
+      request,
+    });
+
+    await returnsPOST(request);
+    expect(routeDependencies.proxyPOSRequest).toHaveBeenLastCalledWith({
+      endpoint: "/pos/returns",
+      request,
+      method: "POST",
+    });
   });
 
-  it("encodes dynamic ids for shift close, held receipts and sale details", async () => {
+  it("encodes dynamic ids for shift close, held receipts, sale and return details", async () => {
     const request = new Request("http://localhost:3000/api/pos/held-receipts/HELD%201");
 
     await shiftClosePOST(request, { params: Promise.resolve({ shiftId: "SHIFT 1" }) });
@@ -116,6 +133,25 @@ describe("POS route handlers", () => {
     expect(routeDependencies.proxyPOSRequest).toHaveBeenLastCalledWith({
       endpoint: "/pos/sales/SALE%201",
       request,
+    });
+
+    await returnOptionsGET(request, { params: Promise.resolve({ saleId: "SALE 1" }) });
+    expect(routeDependencies.proxyPOSRequest).toHaveBeenLastCalledWith({
+      endpoint: "/pos/sales/SALE%201/return-options",
+      request,
+    });
+
+    await returnDetailGET(request, { params: Promise.resolve({ returnId: "RETURN 1" }) });
+    expect(routeDependencies.proxyPOSRequest).toHaveBeenLastCalledWith({
+      endpoint: "/pos/returns/RETURN%201",
+      request,
+    });
+
+    await returnCancelPOST(request, { params: Promise.resolve({ returnId: "RETURN 1" }) });
+    expect(routeDependencies.proxyPOSRequest).toHaveBeenLastCalledWith({
+      endpoint: "/pos/returns/RETURN%201/cancel",
+      request,
+      method: "POST",
     });
   });
 });

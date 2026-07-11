@@ -5,19 +5,33 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { POSManager } from "@/app/pos/pos-manager";
-import type { HeldReceipt, POSOptions, POSProduct, Sale, Shift } from "@/lib/pos";
+import type {
+  HeldReceipt,
+  POSOptions,
+  POSProduct,
+  POSReturn,
+  ReturnList,
+  ReturnOptions,
+  Sale,
+  Shift,
+} from "@/lib/pos";
 
 const posApi = vi.hoisted(() => ({
+  cancelReturn: vi.fn(),
   closeShift: vi.fn(),
   createHeldReceipt: vi.fn(),
   createIdempotencyKey: vi.fn(),
+  createReturn: vi.fn(),
   createSale: vi.fn(),
   deleteHeldReceipt: vi.fn(),
   getCurrentShift: vi.fn(),
   getPOSOptions: vi.fn(),
+  getReturn: vi.fn(),
+  getReturnOptions: vi.fn(),
   getSale: vi.fn(),
   listHeldReceipts: vi.fn(),
   listPOSProducts: vi.fn(),
+  listReturns: vi.fn(),
   listSales: vi.fn(),
   openShift: vi.fn(),
   updateHeldReceipt: vi.fn(),
@@ -104,6 +118,7 @@ const sale: Sale = {
   currency: "KZT",
   lines: [
     {
+      line_id: "LINE-1",
       product_id: milk.id,
       sku: milk.sku,
       name: milk.name,
@@ -114,6 +129,8 @@ const sale: Sale = {
       discount_percent: "0.00",
       discount_amount: "0.00",
       total: "800.00",
+      returned_quantity: "0.000",
+      available_to_return_quantity: "1.000",
     },
   ],
   subtotal: "800.00",
@@ -122,6 +139,96 @@ const sale: Sale = {
   cash_received: "1000.00",
   change: "200.00",
   created_at: "2026-07-08T10:00:00Z",
+  return_status: "none",
+  returned_total: "0.00",
+};
+
+const returnOptions: ReturnOptions = {
+  sale_id: sale.id,
+  receipt_number: sale.receipt_number,
+  status: "submitted",
+  return_status: "none",
+  register_id: "REG-1",
+  shift_id: shift.id,
+  cashier_email: "cashier@example.test",
+  created_at: sale.created_at,
+  currency: "KZT",
+  lines: [
+    {
+      line_id: "LINE-1",
+      item_id: milk.id,
+      item_name: milk.name,
+      sold_quantity: "1.000",
+      already_returned_quantity: "0.000",
+      available_to_return_quantity: "1.000",
+      unit: milk.unit,
+      unit_price: "800.00",
+      line_total: "800.00",
+    },
+  ],
+  totals: {
+    refund_total: "800.00",
+    sold_total: "800.00",
+    already_returned_total: "0.00",
+    available_to_return_total: "800.00",
+  },
+};
+
+const posReturn: POSReturn = {
+  return_id: "RETURN-1",
+  sale_id: sale.id,
+  receipt_number: sale.receipt_number,
+  return_receipt_number: "RET-0001",
+  state: "submitted",
+  return_status_after: "full",
+  refund_method: "cash",
+  reason: "customer_request",
+  comment: "Клиент передумал",
+  currency: "KZT",
+  register_id: "REG-1",
+  shift_id: shift.id,
+  lines: [
+    {
+      line_id: "LINE-1",
+      item_id: milk.id,
+      item_name: milk.name,
+      quantity: "1.000",
+      unit: milk.unit,
+      unit_price: "800.00",
+      line_total: "800.00",
+    },
+  ],
+  totals: {
+    refund_total: "800.00",
+    sold_total: null,
+    already_returned_total: null,
+    available_to_return_total: null,
+  },
+  created_by: "cashier@example.test",
+  created_at: "2026-07-08T10:05:00Z",
+  cancelled_by: null,
+  cancelled_at: null,
+};
+
+const returnList: ReturnList = {
+  items: [
+    {
+      return_id: posReturn.return_id,
+      sale_id: posReturn.sale_id,
+      receipt_number: posReturn.receipt_number,
+      return_receipt_number: posReturn.return_receipt_number,
+      state: posReturn.state,
+      refund_total: posReturn.totals.refund_total,
+      currency: posReturn.currency,
+      register_id: posReturn.register_id,
+      shift_id: posReturn.shift_id,
+      cashier_email: "cashier@example.test",
+      created_at: posReturn.created_at,
+    },
+  ],
+  count: 1,
+  limit: 10,
+  offset: 0,
 };
 
 const held: HeldReceipt = {
@@ -149,11 +256,11 @@ function error(code: string, message: string, statusCode = 409, fields: Record<s
   };
 }
 
-function renderPOS(canUsePOS = true) {
+function renderPOS(canUsePOS = true, userRoles = canUsePOS ? ["Cashier"] : ["Warehouse Clerk"]) {
   return render(
     <POSManager
       canUsePOS={canUsePOS}
-      userRoles={canUsePOS ? ["Cashier"] : ["Warehouse Clerk"]}
+      userRoles={userRoles}
       userEmail="cashier@example.test"
     />,
   );
@@ -176,15 +283,26 @@ async function scanMilk(user: ReturnType<typeof userEvent.setup>) {
 }
 
 beforeEach(() => {
+  posApi.cancelReturn.mockReset().mockResolvedValue(
+    success({
+      ...posReturn,
+      state: "cancelled",
+      cancelled_by: "owner@example.test",
+      cancelled_at: "2026-07-08T10:10:00Z",
+    }),
+  );
   posApi.closeShift.mockReset().mockResolvedValue(success(closedShift));
   posApi.createHeldReceipt.mockReset().mockResolvedValue(success(held));
   posApi.createIdempotencyKey
     .mockReset()
     .mockReturnValue("123e4567-e89b-42d3-a456-426614174000");
+  posApi.createReturn.mockReset().mockResolvedValue(success(posReturn));
   posApi.createSale.mockReset().mockResolvedValue(success(sale));
   posApi.deleteHeldReceipt.mockReset().mockResolvedValue(success(null));
   posApi.getCurrentShift.mockReset().mockResolvedValue(success(shift));
   posApi.getPOSOptions.mockReset().mockResolvedValue(success(options));
+  posApi.getReturn.mockReset().mockResolvedValue(success(posReturn));
+  posApi.getReturnOptions.mockReset().mockResolvedValue(success(returnOptions));
   posApi.getSale.mockReset().mockResolvedValue(success(sale));
   posApi.listHeldReceipts.mockReset().mockResolvedValue(
     success({
@@ -202,6 +320,7 @@ beforeEach(() => {
       offset: 0,
     }),
   );
+  posApi.listReturns.mockReset().mockResolvedValue(success(returnList));
   posApi.listSales.mockReset().mockResolvedValue(
     success({
       items: [sale],
@@ -377,11 +496,15 @@ describe("POSManager sales history and receipt", () => {
     const user = userEvent.setup();
     await renderReady();
 
-    await user.type(screen.getByLabelText("Поиск"), "milk");
-    await user.type(screen.getByLabelText("Кассир email"), "cashier@example.test");
-    await user.type(screen.getByLabelText("Дата от"), "2026-07-08");
-    await user.type(screen.getByLabelText("Дата до"), "2026-07-09");
-    await user.click(screen.getByRole("button", { name: "Применить фильтры продаж" }));
+    const salesSection = screen.getByRole("heading", { name: "История продаж" }).closest("section");
+    expect(salesSection).toBeTruthy();
+    const sales = within(salesSection as HTMLElement);
+
+    await user.type(sales.getByLabelText("Поиск"), "milk");
+    await user.type(sales.getByLabelText("Кассир email"), "cashier@example.test");
+    await user.type(sales.getByLabelText("Дата от"), "2026-07-08");
+    await user.type(sales.getByLabelText("Дата до"), "2026-07-09");
+    await user.click(sales.getByRole("button", { name: "Применить фильтры продаж" }));
 
     await waitFor(() =>
       expect(posApi.listSales).toHaveBeenLastCalledWith({
@@ -395,7 +518,7 @@ describe("POSManager sales history and receipt", () => {
       }),
     );
 
-    await user.click(screen.getByRole("button", { name: "Детали" }));
+    await user.click(sales.getByRole("button", { name: "Детали" }));
     await waitFor(() => expect(posApi.getSale).toHaveBeenCalledWith("SALE-1"));
     expect(await screen.findByText("Детали продажи POS-0001")).toBeTruthy();
   });
@@ -412,5 +535,144 @@ describe("POSManager sales history and receipt", () => {
     expect(within(receipt).getByText("MyRetail POS")).toBeTruthy();
     await user.click(within(receipt).getByRole("button", { name: "Печать чека" }));
     expect(printSpy).toHaveBeenCalledOnce();
+  });
+});
+
+describe("POSManager returns flow", () => {
+  it("loads return options, blocks over-return and safely retries create with the same key", async () => {
+    posApi.createReturn
+      .mockResolvedValueOnce(error("API_TIMEOUT", "Backend timeout", 504))
+      .mockResolvedValueOnce(success(posReturn));
+    const user = userEvent.setup();
+    await renderReady();
+
+    await user.click(screen.getAllByRole("button", { name: "Детали" })[0]);
+    await user.click(await screen.findByRole("button", { name: "Оформить возврат" }));
+
+    await waitFor(() => expect(posApi.getReturnOptions).toHaveBeenCalledWith("SALE-1"));
+    await screen.findByRole("heading", { name: "Оформить возврат по продаже POS-0001" });
+
+    const quantityInput = screen.getByPlaceholderText("0.000");
+    await user.type(quantityInput, "2");
+    await user.selectOptions(screen.getByLabelText("Причина возврата"), "customer_request");
+    await user.click(screen.getByRole("button", { name: "Оформить cash refund KZT" }));
+
+    expect(await screen.findByText("Доступно к возврату не больше 1.000.")).toBeTruthy();
+    expect(posApi.createReturn).not.toHaveBeenCalled();
+
+    await user.clear(quantityInput);
+    await user.type(quantityInput, "1");
+    await user.click(screen.getByRole("button", { name: "Оформить cash refund KZT" }));
+
+    await screen.findByText(
+      "Backend не ответил вовремя. Для безопасного retry используется тот же Idempotency-Key.",
+    );
+    expect(posApi.createReturn).toHaveBeenCalledWith(
+      {
+        sale_id: "SALE-1",
+        register_id: "REG-1",
+        shift_id: "SHIFT-1",
+        refund_method: "cash",
+        reason: "customer_request",
+        comment: "",
+        lines: [{ line_id: "LINE-1", quantity: "1" }],
+      },
+      "123e4567-e89b-42d3-a456-426614174000",
+    );
+
+    await user.click(screen.getByRole("button", { name: "Оформить cash refund KZT" }));
+
+    await screen.findByRole("heading", { name: "Чек возврата RET-0001" });
+    expect(posApi.createReturn).toHaveBeenCalledTimes(2);
+    expect(posApi.createReturn.mock.calls[0][1]).toBe(
+      "123e4567-e89b-42d3-a456-426614174000",
+    );
+    expect(posApi.createReturn.mock.calls[1][1]).toBe(
+      "123e4567-e89b-42d3-a456-426614174000",
+    );
+  });
+
+  it("applies returns filters and opens return detail", async () => {
+    const user = userEvent.setup();
+    await renderReady();
+
+    const returnsSection = screen
+      .getByRole("heading", { name: "История возвратов" })
+      .closest("section");
+    expect(returnsSection).toBeTruthy();
+    const returns = within(returnsSection as HTMLElement);
+
+    await user.type(returns.getByLabelText("Поиск"), "RET");
+    await user.type(returns.getByLabelText("Sale ID"), "SALE-1");
+    await user.type(returns.getByLabelText("Кассир email"), "cashier@example.test");
+    await user.selectOptions(returns.getByLabelText("Статус"), "submitted");
+    await user.type(returns.getByLabelText("Дата от"), "2026-07-08");
+    await user.type(returns.getByLabelText("Дата до"), "2026-07-09");
+    await user.click(returns.getByRole("button", { name: "Применить фильтры возвратов" }));
+
+    await waitFor(() =>
+      expect(posApi.listReturns).toHaveBeenLastCalledWith({
+        q: "RET",
+        saleId: "SALE-1",
+        registerId: "REG-1",
+        cashierEmail: "cashier@example.test",
+        dateFrom: "2026-07-08",
+        dateTo: "2026-07-09",
+        state: "submitted",
+        limit: 10,
+        offset: 0,
+      }),
+    );
+
+    const returnCard = screen.getByText("RET-0001").closest("article");
+    expect(returnCard).toBeTruthy();
+    await user.click(within(returnCard as HTMLElement).getByRole("button", { name: "Детали" }));
+
+    await waitFor(() => expect(posApi.getReturn).toHaveBeenCalledWith("RETURN-1"));
+    expect(await screen.findByRole("heading", { name: "Чек возврата RET-0001" })).toBeTruthy();
+  });
+
+  it("hides cancel action from Cashier", async () => {
+    const user = userEvent.setup();
+    await renderReady();
+
+    const returnCard = await screen.findByText("RET-0001");
+    await user.click(
+      within(returnCard.closest("article") as HTMLElement).getByRole("button", {
+        name: "Детали",
+      }),
+    );
+
+    expect(await screen.findByText("Отмена возврата доступна только Owner/Admin. Для Cashier действие скрыто.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Отменить возврат" })).toBeNull();
+  });
+
+  it("allows Owner/Admin to cancel a submitted return", async () => {
+    const user = userEvent.setup();
+    renderPOS(true, ["Owner"]);
+    await screen.findByRole("heading", { name: "Касса MyRetail" });
+    await screen.findByText("Смена открыта");
+
+    const returnCard = await screen.findByText("RET-0001");
+    await user.click(
+      within(returnCard.closest("article") as HTMLElement).getByRole("button", {
+        name: "Детали",
+      }),
+    );
+
+    await user.selectOptions(
+      await screen.findByLabelText("Причина отмены"),
+      "cashier_error",
+    );
+    await user.click(screen.getByRole("button", { name: "Отменить возврат" }));
+
+    await waitFor(() =>
+      expect(posApi.cancelReturn).toHaveBeenCalledWith(
+        "RETURN-1",
+        { reason: "cashier_error", comment: "" },
+        "123e4567-e89b-42d3-a456-426614174000",
+      ),
+    );
+    expect(await screen.findByText(/Отменён:/)).toBeTruthy();
   });
 });
