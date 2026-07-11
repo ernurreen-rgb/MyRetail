@@ -213,7 +213,7 @@ async def create_return(
     request: ReturnCreateRequest,
     service: Annotated[POSService, Depends(get_pos_service)],
     context: Annotated[TenantContext, Depends(require_tenant_context)],
-    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
 ) -> JSONResponse:
     key = _require_idempotency_key(idempotency_key)
     return await _json_response(service.create_return(context, request, key=key))
@@ -264,7 +264,7 @@ async def cancel_return(
     request: ReturnCancelRequest,
     service: Annotated[POSService, Depends(get_pos_service)],
     context: Annotated[TenantContext, Depends(require_tenant_context)],
-    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
 ) -> JSONResponse:
     key = _require_idempotency_key(idempotency_key)
     return await _json_response(service.cancel_return(context, return_id, request, key=key))

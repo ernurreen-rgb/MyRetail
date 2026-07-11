@@ -31,6 +31,7 @@ from myretail_api.models.pos import (
     Register,
     ReturnCancelRequest,
     ReturnCreateRequest,
+    ReturnHistoryItem,
     ReturnLine,
     ReturnList,
     ReturnOptions,
@@ -378,7 +379,10 @@ class POSService:
             offset=offset,
         )
         return ReturnList(
-            items=[self._to_return(row) for row in rows], count=count, limit=limit, offset=offset
+            items=[self._to_return_history(row) for row in rows],
+            count=count,
+            limit=limit,
+            offset=offset,
         )
 
     async def get_return(self, context: TenantContext, return_id: str) -> ReturnResponse:
@@ -1392,6 +1396,21 @@ class POSService:
             created_at=_parse_dt(str(row["created_at"])),
             cancelled_by=row.get("cancelled_by"),
             cancelled_at=_parse_dt(str(row["cancelled_at"])) if row.get("cancelled_at") else None,
+        )
+
+    def _to_return_history(self, row: dict[str, Any]) -> ReturnHistoryItem:
+        return ReturnHistoryItem(
+            return_id=str(row["id"]),
+            sale_id=str(row["sale_id"]),
+            receipt_number=str(row["receipt_number"]),
+            return_receipt_number=str(row["return_receipt_number"]),
+            state=row["state"],
+            refund_total=str(row["refund_total"]),
+            currency=str(row["currency"]),
+            register_id=str(row["register_id"]),
+            shift_id=str(row["shift_id"]),
+            cashier_email=str(row["cashier_email"]),
+            created_at=_parse_dt(str(row["created_at"])),
         )
 
 

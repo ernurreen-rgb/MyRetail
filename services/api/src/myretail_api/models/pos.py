@@ -379,8 +379,24 @@ class ReturnResponse(BaseModel):
     cancelled_at: datetime | None = None
 
 
+class ReturnHistoryItem(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    return_id: str
+    sale_id: str
+    receipt_number: str
+    return_receipt_number: str
+    state: ReturnState
+    refund_total: str
+    currency: str = "KZT"
+    register_id: str
+    shift_id: str
+    cashier_email: str
+    created_at: datetime
+
+
 class ReturnList(BaseModel):
-    items: list[ReturnResponse]
+    items: list[ReturnHistoryItem]
     count: int
     limit: int = 50
     offset: int = 0

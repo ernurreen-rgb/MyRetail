@@ -67,6 +67,18 @@ async def product_validation_exception_handler(
     if not _uses_api_error_contract(request.url.path):
         return await request_validation_exception_handler(request, exc)
 
+    if _is_missing_pos_return_idempotency_key(request, exc):
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "error": {
+                    "code": "VALIDATION_ERROR",
+                    "message": "Заголовок Idempotency-Key обязателен",
+                    "fields": {"Idempotency-Key": "Обязателен"},
+                }
+            },
+        )
+
     fields: dict[str, str] = {}
     for error in exc.errors():
         location = [
@@ -106,6 +118,21 @@ def _validation_message(path: str) -> str:
     if path.startswith("/stock"):
         return "Проверьте поля складской операции"
     return "Проверьте поля товара"
+
+
+def _is_missing_pos_return_idempotency_key(
+    request: Request, exc: RequestValidationError
+) -> bool:
+    path = request.url.path
+    if request.method != "POST" or not (
+        path == "/pos/returns" or (path.startswith("/pos/returns/") and path.endswith("/cancel"))
+    ):
+        return False
+    return any(
+        error.get("type") == "missing"
+        and tuple(error.get("loc", ())) == ("header", "Idempotency-Key")
+        for error in exc.errors()
+    )
 
 
 def _default_product_error(status_code: int) -> dict[str, Any]:
