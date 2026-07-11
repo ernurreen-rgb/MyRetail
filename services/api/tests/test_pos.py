@@ -1350,10 +1350,85 @@ async def test_returns_history_filters_count_and_openapi(tmp_path: Path) -> None
     assert history.status_code == 200
     assert history.json()["count"] == 1
     assert len(history.json()["items"]) == 1
+    history_item = history.json()["items"][0]
+    assert history_item["refund_total"] == "100.00"
+    assert history_item["cashier_email"] == "cashier@example.kz"
+    assert "totals" not in history_item
+    assert "created_by" not in history_item
     assert detail.status_code == 200
     assert "/pos/returns" in schema["paths"]
     assert "/pos/returns/{return_id}/cancel" in schema["paths"]
     assert "/pos/sales/{sale_id}/return-options" in schema["paths"]
+    return_list = schema["components"]["schemas"]["ReturnList"]
+    history_ref = return_list["properties"]["items"]["items"]["$ref"]
+    assert history_ref == "#/components/schemas/ReturnHistoryItem"
+    history_schema = schema["components"]["schemas"]["ReturnHistoryItem"]
+    assert {"refund_total", "cashier_email"} <= set(history_schema["required"])
+    assert "totals" not in history_schema["properties"]
+    assert "created_by" not in history_schema["properties"]
+    create_headers = {
+        parameter["name"]: parameter
+        for parameter in schema["paths"]["/pos/returns"]["post"]["parameters"]
+    }
+    cancel_headers = {
+        parameter["name"]: parameter
+        for parameter in schema["paths"]["/pos/returns/{return_id}/cancel"]["post"][
+            "parameters"
+        ]
+    }
+    assert create_headers["Idempotency-Key"]["required"] is True
+    assert cancel_headers["Idempotency-Key"]["required"] is True
+
+
+@pytest.mark.anyio
+async def test_return_idempotency_header_validation(tmp_path: Path) -> None:
+    erpnext = StubPOSErpnextClient()
+    app = make_app(erpnext, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        shift = await open_shift(client, tmp_path)
+        sale = await create_sale(client, tmp_path, shift_id=str(shift["id"]))
+        body = {
+            "sale_id": sale["id"],
+            "register_id": "POS-1",
+            "shift_id": shift["id"],
+            "refund_method": "cash",
+            "reason": "other",
+            "lines": [{"line_id": f"{sale['id']}:line:1", "quantity": "1.000"}],
+        }
+        missing_create = await client.post(
+            "/pos/returns", headers=auth_headers(tmp_path), json=body
+        )
+        invalid_create = await client.post(
+            "/pos/returns",
+            headers=auth_headers(tmp_path, key="not-a-uuid"),
+            json=body,
+        )
+        created = await client.post(
+            "/pos/returns", headers=auth_headers(tmp_path, key=str(uuid4())), json=body
+        )
+        return_id = created.json()["return_id"]
+        missing_cancel = await client.post(
+            f"/pos/returns/{return_id}/cancel",
+            headers=auth_headers(tmp_path, roles=["Owner"]),
+            json={"reason": "other"},
+        )
+        invalid_cancel = await client.post(
+            f"/pos/returns/{return_id}/cancel",
+            headers=auth_headers(tmp_path, roles=["Owner"], key="not-a-uuid"),
+            json={"reason": "other"},
+        )
+
+    assert missing_create.status_code == 400
+    assert missing_create.json()["error"]["code"] == "VALIDATION_ERROR"
+    assert invalid_create.status_code == 400
+    assert invalid_create.json()["error"]["code"] == "VALIDATION_ERROR"
+    assert created.status_code == 201
+    assert missing_cancel.status_code == 400
+    assert missing_cancel.json()["error"]["code"] == "VALIDATION_ERROR"
+    assert invalid_cancel.status_code == 400
+    assert invalid_cancel.json()["error"]["code"] == "VALIDATION_ERROR"
 
 
 @pytest.mark.anyio
@@ -1489,5 +1564,5 @@ async def test_returns_scope_and_owner_history_filters(tmp_path: Path) -> None:
     assert cashier_history.json()["items"][0]["register_id"] == "POS-1"
     assert owner_history.status_code == 200
     assert owner_history.json()["count"] == 1
-    assert owner_history.json()["items"][0]["created_by"] == "other@example.kz"
+    assert owner_history.json()["items"][0]["cashier_email"] == "other@example.kz"
     assert foreign_detail.status_code == 404
