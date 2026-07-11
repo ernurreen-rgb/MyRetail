@@ -436,6 +436,339 @@ class POSStore:
             ).fetchone()
         return _dict(row)
 
+    def get_return(self, tenant: str, return_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM pos_returns WHERE tenant = ? AND id = ?",
+                (tenant, return_id),
+            ).fetchone()
+        return _dict(row)
+
+    def get_return_by_idempotency(
+        self, tenant: str, operation: str, user_email: str, key: str
+    ) -> dict[str, Any] | None:
+        if operation != "create_return":
+            return None
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM pos_returns
+                WHERE tenant = ? AND created_by_email = ? AND idempotency_key = ?
+                """,
+                (tenant, user_email, key),
+            ).fetchone()
+        return _dict(row)
+
+    def create_pending_return(
+        self,
+        *,
+        row: dict[str, Any],
+        requested_lines: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            sale = connection.execute(
+                "SELECT * FROM pos_sales WHERE tenant = ? AND id = ?",
+                (row["tenant"], row["sale_id"]),
+            ).fetchone()
+            if sale is None:
+                connection.rollback()
+                raise POSStoreConflictError("SALE_NOT_FOUND", "Продажа не найдена")
+
+            pending = connection.execute(
+                """
+                SELECT id FROM pos_returns
+                WHERE tenant = ? AND sale_id = ? AND state = 'pending_recovery'
+                LIMIT 1
+                """,
+                (row["tenant"], row["sale_id"]),
+            ).fetchone()
+            if pending is not None:
+                connection.rollback()
+                raise POSStoreConflictError(
+                    "RETURN_RECOVERY_REQUIRED",
+                    "По продаже уже есть возврат, ожидающий recovery",
+                    {"return_id": str(pending[0])},
+                )
+
+            sale_lines = json.loads(str(sale["lines_json"]))
+            returned_by_line: dict[str, Decimal] = {}
+            existing = connection.execute(
+                """
+                SELECT lines_json FROM pos_returns
+                WHERE tenant = ? AND sale_id = ? AND state = 'submitted'
+                """,
+                (row["tenant"], row["sale_id"]),
+            ).fetchall()
+            for existing_row in existing:
+                for line in json.loads(str(existing_row[0])):
+                    line_id = str(line["line_id"])
+                    returned_by_line[line_id] = returned_by_line.get(line_id, Decimal("0")) + (
+                        Decimal(str(line["quantity"]))
+                    )
+
+            if sale_lines and all(
+                Decimal(str(source["quantity"])) - returned_by_line.get(
+                    _sale_line_id(str(row["sale_id"]), index), Decimal("0")
+                )
+                <= Decimal("0")
+                for index, source in enumerate(sale_lines)
+            ):
+                connection.rollback()
+                raise POSStoreConflictError(
+                    "SALE_ALREADY_FULLY_RETURNED", "Продажа уже возвращена полностью"
+                )
+
+            snapshot: list[dict[str, str]] = []
+            for requested in requested_lines:
+                line_id = requested["line_id"]
+                index = _sale_line_index(str(row["sale_id"]), line_id)
+                if index is None or index >= len(sale_lines):
+                    connection.rollback()
+                    raise POSStoreConflictError(
+                        "RETURN_LINE_NOT_FOUND", "Строка продажи не найдена", {"line_id": line_id}
+                    )
+                source = sale_lines[index]
+                if line_id != _sale_line_id(str(row["sale_id"]), index):
+                    connection.rollback()
+                    raise POSStoreConflictError(
+                        "RETURN_LINE_NOT_FOUND", "Строка продажи не найдена", {"line_id": line_id}
+                    )
+                requested_quantity = Decimal(requested["quantity"])
+                sold_quantity = Decimal(str(source["quantity"]))
+                net_unit_price = _net_unit_price(source)
+                already_returned = returned_by_line.get(line_id, Decimal("0"))
+                available = sold_quantity - already_returned
+                if requested_quantity > available:
+                    connection.rollback()
+                    raise POSStoreConflictError(
+                        "RETURN_QUANTITY_EXCEEDED",
+                        "Количество возврата больше доступного",
+                        {
+                            "line_id": line_id,
+                            "available_to_return_quantity": _format_quantity(available),
+                        },
+                    )
+                snapshot.append(
+                    {
+                        "line_id": line_id,
+                        "item_id": str(source["product_id"]),
+                        "item_name": str(source["name"]),
+                        "quantity": _format_quantity(requested_quantity),
+                        "unit": str(source["unit"]),
+                        "unit_price": _format_money(net_unit_price),
+                        "line_total": _format_money(
+                            requested_quantity * net_unit_price
+                        ),
+                    }
+                )
+
+            insert_row = {**row, "lines_json": json.dumps(snapshot, ensure_ascii=False)}
+            connection.execute(
+                """
+                INSERT INTO pos_returns (
+                    id, tenant, sale_id, receipt_number, return_receipt_number, state,
+                    refund_method, reason, comment, register_id, shift_id, cashier_email,
+                    currency, refund_total, lines_json, erpnext_return_invoice_id,
+                    idempotency_key, created_by_email, created_at, cancelled_by,
+                    cancelled_at, cancel_reason, cancel_comment, updated_at
+                ) VALUES (
+                    :id, :tenant, :sale_id, :receipt_number, :return_receipt_number, :state,
+                    :refund_method, :reason, :comment, :register_id, :shift_id, :cashier_email,
+                    :currency, :refund_total, :lines_json, :erpnext_return_invoice_id,
+                    :idempotency_key, :created_by_email, :created_at,
+                    NULL, NULL, NULL, NULL, :updated_at
+                )
+                """,
+                insert_row,
+            )
+            connection.commit()
+        return self.get_return(str(row["tenant"]), str(row["id"])) or insert_row
+
+    def delete_pending_return(self, tenant: str, return_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM pos_returns "
+                "WHERE tenant = ? AND id = ? AND state = 'pending_recovery'",
+                (tenant, return_id),
+            )
+
+    def claim_return_cancel(self, tenant: str, return_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM pos_returns WHERE tenant = ? AND id = ?",
+                (tenant, return_id),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                return {}
+            state = str(row["state"])
+            if state == "cancel_pending":
+                connection.rollback()
+                raise POSStoreConflictError(
+                    "RETURN_CANCEL_NOT_ALLOWED", "Отмена возврата уже выполняется"
+                )
+            if state != "submitted":
+                connection.rollback()
+                return dict(row)
+            connection.execute(
+                "UPDATE pos_returns SET state = 'cancel_pending', updated_at = ? "
+                "WHERE tenant = ? AND id = ? AND state = 'submitted'",
+                (_now(), tenant, return_id),
+            )
+            connection.commit()
+        return self.get_return(tenant, return_id) or {}
+
+    def mark_return_submitted(
+        self, tenant: str, return_id: str, erpnext_invoice_id: str
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE pos_returns
+                SET state = 'submitted', erpnext_return_invoice_id = ?,
+                    return_receipt_number = ?, updated_at = ?
+                WHERE tenant = ? AND id = ? AND state = 'pending_recovery'
+                """,
+                (erpnext_invoice_id, erpnext_invoice_id, _now(), tenant, return_id),
+            )
+        return self.get_return(tenant, return_id) or {}
+
+    def mark_return_cancelled(
+        self,
+        *,
+        tenant: str,
+        return_id: str,
+        cancelled_by: str,
+        reason: str,
+        comment: str | None,
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE pos_returns
+                SET state = 'cancelled', cancelled_by = ?, cancelled_at = ?,
+                    cancel_reason = ?, cancel_comment = ?, updated_at = ?
+                WHERE tenant = ? AND id = ? AND state = 'cancel_pending'
+                """,
+                (
+                    cancelled_by,
+                    _now(),
+                    reason,
+                    comment,
+                    _now(),
+                    tenant,
+                    return_id,
+                ),
+            )
+        return self.get_return(tenant, return_id) or {}
+
+    def release_return_cancel(self, tenant: str, return_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE pos_returns SET state = 'submitted', updated_at = ? "
+                "WHERE tenant = ? AND id = ? AND state = 'cancel_pending'",
+                (_now(), tenant, return_id),
+            )
+
+    def return_options(
+        self, tenant: str, sale_id: str
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        sale = self.get_sale(tenant, sale_id)
+        if sale is None:
+            return None, []
+        returned_by_line: dict[str, Decimal] = {}
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT lines_json FROM pos_returns
+                WHERE tenant = ? AND sale_id = ? AND state = 'submitted'
+                """,
+                (tenant, sale_id),
+            ).fetchall()
+        for row in rows:
+            for line in json.loads(str(row[0])):
+                line_id = str(line["line_id"])
+                returned_by_line[line_id] = returned_by_line.get(line_id, Decimal("0")) + Decimal(
+                    str(line["quantity"])
+                )
+        result: list[dict[str, Any]] = []
+        for index, source in enumerate(json.loads(str(sale["lines_json"]))):
+            line_id = _sale_line_id(sale_id, index)
+            sold = Decimal(str(source["quantity"]))
+            returned = returned_by_line.get(line_id, Decimal("0"))
+            available = max(Decimal("0"), sold - returned)
+            net_unit_price = _net_unit_price(source)
+            result.append(
+                {
+                    "line_id": line_id,
+                    "item_id": str(source["product_id"]),
+                    "item_name": str(source["name"]),
+                    "sold_quantity": _format_quantity(sold),
+                    "already_returned_quantity": _format_quantity(returned),
+                    "available_to_return_quantity": _format_quantity(available),
+                    "unit": str(source["unit"]),
+                    "unit_price": _format_money(net_unit_price),
+                    "net_unit_price": _format_money(net_unit_price),
+                    "line_total": _format_money(sold * net_unit_price),
+                }
+            )
+        return sale, result
+
+    def list_returns(
+        self,
+        *,
+        tenant: str,
+        cashier_email: str | None,
+        q: str | None,
+        sale_id: str | None,
+        register_id: str | None,
+        date_from: date | None,
+        date_to: date | None,
+        state: str | None,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[dict[str, Any]], int]:
+        filters = ["tenant = ?"]
+        params: list[Any] = [tenant]
+        if cashier_email:
+            filters.append("cashier_email = ?")
+            params.append(cashier_email)
+        if q and q.strip():
+            pattern = f"%{q.strip()}%"
+            filters.append(
+                "(id LIKE ? OR sale_id LIKE ? OR receipt_number LIKE ? "
+                "OR return_receipt_number LIKE ?)"
+            )
+            params.extend([pattern] * 4)
+        if sale_id:
+            filters.append("sale_id = ?")
+            params.append(sale_id)
+        if register_id:
+            filters.append("register_id = ?")
+            params.append(register_id)
+        if date_from:
+            filters.append("created_at >= ?")
+            params.append(_date_start(date_from))
+        if date_to:
+            filters.append("created_at < ?")
+            params.append(_date_start(date_to + timedelta(days=1)))
+        if state:
+            filters.append("state = ?")
+            params.append(state)
+        where = " AND ".join(filters)
+        with self._connect() as connection:
+            count = connection.execute(
+                f"SELECT COUNT(*) FROM pos_returns WHERE {where}", params
+            ).fetchone()[0]
+            rows = connection.execute(
+                f"SELECT * FROM pos_returns WHERE {where} "
+                "ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                [*params, limit, offset],
+            ).fetchall()
+        return [_dict(row) for row in rows if row is not None], int(count)
+
     def list_sales(
         self,
         *,
@@ -585,6 +918,45 @@ class POSStore:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pos_returns (
+                    id TEXT PRIMARY KEY,
+                    tenant TEXT NOT NULL,
+                    sale_id TEXT NOT NULL,
+                    receipt_number TEXT NOT NULL,
+                    return_receipt_number TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    refund_method TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    comment TEXT,
+                    register_id TEXT NOT NULL,
+                    shift_id TEXT NOT NULL,
+                    cashier_email TEXT NOT NULL,
+                    currency TEXT NOT NULL,
+                    refund_total TEXT NOT NULL,
+                    lines_json TEXT NOT NULL,
+                    erpnext_return_invoice_id TEXT,
+                    idempotency_key TEXT NOT NULL,
+                    created_by_email TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    cancelled_by TEXT,
+                    cancelled_at TEXT,
+                    cancel_reason TEXT,
+                    cancel_comment TEXT,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (tenant, created_by_email, idempotency_key)
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS pos_returns_sale_state "
+                "ON pos_returns(tenant, sale_id, state)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS pos_returns_created_at "
+                "ON pos_returns(tenant, created_at)"
+            )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._database_path, timeout=30)
@@ -609,6 +981,39 @@ def _now() -> str:
 
 def _timestamp(value: float) -> str:
     return datetime.fromtimestamp(value, UTC).isoformat().replace("+00:00", "Z")
+
+
+def _sale_line_id(sale_id: str, index: int) -> str:
+    return f"{sale_id}:line:{index + 1}"
+
+
+def _sale_line_index(sale_id: str, line_id: str) -> int | None:
+    prefix = f"{sale_id}:line:"
+    if not line_id.startswith(prefix):
+        return None
+    try:
+        index = int(line_id[len(prefix) :]) - 1
+    except ValueError:
+        return None
+    return index if index >= 0 else None
+
+
+def _format_quantity(value: Decimal) -> str:
+    return f"{value.quantize(Decimal('0.001')):.3f}"
+
+
+def _format_money(value: Decimal) -> str:
+    return f"{value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):.2f}"
+
+
+def _net_unit_price(source: dict[str, Any]) -> Decimal:
+    quantity = Decimal(str(source["quantity"]))
+    total = Decimal(str(source.get("total") or source["unit_price"]))
+    if not source.get("total"):
+        total *= quantity
+    if quantity <= Decimal("0"):
+        return Decimal("0")
+    return total / quantity
 
 
 def _date_start(value: date) -> str:

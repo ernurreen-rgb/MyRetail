@@ -11,7 +11,7 @@ import httpx
 
 from myretail_api.config import Settings
 from myretail_api.models.auth import AuthenticatedUser
-from myretail_api.models.pos import POSProduct, POSProductList, Register, SaleLine, Shift
+from myretail_api.models.pos import POSProduct, POSProductList, Register, Sale, SaleLine, Shift
 from myretail_api.models.products import (
     Product,
     ProductCreate,
@@ -620,6 +620,167 @@ class ERPNextClient:
                     "INSUFFICIENT_STOCK", "Недостаточно товара на складе"
                 ) from exc
             raise
+
+    async def create_pos_sales_return(
+        self,
+        *,
+        tenant: str,
+        return_id: str,
+        sale: Sale,
+        shift: Shift,
+        lines: list[dict[str, str]],
+        refund_total: str,
+        reason: str,
+        comment: str | None,
+        actor_email: str,
+        idempotency_key: str,
+    ) -> str:
+        pos_headers = self._pos_headers_for_register(shift.register.id)
+        marker = self._pos_idempotency_marker(tenant, "create_return", actor_email, idempotency_key)
+        # Cash refunds must stay on the POS payment path; a closed/stale opening
+        # is rejected explicitly instead of silently becoming a non-cash return.
+        is_pos = 1
+        payload: dict[str, Any] = {
+            "doctype": "Sales Invoice",
+            "naming_series": "ACC-SINV-.YYYY.-",
+            "is_return": 1,
+            "return_against": sale.receipt_number,
+            "is_pos": is_pos,
+            "is_created_using_pos": is_pos,
+            "pos_profile": shift.register.id if is_pos else None,
+            "company": self._company,
+            "customer": "Walk-in Customer",
+            "posting_date": date.today().isoformat(),
+            "posting_time": datetime.now().strftime("%H:%M:%S"),
+            "set_posting_time": 1,
+            "currency": self._currency,
+            "conversion_rate": 1,
+            "selling_price_list": self._selling_price_list,
+            "price_list_currency": self._currency,
+            "plc_conversion_rate": 1,
+            "update_stock": 1,
+            "set_warehouse": shift.warehouse.id,
+            "items": [
+                {
+                    "item_code": line["item_id"],
+                    "qty": -float(Decimal(line["quantity"])),
+                    "rate": float(Decimal(line["unit_price"])),
+                    "warehouse": shift.warehouse.id,
+                }
+                for line in lines
+            ],
+            "myretail_tenant": tenant,
+            "myretail_return_id": return_id,
+            "myretail_return_idempotency_key": marker,
+            "myretail_return_sale_id": sale.id,
+            "myretail_return_shift_id": sale.shift_id,
+            "myretail_return_register_id": sale.register.id,
+            "myretail_return_cashier_email": actor_email,
+            "myretail_return_reason": reason,
+            "remarks": json.dumps(
+                {
+                    "myretail_return": {
+                        "tenant": tenant,
+                        "return_id": return_id,
+                        "sale_id": sale.id,
+                        "idempotency_marker": marker,
+                        "reason": reason,
+                        "comment": comment,
+                    }
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        }
+        amount = -float(Decimal(refund_total))
+        payload.update(
+            {
+                "payments": [{"mode_of_payment": "Cash", "amount": amount}],
+                "paid_amount": amount,
+                "base_paid_amount": amount,
+                "change_amount": 0,
+                "account_for_change_amount": "Cash - MRD",
+            }
+        )
+        try:
+            body = await self._request_json(
+                "POST",
+                "/api/resource/Sales Invoice",
+                json_payload=payload,
+                headers=pos_headers,
+            )
+            doc = body.get("data")
+            if not isinstance(doc, Mapping):
+                raise ERPNextUnavailableError("ERPNext return response is invalid")
+            submitted = await self._submit_doc(doc, headers=pos_headers)
+            return str(submitted.get("name") or doc.get("name"))
+        except ERPNextTimeoutError as exc:
+            raise ERPNextAmbiguousCreateError("Sales Return may have been created") from exc
+        except ERPNextValidationError:
+            recovered = await self.recover_pos_return(
+                tenant, "create_return", actor_email, idempotency_key
+            )
+            if recovered is not None:
+                return recovered
+            existing = await self._find_pos_return_document(
+                tenant, "create_return", actor_email, idempotency_key
+            )
+            if existing is not None:
+                raise ERPNextAmbiguousCreateError(
+                    "Sales Return draft may have been created"
+                ) from None
+            raise
+
+    async def recover_pos_return(
+        self, tenant: str, operation: str, user_email: str, idempotency_key: str
+    ) -> str | None:
+        rows = await self._find_pos_return_rows(tenant, operation, user_email, idempotency_key)
+        for row in rows:
+            if int(row.get("docstatus") or 0) == 1:
+                return str(row["name"])
+        return None
+
+    async def _find_pos_return_document(
+        self, tenant: str, operation: str, user_email: str, idempotency_key: str
+    ) -> str | None:
+        rows = await self._find_pos_return_rows(tenant, operation, user_email, idempotency_key)
+        return str(rows[0]["name"]) if rows else None
+
+    async def _find_pos_return_rows(
+        self, tenant: str, operation: str, user_email: str, idempotency_key: str
+    ) -> list[Mapping[str, Any]]:
+        marker = self._pos_idempotency_marker(tenant, operation, user_email, idempotency_key)
+        return await self._query_resource(
+            "Sales Invoice",
+            fields=["name", "docstatus"],
+            filters=[
+                ["Sales Invoice", "myretail_tenant", "=", tenant],
+                ["Sales Invoice", "myretail_return_idempotency_key", "=", marker],
+            ],
+            limit=1,
+        )
+
+    async def cancel_pos_return(
+        self, invoice_id: str, *, reason: str, comment: str | None
+    ) -> None:
+        _ = reason, comment
+        try:
+            await self._request_json(
+                "POST",
+                "/api/method/frappe.client.cancel",
+                json_payload={"doctype": "Sales Invoice", "name": invoice_id},
+            )
+        except ERPNextTimeoutError as exc:
+            raise ERPNextAmbiguousCreateError("Sales Return cancel may have completed") from exc
+
+    async def get_pos_return_docstatus(self, invoice_id: str) -> int:
+        body = await self._request_json(
+            "GET", f"/api/resource/Sales Invoice/{quote(invoice_id, safe='')}"
+        )
+        data = body.get("data")
+        if not isinstance(data, Mapping) or data.get("docstatus") is None:
+            raise ERPNextUnavailableError("ERPNext return state is invalid")
+        return int(data["docstatus"])
 
     async def recover_pos_opening(
         self, tenant: str, operation: str, user_email: str, idempotency_key: str
@@ -3658,9 +3819,15 @@ class ERPNextClient:
             return "ERPNext отклонил данные товара"
 
         if isinstance(payload, Mapping):
-            message = payload.get("message") or payload.get("exception")
-            if isinstance(message, str) and message:
-                return message
+            messages = [
+                payload.get("message"),
+                payload.get("exception"),
+                payload.get("exc"),
+                payload.get("_server_messages"),
+            ]
+            text = " ".join(str(message) for message in messages if message)
+            if text:
+                return text
         return "ERPNext отклонил данные товара"
 
     @staticmethod

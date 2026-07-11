@@ -29,6 +29,14 @@ from myretail_api.models.pos import (
     POSOptions,
     POSProductList,
     Register,
+    ReturnCancelRequest,
+    ReturnCreateRequest,
+    ReturnLine,
+    ReturnList,
+    ReturnOptions,
+    ReturnOptionsLine,
+    ReturnResponse,
+    ReturnTotals,
     Sale,
     SaleCreateRequest,
     SaleLine,
@@ -289,7 +297,120 @@ class POSService:
             and sale.cashier.email != context.user.email
         ):
             raise POSApiError(404, "SALE_NOT_FOUND", "Продажа не найдена")
-        return sale
+        return self._with_return_summary(sale, context.tenant)
+
+    async def return_options(self, context: TenantContext, sale_id: str) -> ReturnOptions:
+        self._require_pos_role(context)
+        sale = await self.get_sale(context, sale_id)
+        _, lines = self._store.return_options(context.tenant, sale_id)
+        return ReturnOptions(
+            sale_id=sale.id,
+            receipt_number=sale.receipt_number,
+            return_status=sale.return_status,
+            register_id=sale.register.id,
+            shift_id=sale.shift_id,
+            cashier_email=sale.cashier.email,
+            created_at=sale.created_at,
+            currency=sale.currency,
+            lines=[ReturnOptionsLine(**line) for line in lines],
+            totals=ReturnTotals(
+                refund_total=format_money(
+                    sum(
+                        (
+                            Decimal(str(line["available_to_return_quantity"]))
+                            * Decimal(str(line["net_unit_price"]))
+                            for line in lines
+                        ),
+                        Decimal("0.00"),
+                    )
+                ),
+                sold_total=sale.grand_total,
+                already_returned_total=sale.returned_total,
+                available_to_return_total=format_money(
+                    Decimal(sale.grand_total) - Decimal(sale.returned_total)
+                ),
+            ),
+        )
+
+    async def create_return(
+        self, context: TenantContext, request: ReturnCreateRequest, *, key: str
+    ) -> tuple[int, dict[str, object]]:
+        self._require_pos_role(context)
+        return await self._idempotent(
+            context,
+            operation="create_return",
+            key=key,
+            payload=request.model_dump(mode="json"),
+            success_status=201,
+            conflict_code="IDEMPOTENCY_KEY_REUSED",
+            execute=lambda: self._create_return_once(context, request, key),
+            recover=lambda: self._recover_return(context, key),
+        )
+
+    async def list_returns(
+        self,
+        context: TenantContext,
+        *,
+        q: str | None,
+        sale_id: str | None,
+        register_id: str | None,
+        cashier_email: str | None,
+        date_from: date | None,
+        date_to: date | None,
+        state: str | None,
+        limit: int,
+        offset: int,
+    ) -> ReturnList:
+        self._require_pos_role(context)
+        effective_cashier = (
+            cashier_email if ADMIN_ROLES.intersection(context.user.roles) else context.user.email
+        )
+        rows, count = self._store.list_returns(
+            tenant=context.tenant,
+            cashier_email=effective_cashier,
+            q=q,
+            sale_id=sale_id,
+            register_id=register_id,
+            date_from=date_from,
+            date_to=date_to,
+            state=state,
+            limit=limit,
+            offset=offset,
+        )
+        return ReturnList(
+            items=[self._to_return(row) for row in rows], count=count, limit=limit, offset=offset
+        )
+
+    async def get_return(self, context: TenantContext, return_id: str) -> ReturnResponse:
+        self._require_pos_role(context)
+        row = self._store.get_return(context.tenant, return_id)
+        if row is None:
+            raise POSApiError(404, "RETURN_NOT_FOUND", "Возврат не найден")
+        self._ensure_return_scope(context, row)
+        return self._to_return(row)
+
+    async def cancel_return(
+        self,
+        context: TenantContext,
+        return_id: str,
+        request: ReturnCancelRequest,
+        *,
+        key: str,
+    ) -> tuple[int, dict[str, object]]:
+        self._require_pos_role(context)
+        if not ADMIN_ROLES.intersection(context.user.roles):
+            raise POSApiError(403, "POS_FORBIDDEN", "Отменять возврат может только Owner/Admin")
+        payload = {"return_id": return_id, **request.model_dump(mode="json")}
+        return await self._idempotent(
+            context,
+            operation="cancel_return",
+            key=key,
+            payload=payload,
+            success_status=200,
+            conflict_code="IDEMPOTENCY_KEY_REUSED",
+            execute=lambda: self._cancel_return_once(context, return_id, request),
+            recover=lambda: self._recover_cancel_return(context, return_id, request),
+        )
 
     async def _open_shift_once(
         self, context: TenantContext, request: ShiftOpenRequest, key: str
@@ -488,6 +609,222 @@ class POSService:
             self._store.complete_held_receipt(context.tenant, held.id)
         return self._to_sale(row)
 
+    async def _create_return_once(
+        self, context: TenantContext, request: ReturnCreateRequest, key: str
+    ) -> ReturnResponse:
+        sale = await self.get_sale(context, request.sale_id)
+        if sale.register.id != request.register_id or sale.shift_id != request.shift_id:
+            raise POSApiError(404, "SALE_NOT_FOUND", "Продажа не найдена")
+        shift_row = self._store.get_shift(context.tenant, request.shift_id)
+        if shift_row is None:
+            raise POSApiError(409, "SHIFT_NOT_OPEN", "Смена не найдена")
+        shift = self._to_shift(shift_row)
+        if not ADMIN_ROLES.intersection(context.user.roles):
+            if shift.cashier.email != context.user.email:
+                raise POSApiError(403, "POS_FORBIDDEN", "Продажа недоступна для этого кассира")
+            if shift.status != "open":
+                raise POSApiError(
+                    409,
+                    "SHIFT_NOT_OPEN",
+                    "Возврат кассира возможен только в открытой смене",
+                )
+
+        _, option_rows = self._store.return_options(context.tenant, sale.id)
+        options = {str(row["line_id"]): row for row in option_rows}
+        if option_rows and all(
+            Decimal(str(option["available_to_return_quantity"])) <= Decimal("0")
+            for option in option_rows
+        ):
+            raise POSApiError(
+                409, "SALE_ALREADY_FULLY_RETURNED", "Продажа уже возвращена полностью"
+            )
+        snapshot: list[dict[str, str]] = []
+        for requested in request.lines:
+            option = options.get(requested.line_id)
+            if option is None:
+                raise POSApiError(409, "RETURN_LINE_NOT_FOUND", "Строка продажи не найдена")
+            quantity = Decimal(requested.quantity)
+            available = Decimal(str(option["available_to_return_quantity"]))
+            if quantity > available:
+                raise POSApiError(
+                    409,
+                    "RETURN_QUANTITY_EXCEEDED",
+                    "Количество возврата больше доступного",
+                    {
+                        "line_id": requested.line_id,
+                        "available_to_return_quantity": option["available_to_return_quantity"],
+                    },
+                )
+            snapshot.append(
+                {
+                    "line_id": requested.line_id,
+                    "item_id": str(option["item_id"]),
+                    "item_name": str(option["item_name"]),
+                    "quantity": format_quantity(quantity),
+                    "unit": str(option["unit"]),
+                    "unit_price": str(option["net_unit_price"]),
+                    "line_total": format_money(quantity * Decimal(str(option["net_unit_price"]))),
+                }
+            )
+        refund_total = format_money(
+            sum((Decimal(line["line_total"]) for line in snapshot), Decimal("0.00"))
+        )
+        return_id = f"RETURN-{uuid4().hex[:12].upper()}"
+        now = _now()
+        try:
+            self._store.create_pending_return(
+                row={
+                    "id": return_id,
+                    "tenant": context.tenant,
+                    "sale_id": sale.id,
+                    "receipt_number": sale.receipt_number,
+                    "return_receipt_number": "",
+                    "state": "pending_recovery",
+                    "refund_method": request.refund_method,
+                    "reason": request.reason,
+                    "comment": request.comment,
+                    "register_id": sale.register.id,
+                    "shift_id": sale.shift_id,
+                    "cashier_email": sale.cashier.email,
+                    "currency": sale.currency,
+                    "refund_total": refund_total,
+                    "erpnext_return_invoice_id": None,
+                    "idempotency_key": key,
+                    "created_by_email": context.user.email,
+                    "created_at": now,
+                    "updated_at": now,
+                },
+                requested_lines=[
+                    {"line_id": line["line_id"], "quantity": line["quantity"]}
+                    for line in snapshot
+                ],
+            )
+            invoice_id = await self._call_erp(
+                self._erpnext.create_pos_sales_return(
+                    tenant=context.tenant,
+                    return_id=return_id,
+                    sale=sale,
+                    shift=shift,
+                    lines=snapshot,
+                    refund_total=refund_total,
+                    reason=request.reason,
+                    comment=request.comment,
+                    actor_email=context.user.email,
+                    idempotency_key=key,
+                )
+            )
+        except POSStoreConflictError as exc:
+            self._store.delete_pending_return(context.tenant, return_id)
+            raise POSApiError(409, exc.code, exc.message, exc.fields) from exc
+        except POSApiError as exc:
+            self._store.delete_pending_return(context.tenant, return_id)
+            if shift.status == "closed" and exc.code == "VALIDATION_ERROR":
+                raise POSApiError(
+                    409,
+                    "POS_OPENING_OUTDATED",
+                    "POS Opening Entry неактуальна для cash refund",
+                ) from exc
+            raise
+        except ERPNextAmbiguousCreateError:
+            raise
+        except Exception:
+            self._store.delete_pending_return(context.tenant, return_id)
+            raise
+        submitted = self._store.mark_return_submitted(context.tenant, return_id, invoice_id)
+        return self._to_return(submitted)
+
+    async def _recover_return(self, context: TenantContext, key: str) -> ReturnResponse | None:
+        row = self._store.get_return_by_idempotency(
+            context.tenant, "create_return", context.user.email, key
+        )
+        if row is None:
+            return None
+        invoice_id = await self._erpnext.recover_pos_return(
+            context.tenant, "create_return", context.user.email, key
+        )
+        if invoice_id is None:
+            raise POSApiError(
+                503,
+                "RETURN_RECOVERY_REQUIRED",
+                "Результат возврата ERPNext нельзя безопасно подтвердить",
+                {"return_id": str(row["id"])},
+            )
+        return self._to_return(
+            self._store.mark_return_submitted(context.tenant, str(row["id"]), invoice_id)
+        )
+
+    async def _cancel_return_once(
+        self, context: TenantContext, return_id: str, request: ReturnCancelRequest
+    ) -> ReturnResponse:
+        row = self._store.get_return(context.tenant, return_id)
+        if row is None:
+            raise POSApiError(404, "RETURN_NOT_FOUND", "Возврат не найден")
+        self._ensure_return_scope(context, row)
+        if row["state"] == "cancelled":
+            raise POSApiError(409, "RETURN_ALREADY_CANCELLED", "Возврат уже отменён")
+        try:
+            claimed = self._store.claim_return_cancel(context.tenant, return_id)
+        except POSStoreConflictError as exc:
+            raise POSApiError(409, exc.code, exc.message, exc.fields) from exc
+        if not claimed:
+            raise POSApiError(404, "RETURN_NOT_FOUND", "Возврат не найден")
+        if claimed["state"] == "cancelled":
+            raise POSApiError(409, "RETURN_ALREADY_CANCELLED", "Возврат уже отменён")
+        if claimed["state"] != "cancel_pending" or not claimed.get("erpnext_return_invoice_id"):
+            raise POSApiError(503, "RETURN_RECOVERY_REQUIRED", "Возврат ещё не подтверждён ERPNext")
+        try:
+            await self._call_erp(
+                self._erpnext.cancel_pos_return(
+                    str(claimed["erpnext_return_invoice_id"]),
+                    reason=request.reason,
+                    comment=request.comment,
+                )
+            )
+        except ERPNextAmbiguousCreateError:
+            raise
+        except Exception:
+            self._store.release_return_cancel(context.tenant, return_id)
+            raise
+        return self._to_return(
+            self._store.mark_return_cancelled(
+                tenant=context.tenant,
+                return_id=return_id,
+                cancelled_by=context.user.email,
+                reason=request.reason,
+                comment=request.comment,
+            )
+        )
+
+    async def _recover_cancel_return(
+        self, context: TenantContext, return_id: str, request: ReturnCancelRequest
+    ) -> ReturnResponse | None:
+        row = self._store.get_return(context.tenant, return_id)
+        if row is None:
+            return None
+        if row["state"] == "cancelled":
+            raise POSApiError(409, "RETURN_ALREADY_CANCELLED", "Возврат уже отменён")
+        if not row.get("erpnext_return_invoice_id"):
+            raise POSApiError(503, "RETURN_RECOVERY_REQUIRED", "ERPNext return id отсутствует")
+        docstatus = await self._erpnext.get_pos_return_docstatus(
+            str(row["erpnext_return_invoice_id"])
+        )
+        if docstatus == 2:
+            return self._to_return(
+                self._store.mark_return_cancelled(
+                    tenant=context.tenant,
+                    return_id=return_id,
+                    cancelled_by=context.user.email,
+                    reason=request.reason,
+                    comment=request.comment,
+                )
+            )
+        raise POSApiError(
+            503,
+            "RETURN_RECOVERY_REQUIRED",
+            "Результат отмены возврата ERPNext нельзя безопасно подтвердить",
+            {"return_id": return_id},
+        )
+
     async def _build_lines(
         self,
         context: TenantContext,
@@ -618,6 +955,7 @@ class POSService:
         key: str,
         payload: dict[str, object],
         success_status: int,
+        conflict_code: str = "IDEMPOTENCY_CONFLICT",
         execute: Any,
         recover: Any | None = None,
     ) -> tuple[int, dict[str, object]]:
@@ -632,7 +970,7 @@ class POSService:
             )
         except POSIdempotencyConflictError as exc:
             raise POSApiError(
-                409, "IDEMPOTENCY_CONFLICT", "Idempotency-Key уже использован для другого запроса"
+                409, conflict_code, "Idempotency-Key уже использован для другого запроса"
             ) from exc
         if begin.record is not None:
             return begin.record.status_code, begin.record.response_body
@@ -666,7 +1004,9 @@ class POSService:
                 )
                 return success_status, body
         if not begin.acquired:
-            record = await self._wait_completed(context, operation, key, request_hash)
+            record = await self._wait_completed(
+                context, operation, key, request_hash, conflict_code
+            )
             if record is not None:
                 return record.status_code, record.response_body
             if recover is not None:
@@ -684,13 +1024,28 @@ class POSService:
                     )
                     return success_status, body
             raise POSApiError(
-                409, "IDEMPOTENCY_CONFLICT", "Запрос с этим Idempotency-Key ещё выполняется"
+                409, conflict_code, "Запрос с этим Idempotency-Key ещё выполняется"
             )
         try:
             result = await execute()
         except ERPNextAmbiguousCreateError:
             if recover is not None:
-                recovered = await recover()
+                try:
+                    recovered = await recover()
+                except POSApiError as exc:
+                    if exc.status_code >= 500:
+                        body = _error_response_body(exc)
+                        self._store.complete_idempotency(
+                            tenant=context.tenant,
+                            operation=operation,
+                            user_email=context.user.email,
+                            key=key,
+                            request_hash=request_hash,
+                            status_code=exc.status_code,
+                            response_body=body,
+                        )
+                        return exc.status_code, body
+                    raise
                 if recovered is not None:
                     body = jsonable_encoder(recovered)
                     self._store.complete_idempotency(
@@ -715,6 +1070,27 @@ class POSService:
                 "ERPNEXT_UNAVAILABLE",
                 "ERPNext временно недоступен",
             ) from None
+        except POSApiError as exc:
+            if exc.status_code < 500:
+                body = _error_response_body(exc)
+                self._store.complete_idempotency(
+                    tenant=context.tenant,
+                    operation=operation,
+                    user_email=context.user.email,
+                    key=key,
+                    request_hash=request_hash,
+                    status_code=exc.status_code,
+                    response_body=body,
+                )
+                return exc.status_code, body
+            self._store.release_idempotency(
+                tenant=context.tenant,
+                operation=operation,
+                user_email=context.user.email,
+                key=key,
+                request_hash=request_hash,
+            )
+            raise
         except Exception:
             self._store.release_idempotency(
                 tenant=context.tenant,
@@ -742,6 +1118,7 @@ class POSService:
         operation: str,
         key: str,
         request_hash: str,
+        conflict_code: str = "IDEMPOTENCY_CONFLICT",
     ) -> POSIdempotencyRecord | None:
         deadline = datetime.now(UTC).timestamp() + 5
         while datetime.now(UTC).timestamp() < deadline:
@@ -756,7 +1133,7 @@ class POSService:
             except POSIdempotencyConflictError as exc:
                 raise POSApiError(
                     409,
-                    "IDEMPOTENCY_CONFLICT",
+                    conflict_code,
                     "Idempotency-Key уже использован для другого запроса",
                 ) from exc
             if record is not None:
@@ -839,6 +1216,13 @@ class POSService:
         except ERPNextConflictError as exc:
             raise POSApiError(409, exc.code, exc.message, exc.fields) from exc
         except ERPNextValidationError as exc:
+            message = exc.message.lower()
+            if "outdated" in message or "устар" in message:
+                raise POSApiError(
+                    409,
+                    "POS_OPENING_OUTDATED",
+                    "POS Opening Entry неактуальна для cash refund",
+                ) from exc
             raise POSApiError(
                 422, "VALIDATION_ERROR", "ERPNext отклонил данные", exc.fields
             ) from exc
@@ -927,6 +1311,89 @@ class POSService:
             change=str(row["change"]),
             created_at=_parse_dt(row["created_at"]),
         )
+
+    def _with_return_summary(self, sale: Sale, tenant: str) -> Sale:
+        _, option_rows = self._store.return_options(tenant, sale.id)
+        options = {str(row["line_id"]): row for row in option_rows}
+        returned_total = Decimal("0.00")
+        enriched: list[SaleLine] = []
+        for index, line in enumerate(sale.lines):
+            line_id = f"{sale.id}:line:{index + 1}"
+            option = options.get(line_id)
+            returned = Decimal(str(option["already_returned_quantity"])) if option else Decimal("0")
+            available = (
+                Decimal(str(option["available_to_return_quantity"]))
+                if option
+                else Decimal(line.quantity)
+            )
+            net_unit_price = Decimal(line.total) / Decimal(line.quantity)
+            returned_total += (returned * net_unit_price).quantize(Decimal("0.01"))
+            enriched.append(
+                line.model_copy(
+                    update={
+                        "line_id": line_id,
+                        "returned_quantity": format_quantity(returned),
+                        "available_to_return_quantity": format_quantity(available),
+                    }
+                )
+            )
+        available_total = Decimal(sale.grand_total) - returned_total
+        if returned_total <= Decimal("0.00"):
+            return_status = "none"
+        elif available_total <= Decimal("0.00"):
+            return_status = "full"
+        else:
+            return_status = "partial"
+        return sale.model_copy(
+            update={
+                "lines": enriched,
+                "return_status": return_status,
+                "returned_total": format_money(returned_total),
+            }
+        )
+
+    def _ensure_return_scope(self, context: TenantContext, row: dict[str, Any]) -> None:
+        if ADMIN_ROLES.intersection(context.user.roles):
+            return
+        if row.get("cashier_email") != context.user.email:
+            raise POSApiError(404, "RETURN_NOT_FOUND", "Возврат не найден")
+
+    def _to_return(self, row: dict[str, Any]) -> ReturnResponse:
+        lines = [ReturnLine(**line) for line in json.loads(str(row["lines_json"]))]
+        _, options = self._store.return_options(str(row["tenant"]), str(row["sale_id"]))
+        if not options or all(
+            Decimal(str(option["available_to_return_quantity"])) <= Decimal("0")
+            for option in options
+        ):
+            return_status_after = "full"
+        elif all(
+            Decimal(str(option["already_returned_quantity"])) <= Decimal("0")
+            for option in options
+        ):
+            return_status_after = "none"
+        else:
+            return_status_after = "partial"
+        return ReturnResponse(
+            return_id=str(row["id"]),
+            sale_id=str(row["sale_id"]),
+            receipt_number=str(row["receipt_number"]),
+            return_receipt_number=str(row.get("return_receipt_number") or ""),
+            state="pending_recovery" if row["state"] == "cancel_pending" else row["state"],
+            return_status_after=return_status_after,
+            refund_method=row["refund_method"],
+            reason=row["reason"],
+            comment=row.get("comment"),
+            currency=str(row["currency"]),
+            register_id=str(row["register_id"]),
+            shift_id=str(row["shift_id"]),
+            lines=lines,
+            totals=ReturnTotals(refund_total=str(row["refund_total"])),
+            created_by=str(row["created_by_email"]),
+            created_at=_parse_dt(str(row["created_at"])),
+            cancelled_by=row.get("cancelled_by"),
+            cancelled_at=_parse_dt(str(row["cancelled_at"])) if row.get("cancelled_at") else None,
+        )
+
 
 
 def _request_hash(operation: str, payload: dict[str, object]) -> str:
