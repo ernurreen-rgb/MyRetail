@@ -536,6 +536,7 @@ class POSStore:
                     )
                 requested_quantity = Decimal(requested["quantity"])
                 sold_quantity = Decimal(str(source["quantity"]))
+                net_unit_price = _net_unit_price(source)
                 already_returned = returned_by_line.get(line_id, Decimal("0"))
                 available = sold_quantity - already_returned
                 if requested_quantity > available:
@@ -555,9 +556,9 @@ class POSStore:
                         "item_name": str(source["name"]),
                         "quantity": _format_quantity(requested_quantity),
                         "unit": str(source["unit"]),
-                        "unit_price": str(source["unit_price"]),
+                        "unit_price": _format_money(net_unit_price),
                         "line_total": _format_money(
-                            requested_quantity * Decimal(str(source["unit_price"]))
+                            requested_quantity * net_unit_price
                         ),
                     }
                 )
@@ -592,6 +593,33 @@ class POSStore:
                 (tenant, return_id),
             )
 
+    def claim_return_cancel(self, tenant: str, return_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM pos_returns WHERE tenant = ? AND id = ?",
+                (tenant, return_id),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                return {}
+            state = str(row["state"])
+            if state == "cancel_pending":
+                connection.rollback()
+                raise POSStoreConflictError(
+                    "RETURN_CANCEL_IN_PROGRESS", "Отмена возврата уже выполняется"
+                )
+            if state != "submitted":
+                connection.rollback()
+                return dict(row)
+            connection.execute(
+                "UPDATE pos_returns SET state = 'cancel_pending', updated_at = ? "
+                "WHERE tenant = ? AND id = ? AND state = 'submitted'",
+                (_now(), tenant, return_id),
+            )
+            connection.commit()
+        return self.get_return(tenant, return_id) or {}
+
     def mark_return_submitted(
         self, tenant: str, return_id: str, erpnext_invoice_id: str
     ) -> dict[str, Any]:
@@ -622,7 +650,7 @@ class POSStore:
                 UPDATE pos_returns
                 SET state = 'cancelled', cancelled_by = ?, cancelled_at = ?,
                     cancel_reason = ?, cancel_comment = ?, updated_at = ?
-                WHERE tenant = ? AND id = ? AND state = 'submitted'
+                WHERE tenant = ? AND id = ? AND state = 'cancel_pending'
                 """,
                 (
                     cancelled_by,
@@ -635,6 +663,14 @@ class POSStore:
                 ),
             )
         return self.get_return(tenant, return_id) or {}
+
+    def release_return_cancel(self, tenant: str, return_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE pos_returns SET state = 'submitted', updated_at = ? "
+                "WHERE tenant = ? AND id = ? AND state = 'cancel_pending'",
+                (_now(), tenant, return_id),
+            )
 
     def return_options(
         self, tenant: str, sale_id: str
@@ -663,6 +699,7 @@ class POSStore:
             sold = Decimal(str(source["quantity"]))
             returned = returned_by_line.get(line_id, Decimal("0"))
             available = max(Decimal("0"), sold - returned)
+            net_unit_price = _net_unit_price(source)
             result.append(
                 {
                     "line_id": line_id,
@@ -672,8 +709,9 @@ class POSStore:
                     "already_returned_quantity": _format_quantity(returned),
                     "available_to_return_quantity": _format_quantity(available),
                     "unit": str(source["unit"]),
-                    "unit_price": str(source["unit_price"]),
-                    "line_total": _format_money(sold * Decimal(str(source["unit_price"]))),
+                    "unit_price": _format_money(net_unit_price),
+                    "net_unit_price": _format_money(net_unit_price),
+                    "line_total": _format_money(sold * net_unit_price),
                 }
             )
         return sale, result
@@ -966,6 +1004,16 @@ def _format_quantity(value: Decimal) -> str:
 
 def _format_money(value: Decimal) -> str:
     return f"{value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):.2f}"
+
+
+def _net_unit_price(source: dict[str, Any]) -> Decimal:
+    quantity = Decimal(str(source["quantity"]))
+    total = Decimal(str(source.get("total") or source["unit_price"]))
+    if not source.get("total"):
+        total *= quantity
+    if quantity <= Decimal("0"):
+        return Decimal("0")
+    return total / quantity
 
 
 def _date_start(value: date) -> str:

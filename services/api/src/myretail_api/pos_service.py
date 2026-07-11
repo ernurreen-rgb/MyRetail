@@ -318,7 +318,7 @@ class POSService:
                     sum(
                         (
                             Decimal(str(line["available_to_return_quantity"]))
-                            * Decimal(str(line["unit_price"]))
+                            * Decimal(str(line["net_unit_price"]))
                             for line in lines
                         ),
                         Decimal("0.00"),
@@ -342,6 +342,7 @@ class POSService:
             key=key,
             payload=request.model_dump(mode="json"),
             success_status=201,
+            conflict_code="IDEMPOTENCY_KEY_REUSED",
             execute=lambda: self._create_return_once(context, request, key),
             recover=lambda: self._recover_return(context, key),
         )
@@ -406,6 +407,7 @@ class POSService:
             key=key,
             payload=payload,
             success_status=200,
+            conflict_code="IDEMPOTENCY_KEY_REUSED",
             execute=lambda: self._cancel_return_once(context, return_id, request),
             recover=lambda: self._recover_cancel_return(context, return_id, request),
         )
@@ -660,8 +662,8 @@ class POSService:
                     "item_name": str(option["item_name"]),
                     "quantity": format_quantity(quantity),
                     "unit": str(option["unit"]),
-                    "unit_price": str(option["unit_price"]),
-                    "line_total": format_money(quantity * Decimal(str(option["unit_price"]))),
+                    "unit_price": str(option["net_unit_price"]),
+                    "line_total": format_money(quantity * Decimal(str(option["net_unit_price"]))),
                 }
             )
         refund_total = format_money(
@@ -760,17 +762,28 @@ class POSService:
         self._ensure_return_scope(context, row)
         if row["state"] == "cancelled":
             raise POSApiError(409, "RETURN_ALREADY_CANCELLED", "Возврат уже отменён")
-        if row["state"] != "submitted" or not row.get("erpnext_return_invoice_id"):
+        try:
+            claimed = self._store.claim_return_cancel(context.tenant, return_id)
+        except POSStoreConflictError as exc:
+            raise POSApiError(409, exc.code, exc.message, exc.fields) from exc
+        if not claimed:
+            raise POSApiError(404, "RETURN_NOT_FOUND", "Возврат не найден")
+        if claimed["state"] == "cancelled":
+            raise POSApiError(409, "RETURN_ALREADY_CANCELLED", "Возврат уже отменён")
+        if claimed["state"] != "cancel_pending" or not claimed.get("erpnext_return_invoice_id"):
             raise POSApiError(503, "RETURN_RECOVERY_REQUIRED", "Возврат ещё не подтверждён ERPNext")
         try:
             await self._call_erp(
                 self._erpnext.cancel_pos_return(
-                    str(row["erpnext_return_invoice_id"]),
+                    str(claimed["erpnext_return_invoice_id"]),
                     reason=request.reason,
                     comment=request.comment,
                 )
             )
         except ERPNextAmbiguousCreateError:
+            raise
+        except Exception:
+            self._store.release_return_cancel(context.tenant, return_id)
             raise
         return self._to_return(
             self._store.mark_return_cancelled(
@@ -942,6 +955,7 @@ class POSService:
         key: str,
         payload: dict[str, object],
         success_status: int,
+        conflict_code: str = "IDEMPOTENCY_CONFLICT",
         execute: Any,
         recover: Any | None = None,
     ) -> tuple[int, dict[str, object]]:
@@ -956,7 +970,7 @@ class POSService:
             )
         except POSIdempotencyConflictError as exc:
             raise POSApiError(
-                409, "IDEMPOTENCY_CONFLICT", "Idempotency-Key уже использован для другого запроса"
+                409, conflict_code, "Idempotency-Key уже использован для другого запроса"
             ) from exc
         if begin.record is not None:
             return begin.record.status_code, begin.record.response_body
@@ -990,7 +1004,9 @@ class POSService:
                 )
                 return success_status, body
         if not begin.acquired:
-            record = await self._wait_completed(context, operation, key, request_hash)
+            record = await self._wait_completed(
+                context, operation, key, request_hash, conflict_code
+            )
             if record is not None:
                 return record.status_code, record.response_body
             if recover is not None:
@@ -1008,7 +1024,7 @@ class POSService:
                     )
                     return success_status, body
             raise POSApiError(
-                409, "IDEMPOTENCY_CONFLICT", "Запрос с этим Idempotency-Key ещё выполняется"
+                409, conflict_code, "Запрос с этим Idempotency-Key ещё выполняется"
             )
         try:
             result = await execute()
@@ -1054,6 +1070,27 @@ class POSService:
                 "ERPNEXT_UNAVAILABLE",
                 "ERPNext временно недоступен",
             ) from None
+        except POSApiError as exc:
+            if exc.status_code < 500:
+                body = _error_response_body(exc)
+                self._store.complete_idempotency(
+                    tenant=context.tenant,
+                    operation=operation,
+                    user_email=context.user.email,
+                    key=key,
+                    request_hash=request_hash,
+                    status_code=exc.status_code,
+                    response_body=body,
+                )
+                return exc.status_code, body
+            self._store.release_idempotency(
+                tenant=context.tenant,
+                operation=operation,
+                user_email=context.user.email,
+                key=key,
+                request_hash=request_hash,
+            )
+            raise
         except Exception:
             self._store.release_idempotency(
                 tenant=context.tenant,
@@ -1081,6 +1118,7 @@ class POSService:
         operation: str,
         key: str,
         request_hash: str,
+        conflict_code: str = "IDEMPOTENCY_CONFLICT",
     ) -> POSIdempotencyRecord | None:
         deadline = datetime.now(UTC).timestamp() + 5
         while datetime.now(UTC).timestamp() < deadline:
@@ -1095,7 +1133,7 @@ class POSService:
             except POSIdempotencyConflictError as exc:
                 raise POSApiError(
                     409,
-                    "IDEMPOTENCY_CONFLICT",
+                    conflict_code,
                     "Idempotency-Key уже использован для другого запроса",
                 ) from exc
             if record is not None:
@@ -1288,7 +1326,8 @@ class POSService:
                 if option
                 else Decimal(line.quantity)
             )
-            returned_total += returned * Decimal(line.unit_price)
+            net_unit_price = Decimal(line.total) / Decimal(line.quantity)
+            returned_total += (returned * net_unit_price).quantize(Decimal("0.01"))
             enriched.append(
                 line.model_copy(
                     update={
@@ -1339,7 +1378,7 @@ class POSService:
             sale_id=str(row["sale_id"]),
             receipt_number=str(row["receipt_number"]),
             return_receipt_number=str(row.get("return_receipt_number") or ""),
-            state=row["state"],
+            state="pending_recovery" if row["state"] == "cancel_pending" else row["state"],
             return_status_after=return_status_after,
             refund_method=row["refund_method"],
             reason=row["reason"],
