@@ -607,7 +607,7 @@ class POSStore:
             if state == "cancel_pending":
                 connection.rollback()
                 raise POSStoreConflictError(
-                    "RETURN_CANCEL_IN_PROGRESS", "Отмена возврата уже выполняется"
+                    "RETURN_CANCEL_NOT_ALLOWED", "Отмена возврата уже выполняется"
                 )
             if state != "submitted":
                 connection.rollback()

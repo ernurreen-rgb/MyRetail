@@ -1429,7 +1429,7 @@ async def test_cancel_return_is_serialized_before_erpnext_call(tmp_path: Path) -
 
     assert first.status_code == 200
     assert second.status_code == 409
-    assert second.json()["error"]["code"] == "RETURN_CANCEL_IN_PROGRESS"
+    assert second.json()["error"]["code"] == "RETURN_CANCEL_NOT_ALLOWED"
     assert erpnext.cancel_attempts == 1
 
 
