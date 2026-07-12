@@ -7,20 +7,28 @@ import {
   ErrorState,
   formatDateTime,
   inputClass,
+  primaryButtonClass,
   secondaryButtonClass,
 } from "@/app/pos/components/shared";
 import { getSale, listSales, type Register, type Sale } from "@/lib/pos";
 
 const SALES_PAGE_SIZE = 10;
+const returnStatusLabels: Record<Sale["return_status"], string> = {
+  none: "возвратов нет",
+  partial: "частичный возврат",
+  full: "полный возврат",
+};
 
 export function SalesHistory({
   registers,
   currentRegisterId,
   refreshToken,
+  onStartReturn,
 }: {
   registers: Register[];
   currentRegisterId: string;
   refreshToken: number;
+  onStartReturn: (sale: Sale) => void;
 }) {
   const [query, setQuery] = useState("");
   const [registerId, setRegisterId] = useState(currentRegisterId);
@@ -259,6 +267,10 @@ export function SalesHistory({
                       {" "}
                       {formatDateTime(sale.created_at)}
                     </p>
+                    <p className="mt-1 text-sm text-[var(--muted)]">
+                      Возвраты: {returnStatusLabels[sale.return_status]} · возвращено{" "}
+                      {sale.returned_total} {sale.currency}
+                    </p>
                   </div>
                   <button
                     type="button"
@@ -285,13 +297,43 @@ export function SalesHistory({
           <p className="mt-1 text-sm text-[var(--muted)]">
             Смена {selectedSale.shift_id}, чек {selectedSale.id}, сдача {selectedSale.change}
           </p>
+          <div className="mt-3 grid gap-3 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-3 text-sm sm:grid-cols-3">
+            <div>
+              <p className="text-[var(--muted)]">Статус возврата</p>
+              <p className="font-semibold">{returnStatusLabels[selectedSale.return_status]}</p>
+            </div>
+            <div>
+              <p className="text-[var(--muted)]">Возвращено</p>
+              <p className="font-semibold">
+                {selectedSale.returned_total} {selectedSale.currency}
+              </p>
+            </div>
+            <div>
+              <p className="text-[var(--muted)]">Доступно действие</p>
+              <button
+                type="button"
+                className={primaryButtonClass}
+                onClick={() => onStartReturn(selectedSale)}
+                disabled={selectedSale.return_status === "full"}
+              >
+                {selectedSale.return_status === "full" ? "Полностью возвращено" : "Оформить возврат"}
+              </button>
+            </div>
+          </div>
           <ul className="mt-3 grid gap-2 text-sm">
             {selectedSale.lines.map((line) => (
-              <li key={line.product_id} className="flex justify-between gap-4">
+              <li
+                key={line.line_id ?? line.product_id}
+                className="grid gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] p-3 sm:grid-cols-[1fr_auto]"
+              >
                 <span>
-                  {line.name} · {line.quantity} {line.unit}
+                  <span className="font-medium">{line.name}</span>
+                  <span className="block text-[var(--muted)]">
+                    Продано {line.quantity} {line.unit} · возвращено {line.returned_quantity} ·
+                    доступно {line.available_to_return_quantity}
+                  </span>
                 </span>
-                <span>{line.total}</span>
+                <span className="font-semibold">{line.total}</span>
               </li>
             ))}
           </ul>

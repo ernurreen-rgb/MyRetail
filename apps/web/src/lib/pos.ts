@@ -72,7 +72,12 @@ export type POSLineInput = {
   discount_percent: string;
 };
 
+export type ReturnStatus = "none" | "partial" | "full";
+export type ReturnState = "submitted" | "cancelled" | "pending_recovery";
+export type ReturnReason = "customer_request" | "cashier_error" | "damaged" | "other";
+
 export type SaleLine = {
+  line_id: string | null;
   product_id: string;
   sku: string;
   name: string;
@@ -83,6 +88,8 @@ export type SaleLine = {
   discount_percent: string;
   discount_amount: string;
   total: string;
+  returned_quantity: string;
+  available_to_return_quantity: string;
 };
 
 export type Sale = {
@@ -101,10 +108,117 @@ export type Sale = {
   cash_received: string;
   change: string;
   created_at: string;
+  return_status: ReturnStatus;
+  returned_total: string;
 };
 
 export type SaleList = {
   items: Sale[];
+  count: number;
+  limit: number;
+  offset: number;
+};
+
+export type ReturnTotals = {
+  refund_total: string;
+  sold_total: string | null;
+  already_returned_total: string | null;
+  available_to_return_total: string | null;
+};
+
+export type ReturnOptionsLine = {
+  line_id: string;
+  item_id: string;
+  item_name: string;
+  sold_quantity: string;
+  already_returned_quantity: string;
+  available_to_return_quantity: string;
+  unit: string;
+  unit_price: string;
+  line_total: string;
+};
+
+export type ReturnOptions = {
+  sale_id: string;
+  receipt_number: string;
+  status: "submitted";
+  return_status: ReturnStatus;
+  register_id: string;
+  shift_id: string;
+  cashier_email: string;
+  created_at: string;
+  currency: string;
+  lines: ReturnOptionsLine[];
+  totals: ReturnTotals;
+};
+
+export type ReturnLineInput = {
+  line_id: string;
+  quantity: string;
+};
+
+export type ReturnCreatePayload = {
+  sale_id: string;
+  register_id: string;
+  shift_id: string;
+  refund_method: "cash";
+  reason: ReturnReason;
+  comment: string | null;
+  lines: ReturnLineInput[];
+};
+
+export type ReturnCancelPayload = {
+  reason: ReturnReason;
+  comment: string | null;
+};
+
+export type ReturnLine = {
+  line_id: string;
+  item_id: string;
+  item_name: string;
+  quantity: string;
+  unit: string;
+  unit_price: string;
+  line_total: string;
+};
+
+export type POSReturn = {
+  return_id: string;
+  sale_id: string;
+  receipt_number: string;
+  return_receipt_number: string;
+  state: ReturnState;
+  return_status_after: ReturnStatus;
+  refund_method: "cash";
+  reason: ReturnReason;
+  comment: string | null;
+  currency: string;
+  register_id: string;
+  shift_id: string;
+  lines: ReturnLine[];
+  totals: ReturnTotals;
+  created_by: string;
+  created_at: string;
+  cancelled_by: string | null;
+  cancelled_at: string | null;
+};
+
+export type ReturnHistoryItem = {
+  return_id: string;
+  sale_id: string;
+  receipt_number: string;
+  return_receipt_number: string;
+  state: ReturnState;
+  refund_total: string;
+  currency: string;
+  register_id: string;
+  shift_id: string;
+  cashier_email: string;
+  created_at: string;
+};
+
+export type ReturnList = {
+  items: ReturnHistoryItem[];
   count: number;
   limit: number;
   offset: number;
@@ -187,6 +301,9 @@ export type HeldReceiptClientResult = ClientSuccessResult<HeldReceipt> | ClientE
 export type HeldReceiptDeleteResult = ClientSuccessResult<null> | ClientErrorResult;
 export type SaleClientResult = ClientSuccessResult<Sale> | ClientErrorResult;
 export type SaleListClientResult = ClientSuccessResult<SaleList> | ClientErrorResult;
+export type ReturnOptionsClientResult = ClientSuccessResult<ReturnOptions> | ClientErrorResult;
+export type ReturnClientResult = ClientSuccessResult<POSReturn> | ClientErrorResult;
+export type ReturnListClientResult = ClientSuccessResult<ReturnList> | ClientErrorResult;
 
 const DEFAULT_POS_ERROR: POSApiError = {
   code: "REQUEST_ERROR",
@@ -224,6 +341,23 @@ function isShiftRegisterRef(value: unknown): value is ShiftRegisterRef {
 
 function isShiftStatus(value: unknown): value is ShiftStatus {
   return value === "open" || value === "closed";
+}
+
+function isReturnStatus(value: unknown): value is ReturnStatus {
+  return value === "none" || value === "partial" || value === "full";
+}
+
+function isReturnState(value: unknown): value is ReturnState {
+  return value === "submitted" || value === "cancelled" || value === "pending_recovery";
+}
+
+function isReturnReason(value: unknown): value is ReturnReason {
+  return (
+    value === "customer_request" ||
+    value === "cashier_error" ||
+    value === "damaged" ||
+    value === "other"
+  );
 }
 
 function isRegister(value: unknown): value is Register {
@@ -298,6 +432,7 @@ export function isPOSProductList(value: unknown): value is POSProductList {
 export function isSaleLine(value: unknown): value is SaleLine {
   return (
     isRecord(value) &&
+    isNullableString(value.line_id) &&
     typeof value.product_id === "string" &&
     typeof value.sku === "string" &&
     typeof value.name === "string" &&
@@ -307,7 +442,9 @@ export function isSaleLine(value: unknown): value is SaleLine {
     typeof value.subtotal === "string" &&
     typeof value.discount_percent === "string" &&
     typeof value.discount_amount === "string" &&
-    typeof value.total === "string"
+    typeof value.total === "string" &&
+    typeof value.returned_quantity === "string" &&
+    typeof value.available_to_return_quantity === "string"
   );
 }
 
@@ -329,7 +466,9 @@ export function isSale(value: unknown): value is Sale {
     typeof value.grand_total === "string" &&
     typeof value.cash_received === "string" &&
     typeof value.change === "string" &&
-    typeof value.created_at === "string"
+    typeof value.created_at === "string" &&
+    isReturnStatus(value.return_status) &&
+    typeof value.returned_total === "string"
   );
 }
 
@@ -366,6 +505,115 @@ export function isHeldReceiptList(value: unknown): value is HeldReceiptList {
     isRecord(value) &&
     Array.isArray(value.items) &&
     value.items.every(isHeldReceipt) &&
+    typeof value.count === "number" &&
+    typeof value.limit === "number" &&
+    typeof value.offset === "number"
+  );
+}
+
+function isReturnTotals(value: unknown): value is ReturnTotals {
+  return (
+    isRecord(value) &&
+    typeof value.refund_total === "string" &&
+    isNullableString(value.sold_total) &&
+    isNullableString(value.already_returned_total) &&
+    isNullableString(value.available_to_return_total)
+  );
+}
+
+function isReturnOptionsLine(value: unknown): value is ReturnOptionsLine {
+  return (
+    isRecord(value) &&
+    typeof value.line_id === "string" &&
+    typeof value.item_id === "string" &&
+    typeof value.item_name === "string" &&
+    typeof value.sold_quantity === "string" &&
+    typeof value.already_returned_quantity === "string" &&
+    typeof value.available_to_return_quantity === "string" &&
+    typeof value.unit === "string" &&
+    typeof value.unit_price === "string" &&
+    typeof value.line_total === "string"
+  );
+}
+
+export function isReturnOptions(value: unknown): value is ReturnOptions {
+  return (
+    isRecord(value) &&
+    typeof value.sale_id === "string" &&
+    typeof value.receipt_number === "string" &&
+    value.status === "submitted" &&
+    isReturnStatus(value.return_status) &&
+    typeof value.register_id === "string" &&
+    typeof value.shift_id === "string" &&
+    typeof value.cashier_email === "string" &&
+    typeof value.created_at === "string" &&
+    typeof value.currency === "string" &&
+    Array.isArray(value.lines) &&
+    value.lines.every(isReturnOptionsLine) &&
+    isReturnTotals(value.totals)
+  );
+}
+
+function isReturnLine(value: unknown): value is ReturnLine {
+  return (
+    isRecord(value) &&
+    typeof value.line_id === "string" &&
+    typeof value.item_id === "string" &&
+    typeof value.item_name === "string" &&
+    typeof value.quantity === "string" &&
+    typeof value.unit === "string" &&
+    typeof value.unit_price === "string" &&
+    typeof value.line_total === "string"
+  );
+}
+
+export function isPOSReturn(value: unknown): value is POSReturn {
+  return (
+    isRecord(value) &&
+    typeof value.return_id === "string" &&
+    typeof value.sale_id === "string" &&
+    typeof value.receipt_number === "string" &&
+    typeof value.return_receipt_number === "string" &&
+    isReturnState(value.state) &&
+    isReturnStatus(value.return_status_after) &&
+    value.refund_method === "cash" &&
+    isReturnReason(value.reason) &&
+    isNullableString(value.comment) &&
+    typeof value.currency === "string" &&
+    typeof value.register_id === "string" &&
+    typeof value.shift_id === "string" &&
+    Array.isArray(value.lines) &&
+    value.lines.every(isReturnLine) &&
+    isReturnTotals(value.totals) &&
+    typeof value.created_by === "string" &&
+    typeof value.created_at === "string" &&
+    isNullableString(value.cancelled_by) &&
+    isNullableString(value.cancelled_at)
+  );
+}
+
+function isReturnHistoryItem(value: unknown): value is ReturnHistoryItem {
+  return (
+    isRecord(value) &&
+    typeof value.return_id === "string" &&
+    typeof value.sale_id === "string" &&
+    typeof value.receipt_number === "string" &&
+    typeof value.return_receipt_number === "string" &&
+    isReturnState(value.state) &&
+    typeof value.refund_total === "string" &&
+    typeof value.currency === "string" &&
+    typeof value.register_id === "string" &&
+    typeof value.shift_id === "string" &&
+    typeof value.cashier_email === "string" &&
+    typeof value.created_at === "string"
+  );
+}
+
+export function isReturnList(value: unknown): value is ReturnList {
+  return (
+    isRecord(value) &&
+    Array.isArray(value.items) &&
+    value.items.every(isReturnHistoryItem) &&
     typeof value.count === "number" &&
     typeof value.limit === "number" &&
     typeof value.offset === "number"
@@ -481,6 +729,32 @@ export function toSaleCreatePayload(values: SaleCreatePayload): SaleCreatePayloa
     held_receipt_id: optionalText(values.held_receipt_id),
     lines: values.lines.map(normalizePOSLine),
     cash_received: normalizeDecimalInput(values.cash_received),
+  };
+}
+
+function normalizeReturnLine(line: ReturnLineInput): ReturnLineInput {
+  return {
+    line_id: normalizeText(line.line_id),
+    quantity: normalizeDecimalInput(line.quantity),
+  };
+}
+
+export function toReturnCreatePayload(values: ReturnCreatePayload): ReturnCreatePayload {
+  return {
+    sale_id: normalizeText(values.sale_id),
+    register_id: normalizeText(values.register_id),
+    shift_id: normalizeText(values.shift_id),
+    refund_method: "cash",
+    reason: values.reason,
+    comment: optionalText(values.comment),
+    lines: values.lines.map(normalizeReturnLine),
+  };
+}
+
+export function toReturnCancelPayload(values: ReturnCancelPayload): ReturnCancelPayload {
+  return {
+    reason: values.reason,
+    comment: optionalText(values.comment),
   };
 }
 
@@ -719,6 +993,86 @@ export async function getSale(saleId: string): Promise<SaleClientResult> {
     `/api/pos/sales/${encodeURIComponent(saleId)}`,
     isSale,
     "API вернул неожиданный формат продажи.",
+  );
+}
+
+export async function getReturnOptions(saleId: string): Promise<ReturnOptionsClientResult> {
+  return getPOSResource(
+    `/api/pos/sales/${encodeURIComponent(saleId)}/return-options`,
+    isReturnOptions,
+    "API вернул неожиданный формат доступных позиций возврата.",
+  );
+}
+
+export async function createReturn(
+  values: ReturnCreatePayload,
+  idempotencyKey: string,
+): Promise<ReturnClientResult> {
+  return mutatePOSResource(
+    "/api/pos/returns",
+    {
+      method: "POST",
+      body: JSON.stringify(toReturnCreatePayload(values)),
+      idempotencyKey,
+    },
+    isPOSReturn,
+    "API вернул неожиданный формат возврата.",
+  );
+}
+
+export async function listReturns(
+  params: {
+    q?: string;
+    saleId?: string;
+    registerId?: string;
+    cashierEmail?: string;
+    dateFrom?: string;
+    dateTo?: string;
+    state?: ReturnState | "";
+    limit?: number;
+    offset?: number;
+  } = {},
+): Promise<ReturnListClientResult> {
+  const searchParams = new URLSearchParams();
+
+  appendStringParam(searchParams, "q", params.q);
+  appendStringParam(searchParams, "sale_id", params.saleId);
+  appendStringParam(searchParams, "register_id", params.registerId);
+  appendStringParam(searchParams, "cashier_email", params.cashierEmail);
+  appendStringParam(searchParams, "date_from", params.dateFrom);
+  appendStringParam(searchParams, "date_to", params.dateTo);
+  appendStringParam(searchParams, "state", params.state);
+  appendNumberParam(searchParams, "limit", params.limit);
+  appendNumberParam(searchParams, "offset", params.offset);
+
+  const queryString = searchParams.toString();
+  const url = queryString ? `/api/pos/returns?${queryString}` : "/api/pos/returns";
+
+  return getPOSResource(url, isReturnList, "API вернул неожиданный формат истории возвратов.");
+}
+
+export async function getReturn(returnId: string): Promise<ReturnClientResult> {
+  return getPOSResource(
+    `/api/pos/returns/${encodeURIComponent(returnId)}`,
+    isPOSReturn,
+    "API вернул неожиданный формат возврата.",
+  );
+}
+
+export async function cancelReturn(
+  returnId: string,
+  values: ReturnCancelPayload,
+  idempotencyKey: string,
+): Promise<ReturnClientResult> {
+  return mutatePOSResource(
+    `/api/pos/returns/${encodeURIComponent(returnId)}/cancel`,
+    {
+      method: "POST",
+      body: JSON.stringify(toReturnCancelPayload(values)),
+      idempotencyKey,
+    },
+    isPOSReturn,
+    "API вернул неожиданный формат отмены возврата.",
   );
 }
 

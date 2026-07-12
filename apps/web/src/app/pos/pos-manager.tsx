@@ -9,6 +9,8 @@ import { HeldReceiptsPanel } from "@/app/pos/components/held-receipts-panel";
 import { PaymentPanel } from "@/app/pos/components/payment-panel";
 import { ProductLookup } from "@/app/pos/components/product-lookup";
 import { ReceiptView } from "@/app/pos/components/receipt-view";
+import { ReturnFlow } from "@/app/pos/components/return-flow";
+import { ReturnsHistory } from "@/app/pos/components/returns-history";
 import { SalesHistory } from "@/app/pos/components/sales-history";
 import {
   EmptyState,
@@ -34,6 +36,7 @@ import {
   type HeldReceipt,
   type POSOptions,
   type POSProduct,
+  type POSReturn,
   type Sale,
   type Shift,
 } from "@/lib/pos";
@@ -55,6 +58,10 @@ function toActionResult(error: {
 
 function incrementQuantity(quantity: string) {
   return (parseDecimal(quantity) + 1).toFixed(3);
+}
+
+function canCancelReturnsForRoles(roles: string[]) {
+  return roles.some((role) => ["owner", "admin"].includes(role.toLowerCase()));
 }
 
 export function POSManager({
@@ -92,6 +99,8 @@ export function POSManager({
   const [selectedHeldDirty, setSelectedHeldDirty] = useState(false);
 
   const [historyRefreshToken, setHistoryRefreshToken] = useState(0);
+  const [returnsRefreshToken, setReturnsRefreshToken] = useState(0);
+  const [returnTargetSale, setReturnTargetSale] = useState<Sale | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
   const activeRegisters = useMemo(
@@ -104,6 +113,7 @@ export function POSManager({
   );
   const discountLimitPercent = options?.discount_limit_percent ?? "0.00";
   const canOperateShift = Boolean(shift && shift.status === "open");
+  const canCancelReturns = canCancelReturnsForRoles(userRoles);
   const cartHasErrors = hasCartValidationErrors(cartLines, discountLimitPercent);
   const selectedHeldForSale = selectedHeld && !selectedHeldDirty ? selectedHeld : null;
 
@@ -510,6 +520,15 @@ export function POSManager({
     setIsSelling(false);
   }
 
+  function handleReturnCompleted(posReturn: POSReturn) {
+    setNotice(
+      `Возврат ${posReturn.return_receipt_number || posReturn.return_id} оформлен на ${posReturn.totals.refund_total} ${posReturn.currency}.`,
+    );
+    setHistoryRefreshToken((token) => token + 1);
+    setReturnsRefreshToken((token) => token + 1);
+    void refreshCurrentShift(registerId);
+  }
+
   if (!canUsePOS) {
     return (
       <main className="flex-1 px-5 py-6 sm:px-8 lg:px-12 lg:py-10">
@@ -531,7 +550,7 @@ export function POSManager({
         <header className="flex flex-col gap-4 border-b border-[var(--border)] pb-5 lg:flex-row lg:items-end lg:justify-between">
           <div>
             <p className="font-mono text-xs font-semibold uppercase tracking-[0.18em] text-[var(--accent)]">
-              Sprint 5 · POS frontend
+              Sprint 6 · POS returns frontend
             </p>
             <h1 className="mt-2 text-4xl font-semibold tracking-[-0.04em] sm:text-5xl">
               Касса MyRetail
@@ -637,6 +656,21 @@ export function POSManager({
               registers={activeRegisters}
               currentRegisterId={registerId}
               refreshToken={historyRefreshToken}
+              onStartReturn={setReturnTargetSale}
+            />
+
+            <ReturnFlow
+              sale={returnTargetSale}
+              onClose={() => setReturnTargetSale(null)}
+              onCompleted={handleReturnCompleted}
+            />
+
+            <ReturnsHistory
+              registers={activeRegisters}
+              currentRegisterId={registerId}
+              canCancelReturns={canCancelReturns}
+              refreshToken={returnsRefreshToken}
+              onChanged={handleReturnCompleted}
             />
           </>
         ) : null}
