@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, 
 from fastapi.responses import JSONResponse
 
 from myretail_api.clients.erpnext import ERPNextClient
+from myretail_api.config import Settings, get_settings
 from myretail_api.dependencies import get_erpnext_client, get_pos_store, require_tenant_context
 from myretail_api.models.auth import TenantContext
 from myretail_api.models.pos import (
@@ -36,8 +37,9 @@ router = APIRouter(prefix="/pos", tags=["pos"])
 def get_pos_service(
     erpnext: Annotated[ERPNextClient, Depends(get_erpnext_client)],
     store: Annotated[POSStore, Depends(get_pos_store)],
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> POSService:
-    return POSService(erpnext=erpnext, store=store)
+    return POSService(erpnext=erpnext, store=store, settings=settings)
 
 
 @router.get("/options", response_model=POSOptions)

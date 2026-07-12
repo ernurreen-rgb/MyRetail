@@ -50,6 +50,9 @@ class StubPOSErpnextClient:
                 warehouse=WarehouseRef(id="WH-1", name="Основной склад"),
             ),
         ]
+        self.registers[1] = self.registers[1].model_copy(
+            update={"warehouse": WarehouseRef(id="WH-2", name="Warehouse 2")}
+        )
         self.products = {
             "SKU-1": POSProduct(
                 id="SKU-1",
@@ -279,7 +282,31 @@ class SlowCancelERPNextClient(StubPOSErpnextClient):
         await super().cancel_pos_return(invoice_id, reason=reason, comment=comment)
 
 
-def make_settings(tmp_path: Path) -> Settings:
+def make_settings(
+    tmp_path: Path,
+    *,
+    pos_cashier_assignments: dict[str, object] | None = None,
+) -> Settings:
+    assignments = pos_cashier_assignments
+    if assignments is None:
+        assignments = {
+            "cashier@example.kz": {
+                "register_ids": ["POS-1"],
+                "warehouse_ids": ["WH-1"],
+            },
+            "other@example.kz": {
+                "register_ids": ["POS-2"],
+                "warehouse_ids": ["WH-2"],
+            },
+            "a@example.kz": {
+                "register_ids": ["POS-1"],
+                "warehouse_ids": ["WH-1"],
+            },
+            "b@example.kz": {
+                "register_ids": ["POS-2"],
+                "warehouse_ids": ["WH-2"],
+            },
+        }
     return Settings(
         tenant_slug="myretail",
         auth_secret=SecretStr("test-auth-secret"),
@@ -287,6 +314,7 @@ def make_settings(tmp_path: Path) -> Settings:
         erpnext_api_secret=SecretStr("test-secret"),
         pos_db_path=tmp_path / "pos.sqlite3",
         stock_idempotency_db_path=tmp_path / "idempotency.sqlite3",
+        pos_cashier_assignments=assignments,
     )
 
 
@@ -309,8 +337,13 @@ def auth_headers(
     return headers
 
 
-def make_app(erpnext: StubPOSErpnextClient, tmp_path: Path):
-    settings = make_settings(tmp_path)
+def make_app(
+    erpnext: StubPOSErpnextClient,
+    tmp_path: Path,
+    *,
+    settings: Settings | None = None,
+):
+    settings = settings or make_settings(tmp_path)
     store = POSStore(settings.pos_db_path)
     app = create_app()
     app.dependency_overrides[get_settings] = lambda: settings
@@ -394,6 +427,132 @@ async def test_pos_options_require_pos_role(tmp_path: Path) -> None:
     assert ok.json()["discount_limit_percent"] == "10.00"
     assert forbidden.status_code == 403
     assert forbidden.json()["error"]["code"] == "FORBIDDEN"
+
+
+@pytest.mark.anyio
+async def test_cashier_only_sees_and_uses_assigned_register(tmp_path: Path) -> None:
+    erpnext = StubPOSErpnextClient()
+    app = make_app(erpnext, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        options = await client.get("/pos/options", headers=auth_headers(tmp_path))
+        foreign_products = await client.get(
+            "/pos/products?register_id=POS-2", headers=auth_headers(tmp_path)
+        )
+        foreign_open = await client.post(
+            "/pos/shifts",
+            headers=auth_headers(tmp_path, key=str(uuid4())),
+            json={"register_id": "POS-2", "opening_cash": "10000.00"},
+        )
+
+    assert [register["id"] for register in options.json()["registers"]] == ["POS-1"]
+    assert foreign_products.status_code == 403
+    assert foreign_products.json()["error"]["code"] == "POS_FORBIDDEN"
+    assert foreign_open.status_code == 403
+    assert foreign_open.json()["error"]["code"] == "POS_FORBIDDEN"
+    assert erpnext.openings == []
+
+
+@pytest.mark.anyio
+async def test_generic_erp_roles_without_assignment_are_denied_pos(tmp_path: Path) -> None:
+    erpnext = StubPOSErpnextClient()
+    settings = make_settings(tmp_path, pos_cashier_assignments={})
+    app = make_app(erpnext, tmp_path, settings=settings)
+    headers = auth_headers(tmp_path, roles=["Accounts User", "Stock User"], key=str(uuid4()))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        options = await client.get("/pos/options", headers=headers)
+        products = await client.get("/pos/products?register_id=POS-1", headers=headers)
+        opening = await client.post(
+            "/pos/shifts",
+            headers=headers,
+            json={"register_id": "POS-1", "opening_cash": "10000.00"},
+        )
+        sale = await client.post(
+            "/pos/sales",
+            headers=headers,
+            json={
+                "shift_id": "SHIFT-NOT-ALLOWED",
+                "lines": [
+                    {
+                        "product_id": "SKU-1",
+                        "quantity": "1.000",
+                        "discount_percent": "0.00",
+                    }
+                ],
+                "cash_received": "100.00",
+            },
+        )
+
+    for response in (options, products, opening, sale):
+        assert response.status_code == 403
+        assert response.json()["error"]["code"] == "FORBIDDEN"
+    assert erpnext.openings == []
+    assert erpnext.sales == []
+
+
+@pytest.mark.anyio
+async def test_cashier_assignment_requires_matching_warehouse(tmp_path: Path) -> None:
+    settings = make_settings(
+        tmp_path,
+        pos_cashier_assignments={
+            "cashier@example.kz": {
+                "register_ids": ["POS-1"],
+                "warehouse_ids": ["WH-OTHER"],
+            }
+        },
+    )
+    app = make_app(StubPOSErpnextClient(), tmp_path, settings=settings)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        options = await client.get("/pos/options", headers=auth_headers(tmp_path))
+        opening = await client.post(
+            "/pos/shifts",
+            headers=auth_headers(tmp_path, key=str(uuid4())),
+            json={"register_id": "POS-1", "opening_cash": "10000.00"},
+        )
+
+    assert options.status_code == 200
+    assert options.json()["registers"] == []
+    assert opening.status_code == 403
+    assert opening.json()["error"]["code"] == "POS_FORBIDDEN"
+
+
+@pytest.mark.anyio
+async def test_cashier_cannot_sell_from_foreign_register_warehouse(tmp_path: Path) -> None:
+    erpnext = StubPOSErpnextClient()
+    app = make_app(erpnext, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        foreign_shift = await open_shift(
+            client,
+            tmp_path,
+            register_id="POS-2",
+            email="other@example.kz",
+        )
+        response = await client.post(
+            "/pos/sales",
+            headers=auth_headers(tmp_path, key=str(uuid4())),
+            json={
+                "shift_id": foreign_shift["id"],
+                "lines": [
+                    {
+                        "product_id": "SKU-1",
+                        "quantity": "1.000",
+                        "discount_percent": "0.00",
+                    }
+                ],
+                "cash_received": "100.00",
+            },
+        )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "POS_FORBIDDEN"
+    assert erpnext.sales == []
 
 
 @pytest.mark.anyio

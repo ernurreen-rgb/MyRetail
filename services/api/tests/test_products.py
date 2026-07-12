@@ -367,6 +367,28 @@ async def test_products_endpoint_rejects_cashier_write() -> None:
 
 
 @pytest.mark.anyio
+async def test_products_endpoint_hides_prices_and_archived_catalog_from_cashier() -> None:
+    app = make_app(StubERPNextClient())
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        active = await client.get(
+            "/products",
+            headers=auth_headers(roles=["Cashier"]),
+        )
+        archived = await client.get(
+            "/products?include_archived=true",
+            headers=auth_headers(roles=["Cashier"]),
+        )
+
+    assert active.status_code == 403
+    assert active.json()["error"]["code"] == "FORBIDDEN"
+    assert "purchase_price" not in active.text
+    assert archived.status_code == 403
+    assert archived.json()["error"]["code"] == "FORBIDDEN"
+
+
+@pytest.mark.anyio
 async def test_products_endpoint_maps_erpnext_error() -> None:
     app = make_app(UnavailableERPNextClient())
     transport = httpx.ASGITransport(app=app)

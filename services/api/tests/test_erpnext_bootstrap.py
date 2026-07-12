@@ -65,6 +65,7 @@ def test_bootstrap_api_user_grants_minimal_stock_permissions() -> None:
     assert "MYRETAIL_ERPNEXT_POS_USER" in script
     assert "MYRETAIL_ERPNEXT_POS_USER_MAP" in script
     assert "MYRETAIL_ERPNEXT_POS_CREDENTIALS_MAP" in script
+    assert "MYRETAIL_POS_CASHIER_ASSIGNMENTS" in script
     assert "Ensure-ErpUser" in script
     assert "Get-ProfileUserEmail" in script
     assert "myretail-pos-$hash@local.test" in script

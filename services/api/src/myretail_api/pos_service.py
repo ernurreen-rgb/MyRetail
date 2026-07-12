@@ -18,6 +18,7 @@ from myretail_api.clients.erpnext import (
     ERPNextUnavailableError,
     ERPNextValidationError,
 )
+from myretail_api.config import Settings
 from myretail_api.models.auth import AuthenticatedUser, TenantContext
 from myretail_api.models.pos import (
     CashierRef,
@@ -60,8 +61,8 @@ from myretail_api.pos_store import (
     POSStore,
     POSStoreConflictError,
 )
+from myretail_api.security import get_pos_cashier_assignment
 
-POS_ROLES = {"Owner", "Admin", "Cashier"}
 ADMIN_ROLES = {"Owner", "Admin"}
 
 
@@ -77,13 +78,20 @@ class POSApiError(RuntimeError):
 
 
 class POSService:
-    def __init__(self, *, erpnext: ERPNextClient, store: POSStore) -> None:
+    def __init__(self, *, erpnext: ERPNextClient, store: POSStore, settings: Settings) -> None:
         self._erpnext = erpnext
         self._store = store
+        self._settings = settings
 
     async def options(self, context: TenantContext) -> POSOptions:
         self._require_pos_role(context)
         registers = await self._call_erp(self._erpnext.list_pos_registers(context.tenant))
+        if not ADMIN_ROLES.intersection(context.user.roles):
+            registers = [
+                register
+                for register in registers
+                if self._is_register_assigned(context, register)
+            ]
         return POSOptions(
             registers=registers,
             payment_methods=[{"code": "cash", "name": "Наличные"}],
@@ -125,7 +133,9 @@ class POSService:
         row = self._store.get_current_shift(context.tenant, register_id, context.user.email)
         if row is None:
             raise POSApiError(404, "SHIFT_NOT_FOUND", "Смена не найдена")
-        return self._to_shift(row)
+        shift = self._to_shift(row)
+        self._require_register_assignment(context, shift.register, shift.warehouse)
+        return shift
 
     async def open_shift(
         self, context: TenantContext, request: ShiftOpenRequest, *, key: str
@@ -928,6 +938,7 @@ class POSService:
         registers = await self._call_erp(self._erpnext.list_pos_registers(context.tenant))
         for register in registers:
             if register.id == register_id:
+                self._require_register_assignment(context, register)
                 return register
         raise POSApiError(404, "REGISTER_NOT_FOUND", "Касса не найдена")
 
@@ -943,6 +954,7 @@ class POSService:
         if row is None:
             raise POSApiError(404, "SHIFT_NOT_FOUND", "Смена не найдена")
         shift = self._to_shift(row)
+        self._require_register_assignment(context, shift.register, shift.warehouse)
         if shift.cashier.email == context.user.email:
             return shift
         if allow_admin and ADMIN_ROLES.intersection(context.user.roles):
@@ -1254,8 +1266,43 @@ class POSService:
             ) from exc
 
     def _require_pos_role(self, context: TenantContext) -> None:
-        if not POS_ROLES.intersection(context.user.roles):
+        if ADMIN_ROLES.intersection(context.user.roles):
+            return
+        if "Cashier" not in context.user.roles or get_pos_cashier_assignment(
+            self._settings, context.user.email
+        ) is None:
             raise POSApiError(403, "FORBIDDEN", "Недостаточно прав для кассы")
+
+    def _is_register_assigned(self, context: TenantContext, register: Register) -> bool:
+        if ADMIN_ROLES.intersection(context.user.roles):
+            return True
+        assignment = get_pos_cashier_assignment(self._settings, context.user.email)
+        return bool(
+            assignment
+            and register.id in assignment.register_ids
+            and register.warehouse.id in assignment.warehouse_ids
+        )
+
+    def _require_register_assignment(
+        self,
+        context: TenantContext,
+        register: Register | ShiftRegisterRef,
+        warehouse: WarehouseRef | None = None,
+    ) -> None:
+        if ADMIN_ROLES.intersection(context.user.roles):
+            return
+        assignment = get_pos_cashier_assignment(self._settings, context.user.email)
+        warehouse_id = warehouse.id if warehouse else register.warehouse.id
+        if not (
+            assignment
+            and register.id in assignment.register_ids
+            and warehouse_id in assignment.warehouse_ids
+        ):
+            raise POSApiError(
+                403,
+                "POS_FORBIDDEN",
+                "Касса или склад не назначены текущему кассиру",
+            )
 
     def _discount_limit(self, user: AuthenticatedUser) -> str:
         return "100.00" if ADMIN_ROLES.intersection(user.roles) else "10.00"

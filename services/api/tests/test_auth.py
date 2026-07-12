@@ -33,12 +33,25 @@ class UnmappedRoleAuthClient:
         return ERPNextUser(email=email, full_name=None, roles=["Website User", "All"])
 
 
+class GenericERPUserAuthClient:
+    async def authenticate_user(self, *, email: str, password: str) -> ERPNextUser:
+        return ERPNextUser(
+            email=email,
+            full_name="ERP User",
+            roles=["Accounts User", "Stock User"],
+        )
+
+
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
 
 
-def make_test_settings(rate_limit_path: Path | None = None) -> Settings:
+def make_test_settings(
+    rate_limit_path: Path | None = None,
+    *,
+    pos_cashier_assignments: dict[str, object] | None = None,
+) -> Settings:
     return Settings(
         tenant_slug="myretail",
         auth_secret=SecretStr("test-auth-secret"),
@@ -46,6 +59,7 @@ def make_test_settings(rate_limit_path: Path | None = None) -> Settings:
         erpnext_api_key=SecretStr("test-key"),
         erpnext_api_secret=SecretStr("test-secret"),
         auth_rate_limit_db_path=rate_limit_path or Path("test-rate-limit.sqlite3"),
+        pos_cashier_assignments=pos_cashier_assignments or {},
     )
 
 
@@ -75,7 +89,7 @@ async def test_login_returns_myretail_token(tmp_path: Path) -> None:
     assert body["user"] == {
         "email": "damir@example.com",
         "full_name": "Damir",
-        "roles": ["Cashier", "Owner"],
+        "roles": ["Owner"],
     }
     assert body["access_token"]
 
@@ -144,6 +158,58 @@ async def test_login_rejects_user_without_mapped_role(tmp_path: Path) -> None:
 
     assert response.status_code == 403
     assert response.json() == {"detail": "User does not have a MyRetail role"}
+
+
+@pytest.mark.anyio
+async def test_generic_erp_roles_require_explicit_pos_assignment(tmp_path: Path) -> None:
+    settings = make_test_settings(tmp_path / "rate-limit.sqlite3")
+    app = create_app()
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_erpnext_client] = GenericERPUserAuthClient
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/auth/login",
+            json={
+                "tenant": "myretail",
+                "email": "accountant@example.com",
+                "password": "correct-password",
+            },
+        )
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "User does not have a MyRetail role"}
+
+
+@pytest.mark.anyio
+async def test_assigned_generic_erp_user_maps_to_cashier(tmp_path: Path) -> None:
+    settings = make_test_settings(
+        tmp_path / "rate-limit.sqlite3",
+        pos_cashier_assignments={
+            "accountant@example.com": {
+                "register_ids": ["POS-1"],
+                "warehouse_ids": ["WH-1"],
+            }
+        },
+    )
+    app = create_app()
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_erpnext_client] = GenericERPUserAuthClient
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/auth/login",
+            json={
+                "tenant": "myretail",
+                "email": "accountant@example.com",
+                "password": "correct-password",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["user"]["roles"] == ["Cashier"]
 
 
 @pytest.mark.anyio

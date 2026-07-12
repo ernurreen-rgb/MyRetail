@@ -6,7 +6,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from myretail_api.config import Settings
+from myretail_api.config import POSCashierAssignment, Settings
 from myretail_api.models.auth import AuthenticatedUser, TenantContext
 
 
@@ -18,7 +18,10 @@ class TokenValidationError(RuntimeError):
     """Raised when a MyRetail access token is invalid."""
 
 
-def map_erpnext_roles(erpnext_roles: list[str]) -> list[str]:
+POS_SOURCE_ROLES = {"Cashier", "Sales User", "Stock User", "Accounts User"}
+
+
+def map_erpnext_roles(erpnext_roles: list[str], *, has_pos_assignment: bool = False) -> list[str]:
     role_set = {role.strip() for role in erpnext_roles if role.strip()}
     mapped: set[str] = set()
 
@@ -27,10 +30,22 @@ def map_erpnext_roles(erpnext_roles: list[str]) -> list[str]:
     manager_roles = {"Sales Manager", "Stock Manager", "Accounts Manager", "Item Manager"}
     if role_set.intersection(manager_roles):
         mapped.add("Admin")
-    if role_set.intersection({"Sales User", "Stock User", "Accounts User"}):
+    if has_pos_assignment and role_set.intersection(POS_SOURCE_ROLES):
         mapped.add("Cashier")
 
     return sorted(mapped)
+
+
+def get_pos_cashier_assignment(
+    settings: Settings, email: str
+) -> POSCashierAssignment | None:
+    normalized_email = email.strip().casefold()
+    for assigned_email, assignment in settings.pos_cashier_assignments.items():
+        if assigned_email.strip().casefold() == normalized_email:
+            if assignment.register_ids and assignment.warehouse_ids:
+                return assignment
+            return None
+    return None
 
 
 def create_access_token(
