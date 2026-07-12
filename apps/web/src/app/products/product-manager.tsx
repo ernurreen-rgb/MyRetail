@@ -90,11 +90,11 @@ export function ProductManager({ canManage }: { canManage: boolean }) {
   const [query, setQuery] = useState("");
   const [appliedQuery, setAppliedQuery] = useState("");
   const [includeArchived, setIncludeArchived] = useState(false);
-  const [isLoadingProducts, setIsLoadingProducts] = useState(true);
+  const [isLoadingProducts, setIsLoadingProducts] = useState(canManage);
   const [productsError, setProductsError] = useState<string | null>(null);
 
   const [options, setOptions] = useState<ProductOptions | null>(null);
-  const [isLoadingOptions, setIsLoadingOptions] = useState(true);
+  const [isLoadingOptions, setIsLoadingOptions] = useState(canManage);
   const [optionsError, setOptionsError] = useState<string | null>(null);
 
   const [formState, setFormState] = useState<ProductFormState | null>(null);
@@ -168,6 +168,10 @@ export function ProductManager({ canManage }: { canManage: boolean }) {
   }
 
   useEffect(() => {
+    if (!canManage) {
+      return;
+    }
+
     let ignore = false;
     const requestId = ++productsRequestId.current;
 
@@ -212,7 +216,7 @@ export function ProductManager({ canManage }: { canManage: boolean }) {
     return () => {
       ignore = true;
     };
-  }, []);
+  }, [canManage]);
 
   async function handleSearch(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -336,6 +340,19 @@ export function ProductManager({ canManage }: { canManage: boolean }) {
     }
 
     setArchivingId(null);
+  }
+
+  if (!canManage) {
+    return (
+      <section className="rounded-2xl border border-red-200 bg-red-50 p-6 text-red-800 shadow-[0_12px_36px_rgba(20,32,24,0.04)] dark:border-red-900 dark:bg-red-950 dark:text-red-200">
+        <p className="text-sm font-semibold uppercase tracking-[0.16em]">403</p>
+        <h2 className="mt-2 text-2xl font-semibold">Доступ к товарам запрещён</h2>
+        <p className="mt-3 text-sm leading-6">
+          Product management, закупочные цены и архивный каталог доступны только Owner/Admin.
+          Операции кассы используют отдельный POS-каталог без закупочных цен.
+        </p>
+      </section>
+    );
   }
 
   return (
@@ -512,9 +529,11 @@ export function ProductManager({ canManage }: { canManage: boolean }) {
                       <p className="font-semibold">
                         {product.sale_price} {product.currency}
                       </p>
-                      <p className="mt-1 text-xs text-[var(--muted)]">
-                        Закуп: {formatOptional(product.purchase_price)}
-                      </p>
+                      {canManage ? (
+                        <p className="mt-1 text-xs text-[var(--muted)]">
+                          Закуп: {formatOptional(product.purchase_price)}
+                        </p>
+                      ) : null}
                     </td>
                     <td className="px-4 py-4">
                       <span
