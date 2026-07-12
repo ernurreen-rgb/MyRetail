@@ -556,6 +556,7 @@ $apiEnv = @(
     "MYRETAIL_ERPNEXT_POS_USER=$(Get-ApiSetting -Name 'MYRETAIL_ERPNEXT_POS_USER' -Default $serviceUser)"
     "MYRETAIL_ERPNEXT_POS_USER_MAP=$($posUserMap | ConvertTo-Json -Compress)"
     "MYRETAIL_ERPNEXT_POS_CREDENTIALS_MAP=$($posCredentialMap | ConvertTo-Json -Compress)"
+    "MYRETAIL_POS_CASHIER_ASSIGNMENTS=$(Get-ApiSetting -Name 'MYRETAIL_POS_CASHIER_ASSIGNMENTS' -Default '{}')"
     "MYRETAIL_DEFAULT_CURRENCY=$(Get-ApiSetting -Name 'MYRETAIL_DEFAULT_CURRENCY' -Default 'KZT')"
 ) -join [Environment]::NewLine
 

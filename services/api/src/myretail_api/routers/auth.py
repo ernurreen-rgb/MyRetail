@@ -12,7 +12,12 @@ from myretail_api.config import Settings, get_settings
 from myretail_api.dependencies import get_erpnext_client, require_tenant_context
 from myretail_api.models.auth import AuthenticatedUser, LoginRequest, LoginResponse, TenantContext
 from myretail_api.rate_limit import LoginRateLimiter, get_login_rate_limiter
-from myretail_api.security import AuthConfigurationError, create_access_token, map_erpnext_roles
+from myretail_api.security import (
+    AuthConfigurationError,
+    create_access_token,
+    get_pos_cashier_assignment,
+    map_erpnext_roles,
+)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -64,7 +69,10 @@ async def login(
             detail="ERPNext authentication is unavailable",
         ) from exc
 
-    roles = map_erpnext_roles(erpnext_user.roles)
+    roles = map_erpnext_roles(
+        erpnext_user.roles,
+        has_pos_assignment=get_pos_cashier_assignment(settings, erpnext_user.email) is not None,
+    )
     if not roles:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

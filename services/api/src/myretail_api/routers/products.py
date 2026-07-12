@@ -23,7 +23,7 @@ from myretail_api.models.products import (
 
 router = APIRouter(prefix="/products", tags=["products"])
 T = TypeVar("T")
-READ_ROLES = {"Owner", "Admin", "Cashier"}
+READ_ROLES = {"Owner", "Admin"}
 WRITE_ROLES = {"Owner", "Admin"}
 
 

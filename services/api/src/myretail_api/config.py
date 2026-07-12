@@ -2,10 +2,17 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 API_ROOT = Path(__file__).resolve().parents[2]
+
+
+class POSCashierAssignment(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    register_ids: set[str] = Field(default_factory=set)
+    warehouse_ids: set[str] = Field(default_factory=set)
 
 
 class Settings(BaseSettings):
@@ -27,6 +34,7 @@ class Settings(BaseSettings):
     erpnext_pos_user: str = "myretail-api@local.test"
     erpnext_pos_user_map: dict[str, str] = Field(default_factory=dict)
     erpnext_pos_credentials_map: dict[str, str] = Field(default_factory=dict)
+    pos_cashier_assignments: dict[str, POSCashierAssignment] = Field(default_factory=dict)
     default_currency: str = "KZT"
     stock_idempotency_db_path: Path = API_ROOT / "tmp" / "stock_idempotency.sqlite3"
     pos_db_path: Path = API_ROOT / "tmp" / "pos.sqlite3"
