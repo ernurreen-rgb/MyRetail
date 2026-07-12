@@ -25,6 +25,10 @@ async function readJson(response: Response): Promise<unknown> {
 function toProductsErrorMessage(status: number, payload: unknown) {
   const productError = parseProductApiError(payload);
 
+  if (status === 403) {
+    return "Нет доступа к управлению товарами. Раздел доступен только ролям Owner/Admin.";
+  }
+
   if (productError.message) {
     return productError.message;
   }

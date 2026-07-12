@@ -1,7 +1,7 @@
 import { redirect } from "next/navigation";
 import Link from "next/link";
 
-import { canManagePurchases, canUsePOS } from "@/lib/auth";
+import { canManageProducts, canManagePurchases, canUsePOS } from "@/lib/auth";
 import { getProducts } from "@/lib/products-server";
 import { getAuthSession } from "@/lib/session";
 
@@ -41,12 +41,17 @@ export default async function Home() {
     redirect("/login");
   }
 
-  const products = await getProducts(session);
-  const productsReady = products.status === "ready";
+  const canSeeProducts = canManageProducts(session.user.roles);
+  const products = canSeeProducts ? await getProducts(session) : null;
+  const productsReady = products?.status === "ready";
   const productsCount = productsReady ? products.data.count : 0;
   const canSeePurchases = canManagePurchases(session.user.roles);
   const canSeePOS = canUsePOS(session.user.roles);
   const visibleModules = modules.filter((module) => {
+    if (module === "Товары") {
+      return canSeeProducts;
+    }
+
     if (module === "Закупки") {
       return canSeePurchases;
     }
@@ -67,11 +72,13 @@ export default async function Home() {
     },
     {
       name: "MyRetail API",
-      detail: productsReady
-        ? "FastAPI-шлюз принял авторизованный запрос и вернул товары"
-        : "FastAPI-шлюз должен принять Authorization и X-MyRetail-Tenant",
-      status: productsReady ? "Готово" : "Проверить",
-      tone: productsReady ? "ready" : "error",
+      detail: canSeeProducts
+        ? productsReady
+          ? "FastAPI-шлюз принял авторизованный запрос и вернул товары"
+          : "FastAPI-шлюз должен принять Authorization и X-MyRetail-Tenant"
+        : "Доступ к управлению товарами скрыт для текущей роли; доступные рабочие API проверяются в своих разделах.",
+      status: canSeeProducts ? (productsReady ? "Готово" : "Проверить") : "Роль ограничена",
+      tone: canSeeProducts ? (productsReady ? "ready" : "error") : "neutral",
     },
     {
       name: "Tenant context",
@@ -81,11 +88,13 @@ export default async function Home() {
     },
     {
       name: "ERPNext",
-      detail: productsReady
-        ? `Локальная база доступна, товаров: ${productsCount}`
-        : "Доступ к данным идёт только через MyRetail API",
-      status: productsReady ? "Готово" : "Проверить",
-      tone: productsReady ? "ready" : "waiting",
+      detail: canSeeProducts
+        ? productsReady
+          ? `Локальная база доступна, товаров: ${productsCount}`
+          : "Доступ к данным идёт только через MyRetail API"
+        : "Каталог управления, закупочные цены и архив скрыты; POS использует отдельный DTO.",
+      status: canSeeProducts ? (productsReady ? "Готово" : "Проверить") : "Скрыто",
+      tone: canSeeProducts ? (productsReady ? "ready" : "waiting") : "neutral",
     },
   ] as const;
 
@@ -109,6 +118,30 @@ export default async function Home() {
             <span className="rounded-full bg-[var(--accent-soft)] px-3 py-1.5 text-xs font-semibold text-[var(--accent)]">
               Sprint 4
             </span>
+            {canSeePOS ? (
+              <Link
+                href="/pos"
+                className="rounded-full border border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-sm font-semibold transition hover:border-[var(--accent)] hover:text-[var(--accent)]"
+              >
+                Касса
+              </Link>
+            ) : null}
+            {canSeeProducts ? (
+              <Link
+                href="/products"
+                className="rounded-full border border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-sm font-semibold transition hover:border-[var(--accent)] hover:text-[var(--accent)]"
+              >
+                Товары
+              </Link>
+            ) : null}
+            {canSeePurchases ? (
+              <Link
+                href="/purchases"
+                className="rounded-full border border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-sm font-semibold transition hover:border-[var(--accent)] hover:text-[var(--accent)]"
+              >
+                Закупки
+              </Link>
+            ) : null}
             <form action="/api/auth/logout" method="post">
               <button
                 type="submit"
@@ -167,84 +200,88 @@ export default async function Home() {
           </div>
         </section>
 
-        <section
-          aria-labelledby="products-heading"
-          className="rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5 shadow-[0_12px_36px_rgba(20,32,24,0.04)] sm:p-6"
-        >
-          <div className="mb-5 flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
-            <div>
-              <p className="text-sm text-[var(--muted)]">Данные из ERPNext через MyRetail API</p>
-              <h2 id="products-heading" className="text-2xl font-semibold tracking-tight">
-                Товары
-              </h2>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              <Link
-                href="/products"
-                className="w-fit rounded-full bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-white transition hover:brightness-95"
-              >
-                Открыть управление товарами
-              </Link>
-              <Link
-                href="/stock"
-                className="w-fit rounded-full border border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-sm font-semibold transition hover:border-[var(--accent)] hover:text-[var(--accent)]"
-              >
-                Открыть склад
-              </Link>
-              {canSeePOS ? (
+        {canSeeProducts ? (
+          <section
+            aria-labelledby="products-heading"
+            className="rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5 shadow-[0_12px_36px_rgba(20,32,24,0.04)] sm:p-6"
+          >
+            <div className="mb-5 flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+              <div>
+                <p className="text-sm text-[var(--muted)]">Данные из ERPNext через MyRetail API</p>
+                <h2 id="products-heading" className="text-2xl font-semibold tracking-tight">
+                  Товары
+                </h2>
+              </div>
+              <div className="flex flex-wrap gap-2">
                 <Link
-                  href="/pos"
+                  href="/products"
+                  className="w-fit rounded-full bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-white transition hover:brightness-95"
+                >
+                  Открыть управление товарами
+                </Link>
+                <Link
+                  href="/stock"
                   className="w-fit rounded-full border border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-sm font-semibold transition hover:border-[var(--accent)] hover:text-[var(--accent)]"
                 >
-                  Открыть кассу
+                  Открыть склад
                 </Link>
-              ) : null}
-              {canSeePurchases ? (
-                <Link
-                  href="/purchases"
-                  className="w-fit rounded-full border border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-sm font-semibold transition hover:border-[var(--accent)] hover:text-[var(--accent)]"
-                >
-                  Открыть закупки
-                </Link>
-              ) : null}
-            </div>
-          </div>
-
-          {products.status === "ready" ? (
-            products.data.items.length > 0 ? (
-              <div className="grid gap-3 md:grid-cols-2">
-                {products.data.items.map((product) => (
-                  <article
-                    key={product.id}
-                    className="rounded-xl border border-[var(--border)] bg-[var(--surface-muted)] p-4"
+                {canSeePOS ? (
+                  <Link
+                    href="/pos"
+                    className="w-fit rounded-full border border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-sm font-semibold transition hover:border-[var(--accent)] hover:text-[var(--accent)]"
                   >
-                    <div className="flex items-start justify-between gap-4">
-                      <div>
-                        <p className="font-mono text-xs text-[var(--muted)]">{product.id}</p>
-                        <h3 className="mt-1 text-lg font-semibold">{product.name}</h3>
-                      </div>
-                      <span className="rounded-full bg-[var(--accent-soft)] px-2.5 py-1 text-xs font-semibold text-[var(--accent)]">
-                        {product.sale_price} {product.currency}
-                      </span>
-                    </div>
-                    <p className="mt-3 text-sm leading-6 text-[var(--muted)]">
-                      Артикул: {product.sku}. {product.description ?? "Описание пока не заполнено."}
-                    </p>
-                  </article>
-                ))}
+                    Открыть кассу
+                  </Link>
+                ) : null}
+                {canSeePurchases ? (
+                  <Link
+                    href="/purchases"
+                    className="w-fit rounded-full border border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-sm font-semibold transition hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                  >
+                    Открыть закупки
+                  </Link>
+                ) : null}
               </div>
-            ) : (
-              <div className="rounded-xl border border-dashed border-[var(--border)] bg-[var(--surface-muted)] p-5 text-sm leading-6 text-[var(--muted)]">
-                ERPNext доступен, но активных товаров пока нет. Следующий шаг — наполнить каталог
-                тестовыми позициями для сценариев продаж и склада.
-              </div>
-            )
-          ) : (
-            <div className="rounded-xl border border-red-200 bg-red-50 p-5 text-sm leading-6 text-red-700 dark:border-red-900 dark:bg-red-950 dark:text-red-300">
-              Не удалось получить товары: {products.message}
             </div>
-          )}
-        </section>
+
+            {products?.status === "ready" ? (
+              products.data.items.length > 0 ? (
+                <div className="grid gap-3 md:grid-cols-2">
+                  {products.data.items.map((product) => (
+                    <article
+                      key={product.id}
+                      className="rounded-xl border border-[var(--border)] bg-[var(--surface-muted)] p-4"
+                    >
+                      <div className="flex items-start justify-between gap-4">
+                        <div>
+                          <p className="font-mono text-xs text-[var(--muted)]">{product.id}</p>
+                          <h3 className="mt-1 text-lg font-semibold">{product.name}</h3>
+                        </div>
+                        <span className="rounded-full bg-[var(--accent-soft)] px-2.5 py-1 text-xs font-semibold text-[var(--accent)]">
+                          {product.sale_price} {product.currency}
+                        </span>
+                      </div>
+                      <p className="mt-3 text-sm leading-6 text-[var(--muted)]">
+                        Артикул: {product.sku}.{" "}
+                        {product.description ?? "Описание пока не заполнено."}
+                      </p>
+                    </article>
+                  ))}
+                </div>
+              ) : (
+                <div className="rounded-xl border border-dashed border-[var(--border)] bg-[var(--surface-muted)] p-5 text-sm leading-6 text-[var(--muted)]">
+                  ERPNext доступен, но активных товаров пока нет. Следующий шаг — наполнить каталог
+                  тестовыми позициями для сценариев продаж и склада.
+                </div>
+              )
+            ) : (
+              <div className="rounded-xl border border-red-200 bg-red-50 p-5 text-sm leading-6 text-red-700 dark:border-red-900 dark:bg-red-950 dark:text-red-300">
+                Не удалось получить товары:{" "}
+                {products?.status === "error" ? products.message : "нет ответа от API"}
+              </div>
+            )}
+          </section>
+        ) : null}
 
         <section className="rounded-2xl border border-[var(--border)] bg-[var(--surface-muted)] p-5 sm:p-6">
           <div className="grid gap-5 md:grid-cols-[0.85fr_1.15fr] md:items-start">

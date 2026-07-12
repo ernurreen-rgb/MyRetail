@@ -111,6 +111,16 @@ export async function proxyProductRequest({
 
   const payload = await readJson(apiResponse);
 
+  if (apiResponse.status === 403) {
+    return NextResponse.json(
+      productError(
+        "FORBIDDEN",
+        "Нет доступа к управлению товарами. Раздел доступен только ролям Owner/Admin.",
+      ),
+      { status: 403 },
+    );
+  }
+
   if (payload === null) {
     return NextResponse.json(
       productError("INVALID_RESPONSE", "MyRetail API вернул пустой или нечитаемый ответ."),
