@@ -7,6 +7,7 @@ from datetime import time as datetime_time
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 
 class POSStoreConflictError(RuntimeError):
@@ -21,6 +22,10 @@ class POSIdempotencyConflictError(RuntimeError):
     """Raised when an idempotency key is reused with another body."""
 
 
+class POSStoreMigrationError(RuntimeError):
+    """Raised when existing financial data prevents a safe schema migration."""
+
+
 @dataclass(frozen=True)
 class POSIdempotencyRecord:
     status_code: int
@@ -32,6 +37,14 @@ class POSIdempotencyBeginResult:
     acquired: bool
     record: POSIdempotencyRecord | None = None
     expired: bool = False
+    fencing_token: int = 0
+
+
+@dataclass(frozen=True)
+class POSIntentBeginResult:
+    acquired: bool
+    intent: dict[str, Any]
+    recovery_only: bool = False
 
 
 class POSStore:
@@ -55,7 +68,8 @@ class POSStore:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
-                SELECT request_hash, status, status_code, response_body, lease_until
+                SELECT request_hash, status, status_code, response_body, lease_until,
+                       fencing_token
                 FROM pos_idempotency
                 WHERE tenant = ? AND operation = ? AND user_email = ? AND idempotency_key = ?
                 """,
@@ -66,14 +80,15 @@ class POSStore:
                     """
                     INSERT INTO pos_idempotency (
                         tenant, operation, user_email, idempotency_key, request_hash,
-                        status, status_code, response_body, lease_until, created_at, updated_at
+                        status, status_code, response_body, lease_until, fencing_token,
+                        created_at, updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, 'processing', 0, '{}', ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, 'processing', 0, '{}', ?, 1, ?, ?)
                     """,
                     (tenant, operation, user_email, key, request_hash, lease_until, now, now),
                 )
                 connection.commit()
-                return POSIdempotencyBeginResult(acquired=True)
+                return POSIdempotencyBeginResult(acquired=True, fencing_token=1)
 
             if row[0] != request_hash:
                 connection.rollback()
@@ -83,18 +98,24 @@ class POSStore:
                 return POSIdempotencyBeginResult(
                     acquired=False,
                     record=_record_from_row(row[2], row[3]),
+                    fencing_token=int(row[5]),
                 )
             if _parse_timestamp(str(row[4])) <= time.time():
                 connection.execute(
                     """
                     UPDATE pos_idempotency
-                    SET lease_until = ?, updated_at = ?
+                    SET lease_until = ?, fencing_token = fencing_token + 1, updated_at = ?
                     WHERE tenant = ? AND operation = ? AND user_email = ? AND idempotency_key = ?
                     """,
                     (lease_until, now, tenant, operation, user_email, key),
                 )
+                fencing_token = int(row[5]) + 1
                 connection.commit()
-                return POSIdempotencyBeginResult(acquired=True, expired=True)
+                return POSIdempotencyBeginResult(
+                    acquired=True,
+                    expired=True,
+                    fencing_token=fencing_token,
+                )
             connection.execute(
                 """
                 UPDATE pos_idempotency
@@ -104,7 +125,10 @@ class POSStore:
                 (lease_until, now, tenant, operation, user_email, key),
             )
             connection.commit()
-            return POSIdempotencyBeginResult(acquired=False)
+            return POSIdempotencyBeginResult(
+                acquired=False,
+                fencing_token=int(row[5]),
+            )
 
     def get_completed_idempotency(
         self,
@@ -140,22 +164,46 @@ class POSStore:
         user_email: str,
         key: str,
         request_hash: str,
+        fencing_token: int,
         status_code: int,
         response_body: dict[str, object],
-    ) -> None:
+    ) -> bool:
         encoded = json.dumps(
             response_body, ensure_ascii=False, separators=(",", ":"), sort_keys=True
         )
         with self._connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
                 UPDATE pos_idempotency
                 SET status = 'completed', status_code = ?, response_body = ?, updated_at = ?
                 WHERE tenant = ? AND operation = ? AND user_email = ? AND idempotency_key = ?
                   AND request_hash = ?
+                  AND fencing_token = ? AND status = 'processing'
                 """,
-                (status_code, encoded, _now(), tenant, operation, user_email, key, request_hash),
+                (
+                    status_code,
+                    encoded,
+                    _now(),
+                    tenant,
+                    operation,
+                    user_email,
+                    key,
+                    request_hash,
+                    fencing_token,
+                ),
             )
+            if cursor.rowcount != 1:
+                raise POSIdempotencyConflictError("Idempotency lease ownership was lost")
+            connection.execute(
+                """
+                UPDATE pos_operation_intents
+                SET state = 'completed', updated_at = ?
+                WHERE tenant = ? AND operation = ? AND user_email = ?
+                  AND business_hash = ? AND state = 'materialized'
+                """,
+                (_now(), tenant, operation, user_email, request_hash),
+            )
+        return True
 
     def release_idempotency(
         self,
@@ -165,15 +213,541 @@ class POSStore:
         user_email: str,
         key: str,
         request_hash: str,
-    ) -> None:
+        fencing_token: int,
+    ) -> bool:
         with self._connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
                 DELETE FROM pos_idempotency
                 WHERE tenant = ? AND operation = ? AND user_email = ? AND idempotency_key = ?
                   AND request_hash = ? AND status = 'processing'
+                  AND fencing_token = ?
                 """,
-                (tenant, operation, user_email, key, request_hash),
+                (tenant, operation, user_email, key, request_hash, fencing_token),
+            )
+        return cursor.rowcount == 1
+
+    def begin_operation_intent(
+        self,
+        *,
+        tenant: str,
+        operation: str,
+        scope_id: str,
+        user_email: str,
+        business_hash: str,
+        payload: dict[str, Any],
+        external_key: str | None = None,
+        expected_shift_updated_at: str | None = None,
+        lease_seconds: int = 60,
+    ) -> POSIntentBeginResult:
+        now = _now()
+        lease_until = _timestamp(time.time() + lease_seconds)
+        encoded_payload = json.dumps(
+            payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT * FROM pos_operation_intents
+                WHERE tenant = ? AND scope_id = ?
+                  AND state IN ('reserved', 'erp_pending', 'recovery_required', 'materialized')
+                LIMIT 1
+                """,
+                (tenant, scope_id),
+            ).fetchone()
+            if existing is not None:
+                intent = dict(existing)
+                if not (
+                    intent["operation"] == operation
+                    and intent["user_email"] == user_email
+                    and intent["business_hash"] == business_hash
+                ):
+                    connection.rollback()
+                    raise POSStoreConflictError(
+                        "SHIFT_CHANGED", "По смене уже выполняется другая операция"
+                    )
+                expired = _parse_timestamp(str(intent["lease_until"])) <= time.time()
+                recovery_only = intent["state"] != "reserved" or expired
+                if intent["state"] == "materialized":
+                    connection.commit()
+                    return POSIntentBeginResult(
+                        acquired=True,
+                        intent=intent,
+                        recovery_only=True,
+                    )
+                if intent["state"] == "recovery_required" or expired:
+                    fencing_token = int(intent["fencing_token"]) + 1
+                    connection.execute(
+                        """
+                        UPDATE pos_operation_intents
+                        SET fencing_token = ?, lease_until = ?, updated_at = ?
+                        WHERE id = ? AND fencing_token = ?
+                        """,
+                        (
+                            fencing_token,
+                            lease_until,
+                            now,
+                            intent["id"],
+                            intent["fencing_token"],
+                        ),
+                    )
+                    connection.commit()
+                    intent.update(
+                        {
+                            "fencing_token": fencing_token,
+                            "lease_until": lease_until,
+                            "updated_at": now,
+                        }
+                    )
+                    return POSIntentBeginResult(
+                        acquired=True,
+                        intent=intent,
+                        recovery_only=True,
+                    )
+                connection.commit()
+                return POSIntentBeginResult(
+                    acquired=False,
+                    intent=intent,
+                    recovery_only=recovery_only,
+                )
+
+            if expected_shift_updated_at is not None:
+                shift_id = scope_id.removeprefix("shift:")
+                shift = connection.execute(
+                    "SELECT status, updated_at FROM pos_shifts WHERE tenant = ? AND id = ?",
+                    (tenant, shift_id),
+                ).fetchone()
+                if shift is None:
+                    connection.rollback()
+                    raise POSStoreConflictError("SHIFT_NOT_FOUND", "Смена не найдена")
+                if str(shift["status"]) != "open":
+                    connection.rollback()
+                    raise POSStoreConflictError("SHIFT_CLOSED", "Смена закрыта")
+                if str(shift["updated_at"]) != expected_shift_updated_at:
+                    connection.rollback()
+                    raise POSStoreConflictError("SHIFT_CHANGED", "Смена изменилась")
+
+            intent_id = f"POSOP-{uuid4().hex[:16].upper()}"
+            operation_key = external_key or intent_id
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO pos_operation_intents (
+                        id, tenant, operation, scope_id, user_email, business_hash,
+                        external_key, payload_json, state, lease_until, fencing_token,
+                        erpnext_document_id, result_id, created_at, updated_at
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, 1,
+                        NULL, NULL, ?, ?
+                    )
+                    """,
+                    (
+                        intent_id,
+                        tenant,
+                        operation,
+                        scope_id,
+                        user_email,
+                        business_hash,
+                        operation_key,
+                        encoded_payload,
+                        lease_until,
+                        now,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                connection.rollback()
+                raise POSStoreConflictError(
+                    "SHIFT_CHANGED", "Для кассы или кассира уже выполняется операция"
+                ) from exc
+            connection.commit()
+        intent = self.get_operation_intent(intent_id)
+        if intent is None:
+            raise POSStoreConflictError("SHIFT_CHANGED", "Operation intent was not persisted")
+        return POSIntentBeginResult(acquired=True, intent=intent)
+
+    def find_active_operation_intent(
+        self,
+        *,
+        tenant: str,
+        operation: str,
+        user_email: str,
+        business_hash: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM pos_operation_intents
+                WHERE tenant = ? AND operation = ? AND user_email = ? AND business_hash = ?
+                  AND state IN ('reserved', 'erp_pending', 'recovery_required', 'materialized')
+                ORDER BY created_at ASC
+                LIMIT 1
+                """,
+                (tenant, operation, user_email, business_hash),
+            ).fetchone()
+        return _dict(row)
+
+    def claim_operation_intent(
+        self, intent_id: str, *, lease_seconds: int = 60
+    ) -> POSIntentBeginResult:
+        now = _now()
+        lease_until = _timestamp(time.time() + lease_seconds)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM pos_operation_intents WHERE id = ?",
+                (intent_id,),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                raise POSStoreConflictError("SHIFT_CHANGED", "Operation intent not found")
+            intent = dict(row)
+            if intent["state"] == "materialized":
+                connection.commit()
+                return POSIntentBeginResult(
+                    acquired=True,
+                    intent=intent,
+                    recovery_only=True,
+                )
+            if intent["state"] not in {
+                "reserved",
+                "erp_pending",
+                "recovery_required",
+            }:
+                connection.commit()
+                return POSIntentBeginResult(acquired=False, intent=intent)
+            expired = _parse_timestamp(str(intent["lease_until"])) <= time.time()
+            if intent["state"] != "recovery_required" and not expired:
+                connection.commit()
+                return POSIntentBeginResult(
+                    acquired=False,
+                    intent=intent,
+                    recovery_only=intent["state"] != "reserved",
+                )
+            fencing_token = int(intent["fencing_token"]) + 1
+            cursor = connection.execute(
+                """
+                UPDATE pos_operation_intents
+                SET fencing_token = ?, lease_until = ?, updated_at = ?
+                WHERE id = ? AND fencing_token = ?
+                  AND state IN ('reserved', 'erp_pending', 'recovery_required')
+                """,
+                (
+                    fencing_token,
+                    lease_until,
+                    now,
+                    intent_id,
+                    intent["fencing_token"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                raise POSStoreConflictError("SHIFT_CHANGED", "Operation intent changed")
+            connection.commit()
+        intent.update(
+            {
+                "fencing_token": fencing_token,
+                "lease_until": lease_until,
+                "updated_at": now,
+            }
+        )
+        return POSIntentBeginResult(acquired=True, intent=intent, recovery_only=True)
+
+    def get_operation_intent(self, intent_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM pos_operation_intents WHERE id = ?",
+                (intent_id,),
+            ).fetchone()
+        return _dict(row)
+
+    def mark_operation_erp_pending(self, intent_id: str, fencing_token: int) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE pos_operation_intents
+                SET state = 'erp_pending', updated_at = ?
+                WHERE id = ? AND fencing_token = ? AND state = 'reserved'
+                """,
+                (_now(), intent_id, fencing_token),
+            )
+        return cursor.rowcount == 1
+
+    def mark_operation_recovery_required(self, intent_id: str, fencing_token: int) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE pos_operation_intents
+                SET state = 'recovery_required', lease_until = ?, updated_at = ?
+                WHERE id = ? AND fencing_token = ?
+                  AND state IN ('reserved', 'erp_pending', 'recovery_required')
+                """,
+                (_timestamp(time.time() - 1), _now(), intent_id, fencing_token),
+            )
+        return cursor.rowcount == 1
+
+    def fail_operation_intent(self, intent_id: str, fencing_token: int) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE pos_operation_intents
+                SET state = 'failed', updated_at = ?
+                WHERE id = ? AND fencing_token = ?
+                  AND state IN ('reserved', 'erp_pending', 'recovery_required')
+                """,
+                (_now(), intent_id, fencing_token),
+            )
+        return cursor.rowcount == 1
+
+    def materialize_open_shift_intent(
+        self, intent_id: str, fencing_token: int, erpnext_opening_id: str
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            intent = self._owned_intent(
+                connection, intent_id, fencing_token, operation="open_shift"
+            )
+            payload = _intent_payload(intent)
+            shift_row = dict(payload["shift"])
+            shift_row["erpnext_opening_id"] = erpnext_opening_id
+            existing = connection.execute(
+                "SELECT * FROM pos_shifts WHERE tenant = ? AND id = ?",
+                (shift_row["tenant"], shift_row["id"]),
+            ).fetchone()
+            if existing is None:
+                active = connection.execute(
+                    """
+                    SELECT id FROM pos_shifts
+                    WHERE tenant = ? AND status = 'open'
+                      AND (register_id = ? OR cashier_email = ?)
+                    LIMIT 1
+                    """,
+                    (
+                        shift_row["tenant"],
+                        shift_row["register_id"],
+                        shift_row["cashier_email"],
+                    ),
+                ).fetchone()
+                if active is not None:
+                    connection.rollback()
+                    raise POSStoreConflictError("SHIFT_ALREADY_OPEN", "Смена уже открыта")
+                connection.execute(
+                    """
+                    INSERT INTO pos_shifts (
+                        id, tenant, register_id, register_name, warehouse_id, warehouse_name,
+                        cashier_email, cashier_full_name, status, opening_cash, sales_total,
+                        expected_cash, actual_cash, difference, erpnext_opening_id,
+                        erpnext_closing_id, opened_at, closed_at, updated_at
+                    ) VALUES (
+                        :id, :tenant, :register_id, :register_name, :warehouse_id,
+                        :warehouse_name, :cashier_email, :cashier_full_name, 'open',
+                        :opening_cash, '0.00', :opening_cash, NULL, NULL,
+                        :erpnext_opening_id, NULL, :opened_at, NULL, :updated_at
+                    )
+                    """,
+                    shift_row,
+                )
+            self._complete_intent(
+                connection,
+                intent_id,
+                fencing_token,
+                erpnext_document_id=erpnext_opening_id,
+                result_id=str(shift_row["id"]),
+            )
+            connection.commit()
+        return self.get_shift(str(shift_row["tenant"]), str(shift_row["id"])) or shift_row
+
+    def materialize_close_shift_intent(
+        self, intent_id: str, fencing_token: int, erpnext_closing_id: str
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            intent = self._owned_intent(
+                connection, intent_id, fencing_token, operation="close_shift"
+            )
+            payload = _intent_payload(intent)
+            close = dict(payload["close"])
+            shift = connection.execute(
+                "SELECT * FROM pos_shifts WHERE tenant = ? AND id = ?",
+                (close["tenant"], close["shift_id"]),
+            ).fetchone()
+            if shift is None:
+                connection.rollback()
+                raise POSStoreConflictError("SHIFT_NOT_FOUND", "Смена не найдена")
+            current = dict(shift)
+            if current["status"] == "open":
+                if current["updated_at"] != close["expected_updated_at"]:
+                    connection.rollback()
+                    raise POSStoreConflictError("SHIFT_CHANGED", "Смена изменилась")
+                connection.execute(
+                    """
+                    UPDATE pos_shifts
+                    SET status = 'closed', actual_cash = ?, difference = ?,
+                        erpnext_closing_id = ?, closed_at = ?, updated_at = ?
+                    WHERE tenant = ? AND id = ? AND status = 'open'
+                    """,
+                    (
+                        close["actual_cash"],
+                        close["difference"],
+                        erpnext_closing_id,
+                        close["closed_at"],
+                        close["closed_at"],
+                        close["tenant"],
+                        close["shift_id"],
+                    ),
+                )
+            elif current.get("erpnext_closing_id") != erpnext_closing_id:
+                connection.rollback()
+                raise POSStoreConflictError("SHIFT_CLOSED", "Смена уже закрыта")
+            self._complete_intent(
+                connection,
+                intent_id,
+                fencing_token,
+                erpnext_document_id=erpnext_closing_id,
+                result_id=str(close["shift_id"]),
+            )
+            connection.commit()
+        return self.get_shift(str(close["tenant"]), str(close["shift_id"])) or current
+
+    def materialize_sale_intent(
+        self, intent_id: str, fencing_token: int, erpnext_invoice_id: str
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            intent = self._owned_intent(
+                connection, intent_id, fencing_token, operation="create_sale"
+            )
+            payload = _intent_payload(intent)
+            sale_row = dict(payload["sale"])
+            sale_row["receipt_number"] = erpnext_invoice_id
+            sale_row["erpnext_sales_invoice_id"] = erpnext_invoice_id
+            existing = connection.execute(
+                """
+                SELECT * FROM pos_sales
+                WHERE tenant = ? AND erpnext_sales_invoice_id = ?
+                """,
+                (sale_row["tenant"], erpnext_invoice_id),
+            ).fetchone()
+            if existing is None:
+                shift = connection.execute(
+                    "SELECT * FROM pos_shifts WHERE tenant = ? AND id = ?",
+                    (sale_row["tenant"], sale_row["shift_id"]),
+                ).fetchone()
+                if shift is None:
+                    connection.rollback()
+                    raise POSStoreConflictError("SHIFT_NOT_FOUND", "Смена не найдена")
+                shift_data = dict(shift)
+                if shift_data["status"] != "open":
+                    connection.rollback()
+                    raise POSStoreConflictError("SHIFT_CLOSED", "Смена закрыта")
+                try:
+                    connection.execute(
+                        """
+                        INSERT INTO pos_sales (
+                            id, tenant, receipt_number, shift_id, register_id, register_name,
+                            warehouse_id, warehouse_name, cashier_email, cashier_full_name,
+                            lines_json, subtotal, discount_total, grand_total, cash_received,
+                            change, erpnext_sales_invoice_id, created_at
+                        ) VALUES (
+                            :id, :tenant, :receipt_number, :shift_id, :register_id,
+                            :register_name, :warehouse_id, :warehouse_name, :cashier_email,
+                            :cashier_full_name, :lines_json, :subtotal, :discount_total,
+                            :grand_total, :cash_received, :change,
+                            :erpnext_sales_invoice_id, :created_at
+                        )
+                        """,
+                        sale_row,
+                    )
+                except sqlite3.IntegrityError as exc:
+                    connection.rollback()
+                    raise POSStoreConflictError(
+                        "IDEMPOTENCY_CONFLICT", "ERPNext invoice уже materialized"
+                    ) from exc
+                sales_total = _money_add(shift_data["sales_total"], sale_row["grand_total"])
+                expected_cash = _money_add(shift_data["opening_cash"], sales_total)
+                connection.execute(
+                    """
+                    UPDATE pos_shifts
+                    SET sales_total = ?, expected_cash = ?, updated_at = ?
+                    WHERE tenant = ? AND id = ? AND status = 'open'
+                    """,
+                    (
+                        sales_total,
+                        expected_cash,
+                        sale_row["created_at"],
+                        sale_row["tenant"],
+                        sale_row["shift_id"],
+                    ),
+                )
+                held_receipt_id = payload.get("held_receipt_id")
+                if held_receipt_id:
+                    connection.execute(
+                        """
+                        UPDATE pos_held_receipts
+                        SET status = 'completed', updated_at = ?
+                        WHERE tenant = ? AND id = ? AND status = 'open'
+                        """,
+                        (sale_row["created_at"], sale_row["tenant"], held_receipt_id),
+                    )
+                result_id = str(sale_row["id"])
+            else:
+                result_id = str(existing["id"])
+            self._complete_intent(
+                connection,
+                intent_id,
+                fencing_token,
+                erpnext_document_id=erpnext_invoice_id,
+                result_id=result_id,
+            )
+            connection.commit()
+        return self.get_sale(str(sale_row["tenant"]), result_id) or sale_row
+
+    @staticmethod
+    def _owned_intent(
+        connection: sqlite3.Connection,
+        intent_id: str,
+        fencing_token: int,
+        *,
+        operation: str,
+    ) -> dict[str, Any]:
+        row = connection.execute(
+            """
+            SELECT * FROM pos_operation_intents
+            WHERE id = ? AND operation = ? AND fencing_token = ?
+              AND state IN ('reserved', 'erp_pending', 'recovery_required')
+            """,
+            (intent_id, operation, fencing_token),
+        ).fetchone()
+        if row is None:
+            connection.rollback()
+            raise POSStoreConflictError(
+                "IDEMPOTENCY_CONFLICT", "Operation lease больше не принадлежит запросу"
+            )
+        return dict(row)
+
+    @staticmethod
+    def _complete_intent(
+        connection: sqlite3.Connection,
+        intent_id: str,
+        fencing_token: int,
+        *,
+        erpnext_document_id: str,
+        result_id: str,
+    ) -> None:
+        cursor = connection.execute(
+            """
+            UPDATE pos_operation_intents
+            SET state = 'materialized', erpnext_document_id = ?, result_id = ?, updated_at = ?
+            WHERE id = ? AND fencing_token = ?
+              AND state IN ('reserved', 'erp_pending', 'recovery_required')
+            """,
+            (erpnext_document_id, result_id, _now(), intent_id, fencing_token),
+        )
+        if cursor.rowcount != 1:
+            connection.rollback()
+            raise POSStoreConflictError(
+                "IDEMPOTENCY_CONFLICT", "Operation lease больше не принадлежит запросу"
             )
 
     def create_shift(self, row: dict[str, Any]) -> dict[str, Any]:
@@ -836,10 +1410,59 @@ class POSStore:
                     status_code INTEGER NOT NULL,
                     response_body TEXT NOT NULL,
                     lease_until TEXT NOT NULL,
+                    fencing_token INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (tenant, operation, user_email, idempotency_key)
                 )
+                """
+            )
+            if "fencing_token" not in _table_columns(connection, "pos_idempotency"):
+                connection.execute(
+                    "ALTER TABLE pos_idempotency "
+                    "ADD COLUMN fencing_token INTEGER NOT NULL DEFAULT 1"
+                )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pos_operation_intents (
+                    id TEXT PRIMARY KEY,
+                    tenant TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    scope_id TEXT NOT NULL,
+                    user_email TEXT NOT NULL,
+                    business_hash TEXT NOT NULL,
+                    external_key TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    lease_until TEXT NOT NULL,
+                    fencing_token INTEGER NOT NULL,
+                    erpnext_document_id TEXT,
+                    result_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS pos_operation_active_scope
+                ON pos_operation_intents(tenant, scope_id)
+                WHERE state IN ('reserved', 'erp_pending', 'recovery_required', 'materialized')
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS pos_operation_active_business
+                ON pos_operation_intents(tenant, operation, user_email, business_hash)
+                WHERE state IN ('reserved', 'erp_pending', 'recovery_required', 'materialized')
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS pos_operation_active_open_cashier
+                ON pos_operation_intents(tenant, user_email)
+                WHERE operation = 'open_shift'
+                  AND state IN ('reserved', 'erp_pending', 'recovery_required', 'materialized')
                 """
             )
             connection.execute(
@@ -949,6 +1572,25 @@ class POSStore:
                 )
                 """
             )
+            duplicate_invoice = connection.execute(
+                """
+                SELECT 1 FROM pos_sales
+                GROUP BY tenant, erpnext_sales_invoice_id
+                HAVING COUNT(*) > 1
+                LIMIT 1
+                """
+            ).fetchone()
+            if duplicate_invoice is not None:
+                raise POSStoreMigrationError(
+                    "pos_sales contains duplicate ERPNext invoice ids; "
+                    "manual reconciliation required"
+                )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS pos_sales_erpnext_invoice_unique
+                ON pos_sales(tenant, erpnext_sales_invoice_id)
+                """
+            )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS pos_returns_sale_state "
                 "ON pos_returns(tenant, sale_id, state)"
@@ -966,6 +1608,17 @@ class POSStore:
 
 def _dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
+
+
+def _table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")}
+
+
+def _intent_payload(intent: dict[str, Any]) -> dict[str, Any]:
+    payload = json.loads(str(intent["payload_json"]))
+    if not isinstance(payload, dict):
+        raise POSStoreConflictError("IDEMPOTENCY_CONFLICT", "Operation snapshot is invalid")
+    return payload
 
 
 def _record_from_row(status_code: object, response_body: object) -> POSIdempotencyRecord:

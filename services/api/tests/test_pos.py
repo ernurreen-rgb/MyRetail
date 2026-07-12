@@ -27,7 +27,7 @@ from myretail_api.models.pos import (
 )
 from myretail_api.models.stock import WarehouseRef
 from myretail_api.pos_service import _request_hash
-from myretail_api.pos_store import POSStore
+from myretail_api.pos_store import POSStore, POSStoreMigrationError
 from myretail_api.security import create_access_token
 
 
@@ -226,6 +226,105 @@ class FlakySaleERPNextClient(StubPOSErpnextClient):
         if idempotency_key == self.created_key:
             return self.sales[-1]
         return None
+
+
+class DelayedRecoveryOpenERPNextClient(StubPOSErpnextClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.created_key: str | None = None
+        self.recovery_attempts = 0
+
+    async def create_pos_opening(self, **kwargs: object) -> str:
+        _ = await super().create_pos_opening(**kwargs)
+        self.created_key = str(kwargs["idempotency_key"])
+        raise ERPNextAmbiguousCreateError("lost opening response")
+
+    async def recover_pos_opening(
+        self, tenant: str, operation: str, user_email: str, idempotency_key: str
+    ) -> str | None:
+        _ = tenant, operation, user_email
+        self.recovery_attempts += 1
+        if idempotency_key == self.created_key and self.recovery_attempts > 1:
+            return self.openings[-1]
+        return None
+
+
+class DelayedRecoveryCloseERPNextClient(StubPOSErpnextClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.created_key: str | None = None
+        self.recovery_attempts = 0
+
+    async def create_pos_closing(self, **kwargs: object) -> str:
+        _ = await super().create_pos_closing(**kwargs)
+        self.created_key = str(kwargs["idempotency_key"])
+        raise ERPNextAmbiguousCreateError("lost closing response")
+
+    async def recover_pos_closing(
+        self, tenant: str, operation: str, user_email: str, idempotency_key: str
+    ) -> str | None:
+        _ = tenant, operation, user_email
+        self.recovery_attempts += 1
+        if idempotency_key == self.created_key and self.recovery_attempts > 1:
+            return self.closings[-1]
+        return None
+
+
+class DelayedRecoverySaleERPNextClient(StubPOSErpnextClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.created_key: str | None = None
+        self.recovery_attempts = 0
+
+    async def create_pos_sales_invoice(self, **kwargs: object) -> str:
+        _ = await super().create_pos_sales_invoice(**kwargs)
+        self.created_key = str(kwargs["idempotency_key"])
+        raise ERPNextAmbiguousCreateError("lost sale response")
+
+    async def recover_pos_sale(
+        self, tenant: str, operation: str, user_email: str, idempotency_key: str
+    ) -> str | None:
+        _ = tenant, operation, user_email
+        self.recovery_attempts += 1
+        if idempotency_key == self.created_key and self.recovery_attempts > 1:
+            return self.sales[-1]
+        return None
+
+
+class BlockingCommittedSaleERPNextClient(StubPOSErpnextClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.created_key: str | None = None
+        self.invoice_created = asyncio.Event()
+        self.release_response = asyncio.Event()
+
+    async def create_pos_sales_invoice(self, **kwargs: object) -> str:
+        invoice = await super().create_pos_sales_invoice(**kwargs)
+        self.created_key = str(kwargs["idempotency_key"])
+        self.invoice_created.set()
+        await self.release_response.wait()
+        return invoice
+
+    async def recover_pos_sale(
+        self, tenant: str, operation: str, user_email: str, idempotency_key: str
+    ) -> str | None:
+        _ = tenant, operation, user_email
+        if idempotency_key == self.created_key:
+            return self.sales[-1]
+        return None
+
+
+class BlockingCommittedCloseERPNextClient(StubPOSErpnextClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.closing_created = asyncio.Event()
+        self.release_response = asyncio.Event()
+
+    async def create_pos_closing(self, **kwargs: object) -> str:
+        closing = await super().create_pos_closing(**kwargs)
+        self.closing_created.set()
+        await self.release_response.wait()
+        return closing
 
 
 class RecoveringSaleERPNextClient(StubPOSErpnextClient):
@@ -886,6 +985,358 @@ async def test_sale_recovers_ambiguous_erpnext_create_without_duplicate(tmp_path
     assert response.json()["receipt_number"] == "SINV-1"
     assert erpnext.sales == ["SINV-1"]
     assert erpnext.products["SKU-1"].available == "4.000"
+
+
+@pytest.mark.anyio
+async def test_lost_opening_response_retry_materializes_local_shift(tmp_path: Path) -> None:
+    erpnext = DelayedRecoveryOpenERPNextClient()
+    app = make_app(erpnext, tmp_path)
+    key = str(uuid4())
+    body = {"register_id": "POS-1", "opening_cash": "10000.00"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        first = await client.post(
+            "/pos/shifts", headers=auth_headers(tmp_path, key=key), json=body
+        )
+        retry = await client.post(
+            "/pos/shifts", headers=auth_headers(tmp_path, key=key), json=body
+        )
+
+    assert first.status_code == 503
+    assert first.json()["error"]["code"] == "ERPNEXT_RECOVERY_PENDING"
+    assert retry.status_code == 201
+    assert erpnext.openings == ["OPEN-1"]
+    with sqlite3.connect(tmp_path / "pos.sqlite3") as connection:
+        opening_id = connection.execute(
+            "SELECT erpnext_opening_id FROM pos_shifts WHERE id = ?",
+            (retry.json()["id"],),
+        ).fetchone()[0]
+    assert opening_id == "OPEN-1"
+
+
+@pytest.mark.anyio
+async def test_lost_closing_response_retry_materializes_local_shift(tmp_path: Path) -> None:
+    erpnext = DelayedRecoveryCloseERPNextClient()
+    app = make_app(erpnext, tmp_path)
+    key = str(uuid4())
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        shift = await open_shift(client, tmp_path)
+        body = {
+            "actual_cash": "10000.00",
+            "expected_updated_at": shift["updated_at"],
+        }
+        first = await client.post(
+            f"/pos/shifts/{shift['id']}/close",
+            headers=auth_headers(tmp_path, key=key),
+            json=body,
+        )
+        retry = await client.post(
+            f"/pos/shifts/{shift['id']}/close",
+            headers=auth_headers(tmp_path, key=key),
+            json=body,
+        )
+
+    assert first.status_code == 503
+    assert first.json()["error"]["code"] == "ERPNEXT_RECOVERY_PENDING"
+    assert retry.status_code == 200
+    assert retry.json()["status"] == "closed"
+    assert erpnext.closings == ["CLOSE-1"]
+    with sqlite3.connect(tmp_path / "pos.sqlite3") as connection:
+        closing_id = connection.execute(
+            "SELECT erpnext_closing_id FROM pos_shifts WHERE id = ?",
+            (shift["id"],),
+        ).fetchone()[0]
+    assert closing_id == "CLOSE-1"
+
+
+@pytest.mark.anyio
+async def test_sale_timeout_retry_with_new_key_recovers_without_second_invoice(
+    tmp_path: Path,
+) -> None:
+    erpnext = DelayedRecoverySaleERPNextClient()
+    app = make_app(erpnext, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        shift = await open_shift(client, tmp_path)
+        body = {
+            "shift_id": shift["id"],
+            "lines": [
+                {
+                    "product_id": "SKU-1",
+                    "quantity": "1.000",
+                    "discount_percent": "0.00",
+                }
+            ],
+            "cash_received": "100.00",
+        }
+        first = await client.post(
+            "/pos/sales", headers=auth_headers(tmp_path, key=str(uuid4())), json=body
+        )
+        retry = await client.post(
+            "/pos/sales", headers=auth_headers(tmp_path, key=str(uuid4())), json=body
+        )
+
+    assert first.status_code == 503
+    assert first.json()["error"]["code"] == "ERPNEXT_RECOVERY_PENDING"
+    assert retry.status_code == 201
+    assert retry.json()["receipt_number"] == "SINV-1"
+    assert erpnext.sales == ["SINV-1"]
+    assert erpnext.products["SKU-1"].available == "4.000"
+
+
+@pytest.mark.anyio
+async def test_expired_sale_lease_takeover_fences_old_owner(tmp_path: Path) -> None:
+    erpnext = BlockingCommittedSaleERPNextClient()
+    first_app = make_app(erpnext, tmp_path)
+    second_app = make_app(erpnext, tmp_path)
+    key = str(uuid4())
+    async with (
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=first_app), base_url="http://first"
+        ) as first_client,
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=second_app), base_url="http://second"
+        ) as second_client,
+    ):
+        shift = await open_shift(first_client, tmp_path)
+        body = {
+            "shift_id": shift["id"],
+            "lines": [
+                {
+                    "product_id": "SKU-1",
+                    "quantity": "1.000",
+                    "discount_percent": "0.00",
+                }
+            ],
+            "cash_received": "100.00",
+        }
+        first_task = asyncio.create_task(
+            first_client.post(
+                "/pos/sales", headers=auth_headers(tmp_path, key=key), json=body
+            )
+        )
+        await asyncio.wait_for(erpnext.invoice_created.wait(), timeout=2)
+        with sqlite3.connect(tmp_path / "pos.sqlite3") as connection:
+            connection.execute(
+                "UPDATE pos_idempotency SET lease_until = '2000-01-01T00:00:00Z' "
+                "WHERE operation = 'create_sale' AND idempotency_key = ?",
+                (key,),
+            )
+            connection.execute(
+                "UPDATE pos_operation_intents SET lease_until = '2000-01-01T00:00:00Z' "
+                "WHERE operation = 'create_sale' AND state = 'erp_pending'"
+            )
+            connection.commit()
+        takeover = await second_client.post(
+            "/pos/sales", headers=auth_headers(tmp_path, key=key), json=body
+        )
+        erpnext.release_response.set()
+        stale_owner = await asyncio.wait_for(first_task, timeout=2)
+
+    assert takeover.status_code == 201
+    assert stale_owner.status_code == 409
+    assert erpnext.sales == ["SINV-1"]
+    with sqlite3.connect(tmp_path / "pos.sqlite3") as connection:
+        local_sales = connection.execute("SELECT COUNT(*) FROM pos_sales").fetchone()[0]
+        intent = connection.execute(
+            "SELECT state, fencing_token FROM pos_operation_intents "
+            "WHERE operation = 'create_sale'"
+        ).fetchone()
+    assert local_sales == 1
+    assert intent == ("completed", 2)
+
+
+@pytest.mark.anyio
+async def test_sale_and_close_race_is_serialized_across_api_instances(tmp_path: Path) -> None:
+    erpnext = BlockingCommittedSaleERPNextClient()
+    sale_app = make_app(erpnext, tmp_path)
+    close_app = make_app(erpnext, tmp_path)
+    async with (
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=sale_app), base_url="http://sale"
+        ) as sale_client,
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=close_app), base_url="http://close"
+        ) as close_client,
+    ):
+        shift = await open_shift(sale_client, tmp_path)
+        sale_task = asyncio.create_task(
+            sale_client.post(
+                "/pos/sales",
+                headers=auth_headers(tmp_path, key=str(uuid4())),
+                json={
+                    "shift_id": shift["id"],
+                    "lines": [
+                        {
+                            "product_id": "SKU-1",
+                            "quantity": "1.000",
+                            "discount_percent": "0.00",
+                        }
+                    ],
+                    "cash_received": "100.00",
+                },
+            )
+        )
+        await asyncio.wait_for(erpnext.invoice_created.wait(), timeout=2)
+        close = await close_client.post(
+            f"/pos/shifts/{shift['id']}/close",
+            headers=auth_headers(tmp_path, key=str(uuid4())),
+            json={
+                "actual_cash": "10000.00",
+                "expected_updated_at": shift["updated_at"],
+            },
+        )
+        erpnext.release_response.set()
+        sale = await asyncio.wait_for(sale_task, timeout=2)
+
+    assert sale.status_code == 201
+    assert close.status_code == 409
+    assert close.json()["error"]["code"] == "SHIFT_CHANGED"
+    assert erpnext.sales == ["SINV-1"]
+    assert erpnext.closings == []
+    with sqlite3.connect(tmp_path / "pos.sqlite3") as connection:
+        local_sales = connection.execute("SELECT COUNT(*) FROM pos_sales").fetchone()[0]
+        shift_status = connection.execute(
+            "SELECT status FROM pos_shifts WHERE id = ?", (shift["id"],)
+        ).fetchone()[0]
+    assert local_sales == 1
+    assert shift_status == "open"
+
+
+@pytest.mark.anyio
+async def test_close_and_sale_race_blocks_sale_before_erp_side_effect(tmp_path: Path) -> None:
+    erpnext = BlockingCommittedCloseERPNextClient()
+    close_app = make_app(erpnext, tmp_path)
+    sale_app = make_app(erpnext, tmp_path)
+    async with (
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=close_app), base_url="http://close"
+        ) as close_client,
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=sale_app), base_url="http://sale"
+        ) as sale_client,
+    ):
+        shift = await open_shift(close_client, tmp_path)
+        close_task = asyncio.create_task(
+            close_client.post(
+                f"/pos/shifts/{shift['id']}/close",
+                headers=auth_headers(tmp_path, key=str(uuid4())),
+                json={
+                    "actual_cash": "10000.00",
+                    "expected_updated_at": shift["updated_at"],
+                },
+            )
+        )
+        await asyncio.wait_for(erpnext.closing_created.wait(), timeout=2)
+        sale = await sale_client.post(
+            "/pos/sales",
+            headers=auth_headers(tmp_path, key=str(uuid4())),
+            json={
+                "shift_id": shift["id"],
+                "lines": [
+                    {
+                        "product_id": "SKU-1",
+                        "quantity": "1.000",
+                        "discount_percent": "0.00",
+                    }
+                ],
+                "cash_received": "100.00",
+            },
+        )
+        erpnext.release_response.set()
+        close = await asyncio.wait_for(close_task, timeout=2)
+
+    assert close.status_code == 200
+    assert close.json()["status"] == "closed"
+    assert sale.status_code == 409
+    assert sale.json()["error"]["code"] == "SHIFT_CHANGED"
+    assert erpnext.closings == ["CLOSE-1"]
+    assert erpnext.sales == []
+
+
+@pytest.mark.anyio
+async def test_erpnext_sales_invoice_id_is_unique_per_tenant(tmp_path: Path) -> None:
+    erpnext = StubPOSErpnextClient()
+    app = make_app(erpnext, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        shift = await open_shift(client, tmp_path)
+        sale = await create_sale(client, tmp_path, shift_id=str(shift["id"]))
+
+    with (
+        sqlite3.connect(tmp_path / "pos.sqlite3") as connection,
+        pytest.raises(sqlite3.IntegrityError),
+    ):
+        connection.execute(
+            """
+            INSERT INTO pos_sales
+            SELECT 'SALE-DUPLICATE', tenant, receipt_number, shift_id, register_id,
+                   register_name, warehouse_id, warehouse_name, cashier_email,
+                   cashier_full_name, lines_json, subtotal, discount_total, grand_total,
+                   cash_received, change, erpnext_sales_invoice_id, created_at
+            FROM pos_sales WHERE id = ?
+            """,
+            (sale["id"],),
+        )
+
+
+def test_pos_store_migration_fails_closed_on_duplicate_erpnext_invoice(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "pos.sqlite3"
+    POSStore(database_path)
+    values = (
+        "myretail",
+        "SINV-DUP",
+        "SHIFT-1",
+        "POS-1",
+        "Касса 1",
+        "WH-1",
+        "Склад",
+        "cashier@example.kz",
+        "Кассир",
+        "[]",
+        "100.00",
+        "0.00",
+        "100.00",
+        "100.00",
+        "0.00",
+        "SINV-DUP",
+        "2026-07-13T00:00:00Z",
+    )
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DROP INDEX pos_sales_erpnext_invoice_unique")
+        connection.execute(
+            """
+            INSERT INTO pos_sales (
+                id, tenant, receipt_number, shift_id, register_id, register_name,
+                warehouse_id, warehouse_name, cashier_email, cashier_full_name,
+                lines_json, subtotal, discount_total, grand_total, cash_received,
+                change, erpnext_sales_invoice_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("SALE-1", *values),
+        )
+        connection.execute(
+            """
+            INSERT INTO pos_sales (
+                id, tenant, receipt_number, shift_id, register_id, register_name,
+                warehouse_id, warehouse_name, cashier_email, cashier_full_name,
+                lines_json, subtotal, discount_total, grand_total, cash_received,
+                change, erpnext_sales_invoice_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("SALE-2", *values),
+        )
+        connection.commit()
+
+    with pytest.raises(POSStoreMigrationError, match="manual reconciliation required"):
+        POSStore(database_path)
 
 
 @pytest.mark.anyio
