@@ -6,6 +6,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from myretail_api.config import Settings, get_settings, validate_production_state_storage
 from myretail_api.routers.auth import router as auth_router
 from myretail_api.routers.health import router as health_router
 from myretail_api.routers.pos import router as pos_router
@@ -14,7 +15,8 @@ from myretail_api.routers.purchases import purchases_router, suppliers_router
 from myretail_api.routers.stock import router as stock_router
 
 
-def create_app() -> FastAPI:
+def create_app(settings: Settings | None = None) -> FastAPI:
+    validate_production_state_storage(settings or get_settings())
     app = FastAPI(
         title="MyRetail API",
         version="0.1.0",

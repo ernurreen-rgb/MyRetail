@@ -997,6 +997,102 @@ async def test_recover_stock_movement_uses_exact_custom_marker() -> None:
 
 
 @pytest.mark.anyio
+async def test_duplicate_stock_cancellation_marker_recovers_existing_reversal() -> None:
+    marker = hashlib.sha256(
+        b"myretail:cancel_stock_movement:MAT-STE-2026-00001"
+    ).hexdigest()
+    metadata = {
+        "myretail": {
+            "type": "write_off",
+            "status": "posted",
+            "warehouse_id": "Stores - MR",
+            "reason_code": "other",
+            "comment": "Cancellation",
+            "created_by": {"email": "owner@example.com", "full_name": "Owner"},
+            "created_at": "2026-06-29T08:00:00Z",
+            "lines": [
+                {
+                    "product_id": "SKU-001",
+                    "quantity": "2.000",
+                    "before_quantity": "12.000",
+                    "after_quantity": "10.000",
+                }
+            ],
+        }
+    }
+    post_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal post_calls
+        if request.url.path == "/api/resource/Bin":
+            return httpx.Response(
+                200,
+                json={"data": [{"actual_qty": "12.000", "reserved_qty": "0.000"}]},
+            )
+        if request.url.path in {"/api/resource/Stock%20Entry", "/api/resource/Stock Entry"}:
+            if request.method == "POST":
+                post_calls += 1
+                assert json.loads(request.content)["myretail_stock_idempotency_key"] == marker
+                return httpx.Response(
+                    417,
+                    json={
+                        "message": "myretail_stock_idempotency_key must be unique",
+                    },
+                )
+            assert json.loads(request.url.params["filters"]) == [
+                ["Stock Entry", "myretail_stock_idempotency_key", "=", marker]
+            ]
+            return httpx.Response(
+                200,
+                json={"data": [{"name": "MAT-STE-2026-00002"}]},
+            )
+        if request.url.path in {
+            "/api/resource/Stock%20Entry/MAT-STE-2026-00002",
+            "/api/resource/Stock Entry/MAT-STE-2026-00002",
+        }:
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "name": "MAT-STE-2026-00002",
+                        "stock_entry_type": "Material Issue",
+                        "docstatus": 1,
+                        "from_warehouse": "Stores - MR",
+                        "owner": "owner@example.com",
+                        "modified": "2026-06-29T08:00:00Z",
+                        "remarks": json.dumps(metadata, separators=(",", ":")),
+                    }
+                },
+            )
+        if request.url.path == "/api/resource/Comment":
+            return httpx.Response(200, json={"data": []})
+        return httpx.Response(404)
+
+    client = ERPNextClient(make_settings(), transport=httpx.MockTransport(handler))
+    recovered = await client.create_stock_movement(
+        StockMovementCreate(
+            type="write_off",
+            warehouse_id="Stores - MR",
+            reason_code="other",
+            comment="Cancellation",
+            lines=[{"product_id": "SKU-001", "quantity": "2.000"}],
+        ),
+        actor=AuthenticatedUser(
+            email="another-admin@example.com",
+            full_name="Another Admin",
+            roles=["Admin"],
+        ),
+        tenant="myretail",
+        idempotency_key="00000000-0000-0000-0000-000000000999",
+        operation="cancel_stock_movement",
+        idempotency_marker=marker,
+    )
+
+    assert recovered.id == "MAT-STE-2026-00002"
+    assert post_calls == 1
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("movement_type", ["write_off", "transfer"])
 async def test_stock_movement_checks_available_quantity_with_reserved_stock(
     movement_type: str,
@@ -1135,7 +1231,7 @@ async def test_cancel_stock_movement_persists_status_and_blocks_repeat_cancel() 
     cancellation_events: list[str] = []
     key = "00000000-0000-0000-0000-000000000102"
     marker = hashlib.sha256(
-        f"myretail:cancel_stock_movement:owner@example.com:{key}".encode()
+        b"myretail:cancel_stock_movement:MAT-STE-2026-00001"
     ).hexdigest()
     original_metadata = {
         "myretail": {
@@ -1199,9 +1295,11 @@ async def test_cancel_stock_movement_persists_status_and_blocks_repeat_cancel() 
             cancellation_events.append(payload["content"])
             if metadata["status"] == "cancellation_pending":
                 assert "reversal_movement_id" not in metadata
+                assert metadata["operation_marker"] == marker
             else:
                 assert metadata["status"] == "cancelled"
                 assert metadata["reversal_movement_id"] == "MAT-STE-2026-00002"
+                assert metadata["operation_marker"] == marker
                 assert metadata["cancelled_by"] == {
                     "email": "owner@example.com",
                     "full_name": "Owner",
@@ -1216,6 +1314,11 @@ async def test_cancel_stock_movement_persists_status_and_blocks_repeat_cancel() 
                 json={"data": [{"actual_qty": "5.000", "reserved_qty": "0.000"}]},
             )
         if request.url.path in {"/api/resource/Stock%20Entry", "/api/resource/Stock Entry"}:
+            if request.method == "GET":
+                assert json.loads(request.url.params["filters"]) == [
+                    ["Stock Entry", "myretail_stock_idempotency_key", "=", marker]
+                ]
+                return httpx.Response(200, json={"data": []})
             reversal_posts += 1
             payload = json.loads(request.content)
             assert payload["myretail_stock_idempotency_key"] == marker
