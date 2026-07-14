@@ -12,6 +12,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 
 from myretail_api.clients.erpnext import (
+    ERPNextAmbiguousCreateError,
     ERPNextAuthenticationError,
     ERPNextClient,
     ERPNextConflictError,
@@ -48,6 +49,15 @@ READ_ROLES = {"Owner", "Admin", "Cashier"}
 WRITE_ROLES = {"Owner", "Admin"}
 WRITE_OFF_REASONS = {"expired", "damage", "theft", "defect", "other"}
 ADJUSTMENT_REASONS = {"manual_count", "data_correction"}
+STOCK_RECOVERY_TIMEOUT_SECONDS = 5.0
+STOCK_RECOVERY_POLL_SECONDS = 0.25
+ERPNEXT_UNAVAILABLE_RESPONSE = {
+    "error": {
+        "code": "ERPNEXT_UNAVAILABLE",
+        "message": "ERPNext is temporarily unavailable",
+        "fields": {},
+    }
+}
 
 
 def require_stock_reader(
@@ -161,7 +171,18 @@ async def create_stock_movement(
         key=key,
         request_hash=request_hash,
         status_code=status.HTTP_201_CREATED,
-        execute=lambda: client.create_stock_movement(movement, actor=tenant_context.user),
+        execute=lambda: client.create_stock_movement(
+            movement,
+            actor=tenant_context.user,
+            tenant=tenant_context.tenant,
+            idempotency_key=key,
+        ),
+        recover=lambda: client.recover_stock_movement(
+            tenant_context.tenant,
+            "create_stock_movement",
+            tenant_context.user.email,
+            key,
+        ),
     )
 
 
@@ -192,6 +213,15 @@ async def cancel_stock_movement(
             movement_id,
             request,
             actor=tenant_context.user,
+            tenant=tenant_context.tenant,
+            idempotency_key=key,
+        ),
+        recover=lambda: client.recover_cancelled_stock_movement(
+            movement_id,
+            request,
+            actor=tenant_context.user,
+            tenant=tenant_context.tenant,
+            idempotency_key=key,
         ),
     )
 
@@ -199,6 +229,8 @@ async def cancel_stock_movement(
 async def _call_erpnext(call: Awaitable[T]) -> T:
     try:
         return await call
+    except ERPNextAmbiguousCreateError:
+        raise
     except ERPNextTimeoutError as exc:
         raise _api_error(
             status.HTTP_504_GATEWAY_TIMEOUT,
@@ -347,6 +379,7 @@ async def _idempotent_stock_response(
     request_hash: str,
     status_code: int,
     execute: Callable[[], Awaitable[T]],
+    recover: Callable[[], Awaitable[T | None]],
 ) -> JSONResponse:
     begin = _begin_idempotency(store, tenant=tenant, key=key, request_hash=request_hash)
     if begin.record is not None:
@@ -355,31 +388,259 @@ async def _idempotent_stock_response(
             content=begin.record.response_body,
         )
 
+    if begin.acquired and begin.recovery_only:
+        return await _recover_stock_or_pending(
+            store=store,
+            tenant=tenant,
+            key=key,
+            request_hash=request_hash,
+            fencing_token=begin.fencing_token,
+            status_code=status_code,
+            recover=recover,
+        )
+
     if not begin.acquired:
         record = await _wait_idempotency(store, tenant=tenant, key=key, request_hash=request_hash)
         if record is not None:
             return JSONResponse(status_code=record.status_code, content=record.response_body)
+        begin = _begin_idempotency(store, tenant=tenant, key=key, request_hash=request_hash)
+        if begin.record is not None:
+            return JSONResponse(
+                status_code=begin.record.status_code,
+                content=begin.record.response_body,
+            )
+        if begin.acquired and begin.recovery_only:
+            return await _recover_stock_or_pending(
+                store=store,
+                tenant=tenant,
+                key=key,
+                request_hash=request_hash,
+                fencing_token=begin.fencing_token,
+                status_code=status_code,
+                recover=recover,
+            )
         raise _api_error(
             status.HTTP_409_CONFLICT,
             "IDEMPOTENCY_CONFLICT",
             "Запрос с этим Idempotency-Key ещё выполняется",
         )
 
+    fencing_token = begin.fencing_token
     try:
         result = await _call_erpnext(execute())
-    except Exception:
-        store.release(tenant=tenant, key=key, request_hash=request_hash)
+    except ERPNextAmbiguousCreateError:
+        _mark_stock_recovery(
+            store,
+            tenant,
+            key,
+            request_hash,
+            fencing_token,
+            lease_seconds=60.0,
+        )
+        try:
+            deadline = asyncio.get_running_loop().time() + STOCK_RECOVERY_TIMEOUT_SECONDS
+            while asyncio.get_running_loop().time() < deadline:
+                recovered = await _call_erpnext(recover())
+                if recovered is not None:
+                    return _complete_stock_response(
+                        store=store,
+                        tenant=tenant,
+                        key=key,
+                        request_hash=request_hash,
+                        fencing_token=fencing_token,
+                        status_code=status_code,
+                        result=recovered,
+                    )
+                await asyncio.sleep(STOCK_RECOVERY_POLL_SECONDS)
+        except Exception:
+            _mark_stock_recovery(
+                store,
+                tenant,
+                key,
+                request_hash,
+                fencing_token,
+                lease_seconds=0,
+            )
+            raise
+        return _pending_stock_response(
+            store=store,
+            tenant=tenant,
+            key=key,
+            request_hash=request_hash,
+            fencing_token=fencing_token,
+        )
+    except Exception as exc:
+        if isinstance(exc, HTTPException) and exc.status_code >= 500:
+            _mark_stock_recovery(
+                store,
+                tenant,
+                key,
+                request_hash,
+                fencing_token,
+                lease_seconds=60.0,
+            )
+            try:
+                recovered = await _call_erpnext(recover())
+            except Exception as recovery_exc:
+                _mark_stock_recovery(
+                    store,
+                    tenant,
+                    key,
+                    request_hash,
+                    fencing_token,
+                    lease_seconds=0,
+                )
+                raise exc from recovery_exc
+            if recovered is not None:
+                return _complete_stock_response(
+                    store=store,
+                    tenant=tenant,
+                    key=key,
+                    request_hash=request_hash,
+                    fencing_token=fencing_token,
+                    status_code=status_code,
+                    result=recovered,
+                )
+            _mark_stock_recovery(
+                store,
+                tenant,
+                key,
+                request_hash,
+                fencing_token,
+                lease_seconds=0,
+            )
+            raise
+        store.release(
+            tenant=tenant,
+            key=key,
+            request_hash=request_hash,
+            fencing_token=fencing_token,
+        )
         raise
 
-    response_body = jsonable_encoder(result)
-    store.complete(
+    return _complete_stock_response(
+        store=store,
         tenant=tenant,
         key=key,
         request_hash=request_hash,
+        fencing_token=fencing_token,
+        status_code=status_code,
+        result=result,
+    )
+
+
+async def _recover_stock_or_pending(
+    *,
+    store: StockIdempotencyStore,
+    tenant: str,
+    key: str,
+    request_hash: str,
+    fencing_token: int,
+    status_code: int,
+    recover: Callable[[], Awaitable[T | None]],
+) -> JSONResponse:
+    try:
+        recovered = await _call_erpnext(recover())
+    except Exception:
+        _mark_stock_recovery(
+            store,
+            tenant,
+            key,
+            request_hash,
+            fencing_token,
+            lease_seconds=0,
+        )
+        raise
+    if recovered is not None:
+        return _complete_stock_response(
+            store=store,
+            tenant=tenant,
+            key=key,
+            request_hash=request_hash,
+            fencing_token=fencing_token,
+            status_code=status_code,
+            result=recovered,
+        )
+    return _pending_stock_response(
+        store=store,
+        tenant=tenant,
+        key=key,
+        request_hash=request_hash,
+        fencing_token=fencing_token,
+    )
+
+
+def _complete_stock_response(
+    *,
+    store: StockIdempotencyStore,
+    tenant: str,
+    key: str,
+    request_hash: str,
+    fencing_token: int,
+    status_code: int,
+    result: object,
+) -> JSONResponse:
+    response_body = jsonable_encoder(result)
+    if not store.complete(
+        tenant=tenant,
+        key=key,
+        request_hash=request_hash,
+        fencing_token=fencing_token,
         status_code=status_code,
         response_body=response_body,
-    )
+    ):
+        raise _api_error(
+            status.HTTP_409_CONFLICT,
+            "IDEMPOTENCY_CONFLICT",
+            "Idempotency operation ownership changed",
+        )
     return JSONResponse(status_code=status_code, content=response_body)
+
+
+def _pending_stock_response(
+    *,
+    store: StockIdempotencyStore,
+    tenant: str,
+    key: str,
+    request_hash: str,
+    fencing_token: int,
+) -> JSONResponse:
+    _mark_stock_recovery(
+        store,
+        tenant,
+        key,
+        request_hash,
+        fencing_token,
+        lease_seconds=0,
+    )
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content=ERPNEXT_UNAVAILABLE_RESPONSE,
+    )
+
+
+def _mark_stock_recovery(
+    store: StockIdempotencyStore,
+    tenant: str,
+    key: str,
+    request_hash: str,
+    fencing_token: int,
+    *,
+    lease_seconds: float,
+) -> None:
+    if store.mark_recovery_required(
+        tenant=tenant,
+        key=key,
+        request_hash=request_hash,
+        fencing_token=fencing_token,
+        lease_seconds=lease_seconds,
+    ):
+        return
+    raise _api_error(
+        status.HTTP_409_CONFLICT,
+        "IDEMPOTENCY_CONFLICT",
+        "Idempotency recovery ownership changed",
+    )
 
 
 def _begin_idempotency(

@@ -255,7 +255,10 @@ class POSService:
         row = self._store.get_held_receipt(context.tenant, held_id)
         if row is not None:
             self._require_shift_access(context, str(row["shift_id"]))
-        self._store.delete_held_receipt(context.tenant, held_id)
+        try:
+            self._store.delete_held_receipt(context.tenant, held_id)
+        except POSStoreConflictError as exc:
+            raise POSApiError(409, exc.code, exc.message, exc.fields) from exc
 
     async def create_sale(
         self, context: TenantContext, request: SaleCreateRequest, *, key: str
@@ -530,6 +533,7 @@ class POSService:
                 }
             },
             expected_shift_updated_at=expected_updated_at,
+            require_no_held_receipts=True,
         )
         if claim.recovery_only:
             return await self._recover_close_shift_intent(context, claim.intent)
@@ -566,8 +570,9 @@ class POSService:
         shift = self._require_shift_access(context, request.shift_id)
         totals = await self._build_lines(context, shift, request.lines)
         now = _now()
-        row = self._store.upsert_held_receipt(
-            {
+        try:
+            row = self._store.upsert_held_receipt(
+                {
                 "id": f"HELD-{uuid4().hex[:12].upper()}",
                 "tenant": context.tenant,
                 "shift_id": shift.id,
@@ -582,8 +587,10 @@ class POSService:
                 "created_by_full_name": context.user.full_name,
                 "created_at": now,
                 "updated_at": now,
-            }
-        )
+                }
+            )
+        except POSStoreConflictError as exc:
+            raise POSApiError(409, exc.code, exc.message, exc.fields) from exc
         return self._to_held(row)
 
     async def _create_sale_once(
@@ -1033,6 +1040,7 @@ class POSService:
         business_hash: str,
         payload: dict[str, Any],
         expected_shift_updated_at: str | None = None,
+        require_no_held_receipts: bool = False,
     ) -> POSIntentBeginResult:
         try:
             claim = self._store.begin_operation_intent(
@@ -1043,6 +1051,7 @@ class POSService:
                 business_hash=business_hash,
                 payload=payload,
                 expected_shift_updated_at=expected_shift_updated_at,
+                require_no_held_receipts=require_no_held_receipts,
             )
         except POSStoreConflictError as exc:
             raise POSApiError(409, exc.code, exc.message, exc.fields) from exc

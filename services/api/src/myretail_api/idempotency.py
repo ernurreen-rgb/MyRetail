@@ -19,6 +19,8 @@ class IdempotencyRecord:
 class IdempotencyBeginResult:
     acquired: bool
     record: IdempotencyRecord | None = None
+    fencing_token: int = 0
+    recovery_only: bool = False
 
 
 class IdempotencyStore:
@@ -26,12 +28,22 @@ class IdempotencyStore:
         self._database_path = database_path
         self._ensure_schema()
 
-    def begin(self, *, tenant: str, key: str, request_hash: str) -> IdempotencyBeginResult:
+    def begin(
+        self,
+        *,
+        tenant: str,
+        key: str,
+        request_hash: str,
+        lease_seconds: float = 60.0,
+    ) -> IdempotencyBeginResult:
+        now = time.time()
+        lease_until = now + lease_seconds
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
-                SELECT request_hash, status, status_code, response_body
+                SELECT request_hash, status, status_code, response_body,
+                       lease_until, fencing_token
                 FROM stock_idempotency
                 WHERE tenant = ? AND idempotency_key = ?
                 """,
@@ -46,14 +58,16 @@ class IdempotencyStore:
                         request_hash,
                         status,
                         status_code,
-                        response_body
+                        response_body,
+                        lease_until,
+                        fencing_token
                     )
-                    VALUES (?, ?, ?, 'processing', 0, '{}')
+                    VALUES (?, ?, ?, 'processing', 0, '{}', ?, 1)
                     """,
-                    (tenant, key, request_hash),
+                    (tenant, key, request_hash, lease_until),
                 )
                 connection.commit()
-                return IdempotencyBeginResult(acquired=True)
+                return IdempotencyBeginResult(acquired=True, fencing_token=1)
 
             if row[0] != request_hash:
                 connection.rollback()
@@ -65,6 +79,39 @@ class IdempotencyStore:
                 record = self._record_from_row(row[2], row[3])
                 connection.commit()
                 return IdempotencyBeginResult(acquired=False, record=record)
+
+            if float(row[4] or 0) <= now:
+                fencing_token = int(row[5] or 0) + 1
+                cursor = connection.execute(
+                    """
+                    UPDATE stock_idempotency
+                    SET status = 'recovery_required',
+                        lease_until = ?,
+                        fencing_token = ?
+                    WHERE tenant = ?
+                      AND idempotency_key = ?
+                      AND request_hash = ?
+                      AND fencing_token = ?
+                      AND status IN ('processing', 'recovery_required')
+                    """,
+                    (
+                        lease_until,
+                        fencing_token,
+                        tenant,
+                        key,
+                        request_hash,
+                        int(row[5] or 0),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    connection.rollback()
+                    return IdempotencyBeginResult(acquired=False)
+                connection.commit()
+                return IdempotencyBeginResult(
+                    acquired=True,
+                    fencing_token=fencing_token,
+                    recovery_only=True,
+                )
 
             connection.commit()
             return IdempotencyBeginResult(acquired=False)
@@ -134,12 +181,13 @@ class IdempotencyStore:
         tenant: str,
         key: str,
         request_hash: str,
+        fencing_token: int,
         status_code: int,
         response_body: dict[str, object],
-    ) -> None:
+    ) -> bool:
         encoded_body = json.dumps(response_body, separators=(",", ":"), sort_keys=True)
         with self._connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
                 UPDATE stock_idempotency
                 SET status = 'completed',
@@ -148,23 +196,71 @@ class IdempotencyStore:
                 WHERE tenant = ?
                   AND idempotency_key = ?
                   AND request_hash = ?
-                  AND status = 'processing'
+                  AND fencing_token = ?
+                  AND status IN ('processing', 'recovery_required')
                 """,
-                (status_code, encoded_body, tenant, key, request_hash),
+                (
+                    status_code,
+                    encoded_body,
+                    tenant,
+                    key,
+                    request_hash,
+                    fencing_token,
+                ),
             )
+        return cursor.rowcount == 1
 
-    def release(self, *, tenant: str, key: str, request_hash: str) -> None:
+    def mark_recovery_required(
+        self,
+        *,
+        tenant: str,
+        key: str,
+        request_hash: str,
+        fencing_token: int,
+        lease_seconds: float = 60.0,
+    ) -> bool:
         with self._connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
+                """
+                UPDATE stock_idempotency
+                SET status = 'recovery_required', lease_until = ?
+                WHERE tenant = ?
+                  AND idempotency_key = ?
+                  AND request_hash = ?
+                  AND fencing_token = ?
+                  AND status IN ('processing', 'recovery_required')
+                """,
+                (
+                    time.time() + lease_seconds,
+                    tenant,
+                    key,
+                    request_hash,
+                    fencing_token,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def release(
+        self,
+        *,
+        tenant: str,
+        key: str,
+        request_hash: str,
+        fencing_token: int,
+    ) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
                 """
                 DELETE FROM stock_idempotency
                 WHERE tenant = ?
                   AND idempotency_key = ?
                   AND request_hash = ?
-                  AND status = 'processing'
+                  AND fencing_token = ?
+                  AND status IN ('processing', 'recovery_required')
                 """,
-                (tenant, key, request_hash),
+                (tenant, key, request_hash, fencing_token),
             )
+        return cursor.rowcount == 1
 
     def _ensure_schema(self) -> None:
         self._database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -178,6 +274,8 @@ class IdempotencyStore:
                     status TEXT NOT NULL DEFAULT 'completed',
                     status_code INTEGER NOT NULL,
                     response_body TEXT NOT NULL,
+                    lease_until REAL NOT NULL DEFAULT 0,
+                    fencing_token INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (tenant, idempotency_key)
                 )
@@ -191,6 +289,16 @@ class IdempotencyStore:
                 connection.execute(
                     "ALTER TABLE stock_idempotency ADD COLUMN status TEXT NOT NULL "
                     "DEFAULT 'completed'"
+                )
+            if "lease_until" not in columns:
+                connection.execute(
+                    "ALTER TABLE stock_idempotency ADD COLUMN lease_until REAL NOT NULL "
+                    "DEFAULT 0"
+                )
+            if "fencing_token" not in columns:
+                connection.execute(
+                    "ALTER TABLE stock_idempotency ADD COLUMN fencing_token INTEGER NOT NULL "
+                    "DEFAULT 1"
                 )
 
     @staticmethod

@@ -878,6 +878,10 @@ async def test_list_stock_movements_filters_receipts_by_destination_warehouse() 
 @pytest.mark.anyio
 async def test_create_stock_movement_posts_stock_entry_payload() -> None:
     requests: list[httpx.Request] = []
+    key = "00000000-0000-0000-0000-000000000101"
+    marker = hashlib.sha256(
+        f"myretail:create_stock_movement:owner@example.com:{key}".encode()
+    ).hexdigest()
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
@@ -885,6 +889,7 @@ async def test_create_stock_movement_posts_stock_entry_payload() -> None:
             return httpx.Response(200, json={"data": [{"actual_qty": "10.000"}]})
         if request.url.path in {"/api/resource/Stock%20Entry", "/api/resource/Stock Entry"}:
             payload = json.loads(request.content)
+            assert payload["myretail_stock_idempotency_key"] == marker
             assert payload["docstatus"] == 1
             assert payload["stock_entry_type"] == "Material Issue"
             assert payload["items"] == [
@@ -918,12 +923,77 @@ async def test_create_stock_movement_posts_stock_entry_payload() -> None:
             lines=[{"product_id": "SKU-001", "quantity": "2.000"}],
         ),
         actor=AuthenticatedUser(email="owner@example.com", full_name="Owner", roles=["Owner"]),
+        tenant="myretail",
+        idempotency_key=key,
     )
 
     assert movement.id == "MAT-STE-2026-00001"
     assert movement.lines[0].before_quantity == "10.000"
     assert movement.lines[0].after_quantity == "8.000"
     assert [request.method for request in requests] == ["GET", "POST"]
+
+
+@pytest.mark.anyio
+async def test_recover_stock_movement_uses_exact_custom_marker() -> None:
+    key = "00000000-0000-0000-0000-000000000103"
+    marker = hashlib.sha256(
+        f"myretail:create_stock_movement:owner@example.com:{key}".encode()
+    ).hexdigest()
+    metadata = {
+        "myretail": {
+            "type": "receipt",
+            "status": "posted",
+            "warehouse_id": "Stores - MR",
+            "created_by": {"email": "owner@example.com", "full_name": "Owner"},
+            "created_at": "2026-06-29T08:00:00Z",
+            "lines": [
+                {
+                    "product_id": "SKU-001",
+                    "quantity": "1.000",
+                    "before_quantity": "10.000",
+                    "after_quantity": "11.000",
+                }
+            ],
+        }
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path in {"/api/resource/Stock%20Entry", "/api/resource/Stock Entry"}:
+            assert json.loads(request.url.params["filters"]) == [
+                ["Stock Entry", "myretail_stock_idempotency_key", "=", marker]
+            ]
+            return httpx.Response(200, json={"data": [{"name": "MAT-STE-2026-00003"}]})
+        if request.url.path in {
+            "/api/resource/Stock%20Entry/MAT-STE-2026-00003",
+            "/api/resource/Stock Entry/MAT-STE-2026-00003",
+        }:
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "name": "MAT-STE-2026-00003",
+                        "stock_entry_type": "Material Receipt",
+                        "docstatus": 1,
+                        "to_warehouse": "Stores - MR",
+                        "owner": "owner@example.com",
+                        "modified": "2026-06-29T08:00:00Z",
+                        "remarks": json.dumps(metadata, separators=(",", ":")),
+                    }
+                },
+            )
+        if request.url.path == "/api/resource/Comment":
+            return httpx.Response(200, json={"data": []})
+        return httpx.Response(404)
+
+    client = ERPNextClient(make_settings(), transport=httpx.MockTransport(handler))
+
+    recovered = await client.recover_stock_movement(
+        "myretail", "create_stock_movement", "owner@example.com", key
+    )
+
+    assert recovered is not None
+    assert recovered.id == "MAT-STE-2026-00003"
+    assert recovered.status == "posted"
 
 
 @pytest.mark.anyio
@@ -1063,6 +1133,10 @@ async def test_adjustment_rejects_mixed_increase_and_decrease_directions() -> No
 async def test_cancel_stock_movement_persists_status_and_blocks_repeat_cancel() -> None:
     reversal_posts = 0
     cancellation_events: list[str] = []
+    key = "00000000-0000-0000-0000-000000000102"
+    marker = hashlib.sha256(
+        f"myretail:cancel_stock_movement:owner@example.com:{key}".encode()
+    ).hexdigest()
     original_metadata = {
         "myretail": {
             "type": "receipt",
@@ -1144,6 +1218,7 @@ async def test_cancel_stock_movement_persists_status_and_blocks_repeat_cancel() 
         if request.url.path in {"/api/resource/Stock%20Entry", "/api/resource/Stock Entry"}:
             reversal_posts += 1
             payload = json.loads(request.content)
+            assert payload["myretail_stock_idempotency_key"] == marker
             assert payload["stock_entry_type"] == "Material Issue"
             return httpx.Response(200, json={"data": {"name": "MAT-STE-2026-00002"}})
         return httpx.Response(404)
@@ -1155,6 +1230,8 @@ async def test_cancel_stock_movement_persists_status_and_blocks_repeat_cancel() 
         "MAT-STE-2026-00001",
         StockMovementCancelRequest(reason="Wrong delivery"),
         actor=actor,
+        tenant="myretail",
+        idempotency_key=key,
     )
 
     assert response.movement.status == "cancelled"
@@ -1260,6 +1337,12 @@ async def test_cancel_stock_movement_blocks_repeat_when_final_mark_fails() -> No
             StockMovementCancelRequest(reason="Wrong delivery"),
             actor=actor,
         )
+
+    pending = await client.get_stock_movement("MAT-STE-2026-00001")
+    assert pending.status == "posted"
+    assert pending.reversal_movement_id is None
+    assert pending.cancelled_by is None
+    assert pending.cancelled_at is None
 
     with pytest.raises(ERPNextConflictError):
         await client.cancel_stock_movement(
@@ -1614,6 +1697,10 @@ async def test_purchase_save_maps_frappe_query_deadlock_to_changed_conflict() ->
 
 @pytest.mark.anyio
 async def test_create_purchase_draft_restores_erpnext_auto_buying_price() -> None:
+    key = "purchase-create-key"
+    marker = hashlib.sha256(
+        f"myretail:create_purchase:owner@example.com:{key}".encode()
+    ).hexdigest()
     state = {"price": "510.00", "purchase_created": False}
     restored_prices: list[str] = []
     metadata = {
@@ -1729,6 +1816,7 @@ async def test_create_purchase_draft_restores_erpnext_auto_buying_price() -> Non
             "/api/resource/Purchase Receipt",
         }:
             body = json.loads(request.content)
+            assert body["myretail_purchase_idempotency_key"] == marker
             purchase_doc["remarks"] = body["remarks"]
             state["purchase_created"] = True
             state["price"] = "778.00"
@@ -1755,7 +1843,8 @@ async def test_create_purchase_draft_restores_erpnext_auto_buying_price() -> Non
             ],
         ),
         actor=actor,
-        idempotency_key="purchase-create-key",
+        idempotency_key=key,
+        tenant="myretail",
     )
 
     assert created.id == "PREC-00001"
@@ -1771,6 +1860,9 @@ async def test_create_purchase_draft_restores_erpnext_auto_buying_price() -> Non
 @pytest.mark.anyio
 async def test_recover_created_purchase_restores_draft_price_before_returning() -> None:
     state = {"price": "778.00", "restore_calls": 0}
+    marker = hashlib.sha256(
+        b"myretail:create_purchase:owner@example.com:purchase-create-key"
+    ).hexdigest()
     metadata = {
         "myretail_purchase": {
             "create_idempotency_key": "purchase-create-key",
@@ -1812,6 +1904,14 @@ async def test_recover_created_purchase_restores_draft_price_before_returning() 
             "/api/resource/Purchase%20Receipt",
             "/api/resource/Purchase Receipt",
         }:
+            assert json.loads(request.url.params["filters"]) == [
+                [
+                    "Purchase Receipt",
+                    "myretail_purchase_idempotency_key",
+                    "=",
+                    marker,
+                ]
+            ]
             return httpx.Response(200, json={"data": [purchase_doc]})
         if request.url.path in {"/api/resource/Item%20Price", "/api/resource/Item Price"}:
             return httpx.Response(
@@ -1845,7 +1945,11 @@ async def test_recover_created_purchase_restores_draft_price_before_returning() 
 
     client = ERPNextClient(make_settings(), transport=httpx.MockTransport(handler))
 
-    recovered = await client.recover_created_purchase("purchase-create-key")
+    recovered = await client.recover_created_purchase(
+        "purchase-create-key",
+        tenant="myretail",
+        actor_email="owner@example.com",
+    )
 
     assert recovered is not None
     assert recovered.id == "PREC-00001"

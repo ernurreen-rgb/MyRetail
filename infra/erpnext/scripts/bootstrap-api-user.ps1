@@ -345,6 +345,8 @@ foreach ($definition in $permissionDefinitions) {
 }
 
 $customFieldDefinitions = @(
+    @{ dt = "Stock Entry"; fieldname = "myretail_stock_idempotency_key"; label = "MyRetail Stock Idempotency Key"; unique = 1 },
+    @{ dt = "Purchase Receipt"; fieldname = "myretail_purchase_idempotency_key"; label = "MyRetail Purchase Idempotency Key"; unique = 1 },
     @{ dt = "Sales Invoice"; fieldname = "myretail_tenant"; label = "MyRetail Tenant"; unique = 0 },
     @{ dt = "Sales Invoice"; fieldname = "myretail_sale_id"; label = "MyRetail Sale ID"; unique = 1 },
     @{ dt = "Sales Invoice"; fieldname = "myretail_sale_idempotency_key"; label = "MyRetail Sale Idempotency Key"; unique = 1 },

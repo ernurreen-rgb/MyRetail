@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -9,6 +10,7 @@ import pytest
 from pydantic import SecretStr
 
 from myretail_api.clients.erpnext import (
+    ERPNextAmbiguousCreateError,
     ERPNextConflictError,
     ERPNextTimeoutError,
     ERPNextUnavailableError,
@@ -33,6 +35,7 @@ from myretail_api.models.stock import (
     Warehouse,
     WarehouseRef,
 )
+from myretail_api.routers import stock as stock_router_module
 from myretail_api.security import create_access_token
 
 
@@ -52,6 +55,7 @@ class StubStockERPNextClient:
             ("SKU-001", "Reserve - MR"): Decimal("0.000"),
         }
         self.movements: dict[str, StockMovement] = {}
+        self.operation_results: dict[tuple[str, str], str] = {}
         self.next_id = 1
         self.now = datetime(2026, 6, 29, 8, 0, tzinfo=UTC)
 
@@ -144,7 +148,11 @@ class StubStockERPNextClient:
         movement: StockMovementCreate,
         *,
         actor: AuthenticatedUser,
+        tenant: str | None = None,
+        idempotency_key: str | None = None,
+        operation: str = "create_stock_movement",
     ) -> StockMovement:
+        _ = tenant
         lines: list[StockMovementLine] = []
         for index, line in enumerate(movement.lines):
             key = (line.product_id, movement.warehouse_id)
@@ -208,7 +216,20 @@ class StubStockERPNextClient:
             lines=lines,
         )
         self.movements[movement_id] = created
+        if idempotency_key is not None:
+            self.operation_results[(operation, idempotency_key)] = movement_id
         return created
+
+    async def recover_stock_movement(
+        self,
+        tenant: str | None,
+        operation: str,
+        user_email: str,
+        idempotency_key: str | None,
+    ) -> StockMovement | None:
+        _ = tenant, user_email
+        movement_id = self.operation_results.get((operation, idempotency_key or ""))
+        return self.movements.get(movement_id) if movement_id is not None else None
 
     async def cancel_stock_movement(
         self,
@@ -216,6 +237,8 @@ class StubStockERPNextClient:
         request: StockMovementCancelRequest,
         *,
         actor: AuthenticatedUser,
+        tenant: str | None = None,
+        idempotency_key: str | None = None,
     ) -> StockMovementCancelResponse:
         movement = self.movements[movement_id]
         if movement.status == "cancelled":
@@ -241,7 +264,13 @@ class StubStockERPNextClient:
                     for line in movement.lines
                 ],
             )
-        reversal = await self.create_stock_movement(reversal_request, actor=actor)
+        reversal = await self.create_stock_movement(
+            reversal_request,
+            actor=actor,
+            tenant=tenant,
+            idempotency_key=idempotency_key,
+            operation="cancel_stock_movement",
+        )
         cancelled = movement.model_copy(
             update={
                 "status": "cancelled",
@@ -252,6 +281,23 @@ class StubStockERPNextClient:
         )
         self.movements[movement_id] = cancelled
         return StockMovementCancelResponse(movement=cancelled, reversal=reversal)
+
+    async def recover_cancelled_stock_movement(
+        self,
+        movement_id: str,
+        request: StockMovementCancelRequest,
+        *,
+        actor: AuthenticatedUser,
+        tenant: str,
+        idempotency_key: str,
+    ) -> StockMovementCancelResponse | None:
+        _ = request, actor, tenant
+        movement = self.movements.get(movement_id)
+        reversal_id = self.operation_results.get(("cancel_stock_movement", idempotency_key))
+        reversal = self.movements.get(reversal_id) if reversal_id is not None else None
+        if movement is None or reversal is None or movement.status != "cancelled":
+            return None
+        return StockMovementCancelResponse(movement=movement, reversal=reversal)
 
     @staticmethod
     def _ensure_available(after: Decimal, index: int) -> None:
@@ -301,11 +347,122 @@ class BlockingCreateStockClient(StubStockERPNextClient):
         movement: StockMovementCreate,
         *,
         actor: AuthenticatedUser,
+        tenant: str | None = None,
+        idempotency_key: str | None = None,
+        operation: str = "create_stock_movement",
     ) -> StockMovement:
         self.create_calls += 1
         self.started.set()
         await self.release.wait()
-        return await super().create_stock_movement(movement, actor=actor)
+        return await super().create_stock_movement(
+            movement,
+            actor=actor,
+            tenant=tenant,
+            idempotency_key=idempotency_key,
+            operation=operation,
+        )
+
+
+class AmbiguousStockCreateClient(StubStockERPNextClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.create_calls = 0
+        self.allow_recovery = False
+
+    async def create_stock_movement(
+        self,
+        movement: StockMovementCreate,
+        *,
+        actor: AuthenticatedUser,
+        tenant: str | None = None,
+        idempotency_key: str | None = None,
+        operation: str = "create_stock_movement",
+    ) -> StockMovement:
+        self.create_calls += 1
+        await super().create_stock_movement(
+            movement,
+            actor=actor,
+            tenant=tenant,
+            idempotency_key=idempotency_key,
+            operation=operation,
+        )
+        raise ERPNextAmbiguousCreateError("lost Stock Entry response")
+
+    async def recover_stock_movement(
+        self,
+        tenant: str | None,
+        operation: str,
+        user_email: str,
+        idempotency_key: str | None,
+    ) -> StockMovement | None:
+        if not self.allow_recovery:
+            return None
+        return await super().recover_stock_movement(
+            tenant, operation, user_email, idempotency_key
+        )
+
+
+class AmbiguousStockCancelClient(StubStockERPNextClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancel_calls = 0
+        self.allow_recovery = False
+        self.pending_reversals: dict[str, str] = {}
+
+    async def cancel_stock_movement(
+        self,
+        movement_id: str,
+        request: StockMovementCancelRequest,
+        *,
+        actor: AuthenticatedUser,
+        tenant: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> StockMovementCancelResponse:
+        self.cancel_calls += 1
+        movement = self.movements[movement_id]
+        reversal = await self.create_stock_movement(
+            StockMovementCreate(
+                type="write_off",
+                warehouse_id=movement.warehouse_id,
+                reason_code="other",
+                comment=request.reason,
+                lines=[
+                    {"product_id": line.product_id, "quantity": line.quantity}
+                    for line in movement.lines
+                ],
+            ),
+            actor=actor,
+            tenant=tenant,
+            idempotency_key=idempotency_key,
+            operation="cancel_stock_movement",
+        )
+        self.pending_reversals[movement_id] = reversal.id
+        raise ERPNextAmbiguousCreateError("lost cancellation response")
+
+    async def recover_cancelled_stock_movement(
+        self,
+        movement_id: str,
+        request: StockMovementCancelRequest,
+        *,
+        actor: AuthenticatedUser,
+        tenant: str,
+        idempotency_key: str,
+    ) -> StockMovementCancelResponse | None:
+        _ = request, tenant, idempotency_key
+        if not self.allow_recovery:
+            return None
+        movement = self.movements[movement_id]
+        reversal = self.movements[self.pending_reversals[movement_id]]
+        cancelled = movement.model_copy(
+            update={
+                "status": "cancelled",
+                "cancelled_by": AuditUser(email=actor.email, full_name=actor.full_name),
+                "cancelled_at": self.now,
+                "reversal_movement_id": reversal.id,
+            }
+        )
+        self.movements[movement_id] = cancelled
+        return StockMovementCancelResponse(movement=cancelled, reversal=reversal)
 
 
 @pytest.fixture
@@ -459,6 +616,172 @@ async def test_stock_create_receipt_is_concurrently_idempotent(tmp_path: Path) -
     assert first_response.json()["id"] == second_response.json()["id"]
     assert erpnext_client.create_calls == 1
     assert erpnext_client.balances[("SKU-001", "Stores - MR")] == Decimal("11.500")
+
+
+@pytest.mark.anyio
+async def test_stock_lost_response_retry_recovers_without_duplicate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(stock_router_module, "STOCK_RECOVERY_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(stock_router_module, "STOCK_RECOVERY_POLL_SECONDS", 0.001)
+    erpnext_client = AmbiguousStockCreateClient()
+    app = make_app(erpnext_client, tmp_path)
+    key = str(uuid4())
+    payload = {
+        "type": "receipt",
+        "warehouse_id": "Stores - MR",
+        "lines": [{"product_id": "SKU-001", "quantity": "1.500"}],
+    }
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        first = await client.post(
+            "/stock/movements",
+            headers=auth_headers(tmp_path, idempotency_key=key),
+            json=payload,
+        )
+        erpnext_client.allow_recovery = True
+        second = await client.post(
+            "/stock/movements",
+            headers=auth_headers(tmp_path, idempotency_key=key),
+            json=payload,
+        )
+
+    assert first.status_code == 503
+    assert first.json()["error"]["code"] == "ERPNEXT_UNAVAILABLE"
+    assert second.status_code == 201
+    assert erpnext_client.create_calls == 1
+    assert len(erpnext_client.movements) == 1
+    assert erpnext_client.balances[("SKU-001", "Stores - MR")] == Decimal("11.500")
+
+
+@pytest.mark.anyio
+async def test_stock_cancel_timeout_stays_posted_until_reversal_is_recovered(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(stock_router_module, "STOCK_RECOVERY_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(stock_router_module, "STOCK_RECOVERY_POLL_SECONDS", 0.001)
+    erpnext_client = AmbiguousStockCancelClient()
+    app = make_app(erpnext_client, tmp_path)
+    cancel_key = str(uuid4())
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        created = await client.post(
+            "/stock/movements",
+            headers=auth_headers(tmp_path, idempotency_key=str(uuid4())),
+            json={
+                "type": "receipt",
+                "warehouse_id": "Stores - MR",
+                "lines": [{"product_id": "SKU-001", "quantity": "2.000"}],
+            },
+        )
+        movement_id = created.json()["id"]
+        first = await client.post(
+            f"/stock/movements/{movement_id}/cancel",
+            headers=auth_headers(tmp_path, idempotency_key=cancel_key),
+            json={"reason": "Wrong receipt"},
+        )
+        pending = await client.get(
+            f"/stock/movements/{movement_id}", headers=auth_headers(tmp_path)
+        )
+        erpnext_client.allow_recovery = True
+        second = await client.post(
+            f"/stock/movements/{movement_id}/cancel",
+            headers=auth_headers(tmp_path, idempotency_key=cancel_key),
+            json={"reason": "Wrong receipt"},
+        )
+
+    assert first.status_code == 503
+    assert pending.status_code == 200
+    assert pending.json()["status"] == "posted"
+    assert pending.json()["reversal_movement_id"] is None
+    assert second.status_code == 200
+    assert second.json()["movement"]["status"] == "cancelled"
+    assert erpnext_client.cancel_calls == 1
+    assert len(erpnext_client.movements) == 2
+
+
+def test_stock_idempotency_fencing_rejects_stale_owner(tmp_path: Path) -> None:
+    store = StockIdempotencyStore(tmp_path / "fencing.sqlite3")
+    first = store.begin(
+        tenant="myretail",
+        key="key-1",
+        request_hash="hash-1",
+        lease_seconds=0,
+    )
+    takeover = store.begin(
+        tenant="myretail",
+        key="key-1",
+        request_hash="hash-1",
+    )
+
+    assert first.acquired is True
+    assert takeover.acquired is True
+    assert takeover.recovery_only is True
+    assert takeover.fencing_token > first.fencing_token
+    assert store.complete(
+        tenant="myretail",
+        key="key-1",
+        request_hash="hash-1",
+        fencing_token=first.fencing_token,
+        status_code=201,
+        response_body={"id": "STALE"},
+    ) is False
+    assert store.complete(
+        tenant="myretail",
+        key="key-1",
+        request_hash="hash-1",
+        fencing_token=takeover.fencing_token,
+        status_code=201,
+        response_body={"id": "RECOVERED"},
+    ) is True
+
+
+def test_stock_idempotency_schema_migrates_existing_database(tmp_path: Path) -> None:
+    database_path = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE stock_idempotency (
+                tenant TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                request_hash TEXT NOT NULL,
+                status TEXT NOT NULL,
+                status_code INTEGER NOT NULL,
+                response_body TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (tenant, idempotency_key)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO stock_idempotency (
+                tenant, idempotency_key, request_hash, status, status_code, response_body
+            ) VALUES ('myretail', 'legacy-key', 'legacy-hash', 'completed', 201, '{"id":"OLD"}')
+            """
+        )
+
+    store = StockIdempotencyStore(database_path)
+    record = store.get_completed(
+        tenant="myretail", key="legacy-key", request_hash="legacy-hash"
+    )
+    with sqlite3.connect(database_path) as connection:
+        columns = {
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info(stock_idempotency)"
+            ).fetchall()
+        }
+
+    assert record is not None
+    assert record.response_body == {"id": "OLD"}
+    assert {"lease_until", "fencing_token"}.issubset(columns)
 
 
 @pytest.mark.anyio

@@ -1259,6 +1259,113 @@ async def test_close_and_sale_race_blocks_sale_before_erp_side_effect(tmp_path: 
 
 
 @pytest.mark.anyio
+async def test_close_and_held_create_race_blocks_held_mutation(tmp_path: Path) -> None:
+    erpnext = BlockingCommittedCloseERPNextClient()
+    close_app = make_app(erpnext, tmp_path)
+    held_app = make_app(erpnext, tmp_path)
+    async with (
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=close_app), base_url="http://close"
+        ) as close_client,
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=held_app), base_url="http://held"
+        ) as held_client,
+    ):
+        shift = await open_shift(close_client, tmp_path)
+        close_task = asyncio.create_task(
+            close_client.post(
+                f"/pos/shifts/{shift['id']}/close",
+                headers=auth_headers(tmp_path, key=str(uuid4())),
+                json={
+                    "actual_cash": "10000.00",
+                    "expected_updated_at": shift["updated_at"],
+                },
+            )
+        )
+        await asyncio.wait_for(erpnext.closing_created.wait(), timeout=2)
+        held = await held_client.post(
+            "/pos/held-receipts",
+            headers=auth_headers(tmp_path, key=str(uuid4())),
+            json={
+                "shift_id": shift["id"],
+                "label": "Late receipt",
+                "lines": [
+                    {
+                        "product_id": "SKU-1",
+                        "quantity": "1.000",
+                        "discount_percent": "0.00",
+                    }
+                ],
+            },
+        )
+        erpnext.release_response.set()
+        close = await asyncio.wait_for(close_task, timeout=2)
+
+    assert close.status_code == 200
+    assert held.status_code == 409
+    assert held.json()["error"]["code"] == "SHIFT_CHANGED"
+    assert erpnext.closings == ["CLOSE-1"]
+    with sqlite3.connect(tmp_path / "pos.sqlite3") as connection:
+        held_count = connection.execute(
+            "SELECT COUNT(*) FROM pos_held_receipts"
+        ).fetchone()[0]
+    assert held_count == 0
+
+
+@pytest.mark.anyio
+async def test_active_shift_scope_blocks_held_update_and_delete(tmp_path: Path) -> None:
+    erpnext = StubPOSErpnextClient()
+    app = make_app(erpnext, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        shift = await open_shift(client, tmp_path)
+        created = await client.post(
+            "/pos/held-receipts",
+            headers=auth_headers(tmp_path, key=str(uuid4())),
+            json={
+                "shift_id": shift["id"],
+                "label": "Before close",
+                "lines": [
+                    {
+                        "product_id": "SKU-1",
+                        "quantity": "1.000",
+                        "discount_percent": "0.00",
+                    }
+                ],
+            },
+        )
+        held = created.json()
+        POSStore(tmp_path / "pos.sqlite3").begin_operation_intent(
+            tenant="myretail",
+            operation="close_shift",
+            scope_id=f"shift:{shift['id']}",
+            user_email="cashier@example.kz",
+            business_hash="held-mutation-race",
+            payload={"close": {"shift_id": shift["id"]}},
+            expected_shift_updated_at=str(shift["updated_at"]),
+            require_no_held_receipts=False,
+        )
+        updated = await client.patch(
+            f"/pos/held-receipts/{held['id']}",
+            headers=auth_headers(tmp_path),
+            json={
+                "label": "Too late",
+                "expected_updated_at": held["updated_at"],
+            },
+        )
+        deleted = await client.delete(
+            f"/pos/held-receipts/{held['id']}", headers=auth_headers(tmp_path)
+        )
+
+    assert created.status_code == 201
+    assert updated.status_code == 409
+    assert updated.json()["error"]["code"] == "SHIFT_CHANGED"
+    assert deleted.status_code == 409
+    assert deleted.json()["error"]["code"] == "SHIFT_CHANGED"
+
+
+@pytest.mark.anyio
 async def test_erpnext_sales_invoice_id_is_unique_per_tenant(tmp_path: Path) -> None:
     erpnext = StubPOSErpnextClient()
     app = make_app(erpnext, tmp_path)
