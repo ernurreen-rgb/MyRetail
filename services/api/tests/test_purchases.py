@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -230,7 +231,9 @@ class StubPurchasesERPNextClient:
         *,
         actor: AuthenticatedUser,
         idempotency_key: str | None = None,
+        tenant: str | None = None,
     ) -> Purchase:
+        _ = tenant
         self.create_purchase_calls += 1
         supplier = self.suppliers[purchase.supplier_id]
         if not supplier.is_active:
@@ -288,7 +291,14 @@ class StubPurchasesERPNextClient:
             self.purchase_create_keys[idempotency_key] = purchase_id
         return created
 
-    async def recover_created_purchase(self, idempotency_key: str | None) -> Purchase | None:
+    async def recover_created_purchase(
+        self,
+        idempotency_key: str | None,
+        *,
+        tenant: str | None = None,
+        actor_email: str | None = None,
+    ) -> Purchase | None:
+        _ = tenant, actor_email
         if idempotency_key is None:
             return None
         purchase_id = self.purchase_create_keys.get(idempotency_key)
@@ -385,6 +395,32 @@ class BlockingSubmitPurchasesClient(StubPurchasesERPNextClient):
         return await super().submit_purchase(purchase_id, request, actor=actor)
 
 
+class BlockingPurchaseCreateClient(StubPurchasesERPNextClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.create_attempts = 0
+
+    async def create_purchase(
+        self,
+        purchase: PurchaseCreate,
+        *,
+        actor: AuthenticatedUser,
+        idempotency_key: str | None = None,
+        tenant: str | None = None,
+    ) -> Purchase:
+        self.create_attempts += 1
+        self.started.set()
+        await self.release.wait()
+        return await super().create_purchase(
+            purchase,
+            actor=actor,
+            idempotency_key=idempotency_key,
+            tenant=tenant,
+        )
+
+
 class FlakySupplierCreateClient(StubPurchasesERPNextClient):
     def __init__(self) -> None:
         super().__init__()
@@ -414,11 +450,13 @@ class FlakyPurchaseCreateClient(StubPurchasesERPNextClient):
         *,
         actor: AuthenticatedUser,
         idempotency_key: str | None = None,
+        tenant: str | None = None,
     ) -> Purchase:
         created = await super().create_purchase(
             purchase,
             actor=actor,
             idempotency_key=idempotency_key,
+            tenant=tenant,
         )
         if self.fail_once:
             self.fail_once = False
@@ -443,11 +481,21 @@ class DelayedPurchaseRecoveryClient(FlakyPurchaseCreateClient):
         super().__init__()
         self.recovery_calls = 0
 
-    async def recover_created_purchase(self, idempotency_key: str | None) -> Purchase | None:
+    async def recover_created_purchase(
+        self,
+        idempotency_key: str | None,
+        *,
+        tenant: str | None = None,
+        actor_email: str | None = None,
+    ) -> Purchase | None:
         self.recovery_calls += 1
         if self.recovery_calls < 3:
             return None
-        return await super().recover_created_purchase(idempotency_key)
+        return await super().recover_created_purchase(
+            idempotency_key,
+            tenant=tenant,
+            actor_email=actor_email,
+        )
 
 
 class DraftPriceRecoveryPurchaseClient(StubPurchasesERPNextClient):
@@ -462,22 +510,34 @@ class DraftPriceRecoveryPurchaseClient(StubPurchasesERPNextClient):
         *,
         actor: AuthenticatedUser,
         idempotency_key: str | None = None,
+        tenant: str | None = None,
     ) -> Purchase:
         created = await super().create_purchase(
             purchase,
             actor=actor,
             idempotency_key=idempotency_key,
+            tenant=tenant,
         )
         for line in created.lines:
             self.buying_prices[line.product_id] = line.unit_price
         raise ERPNextUnavailableError("draft price restore failed")
 
-    async def recover_created_purchase(self, idempotency_key: str | None) -> Purchase | None:
+    async def recover_created_purchase(
+        self,
+        idempotency_key: str | None,
+        *,
+        tenant: str | None = None,
+        actor_email: str | None = None,
+    ) -> Purchase | None:
         self.recovery_calls += 1
         if self.fail_recovery_once:
             self.fail_recovery_once = False
             raise ERPNextUnavailableError("draft price still not restored")
-        recovered = await super().recover_created_purchase(idempotency_key)
+        recovered = await super().recover_created_purchase(
+            idempotency_key,
+            tenant=tenant,
+            actor_email=actor_email,
+        )
         if recovered is not None:
             for line in recovered.lines:
                 self.buying_prices[line.product_id] = "510.00"
@@ -495,13 +555,20 @@ class MissingAmbiguousPurchaseCreateClient(StubPurchasesERPNextClient):
         *,
         actor: AuthenticatedUser,
         idempotency_key: str | None = None,
+        tenant: str | None = None,
     ) -> Purchase:
-        _ = purchase, actor, idempotency_key
+        _ = purchase, actor, idempotency_key, tenant
         self.create_purchase_calls += 1
         raise ERPNextAmbiguousCreateError("lost response without external document")
 
-    async def recover_created_purchase(self, idempotency_key: str | None) -> Purchase | None:
-        _ = idempotency_key
+    async def recover_created_purchase(
+        self,
+        idempotency_key: str | None,
+        *,
+        tenant: str | None = None,
+        actor_email: str | None = None,
+    ) -> Purchase | None:
+        _ = idempotency_key, tenant, actor_email
         self.recovery_calls += 1
         return None
 
@@ -864,6 +931,60 @@ async def test_purchase_create_keeps_idempotency_key_until_delayed_recovery(
 
 
 @pytest.mark.anyio
+async def test_purchase_create_is_idempotent_across_two_api_stores(tmp_path: Path) -> None:
+    erpnext_client = BlockingPurchaseCreateClient()
+    first_app = make_app(erpnext_client, tmp_path)
+    second_app = make_app(erpnext_client, tmp_path)
+    key = str(uuid4())
+
+    async with (
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=first_app), base_url="http://api-a"
+        ) as first_client,
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=second_app), base_url="http://api-b"
+        ) as second_client,
+    ):
+        supplier = await create_supplier_via_api(first_client, tmp_path)
+        payload = {
+            "supplier_id": supplier["id"],
+            "warehouse_id": "Stores - MR",
+            "posting_date": "2026-06-30",
+            "lines": [
+                {
+                    "product_id": "QA-MILK-001",
+                    "quantity": "1.000",
+                    "unit_price": "600.00",
+                }
+            ],
+        }
+        first_task = asyncio.create_task(
+            first_client.post(
+                "/purchases",
+                headers=auth_headers(tmp_path, idempotency_key=key),
+                json=payload,
+            )
+        )
+        await asyncio.wait_for(erpnext_client.started.wait(), timeout=2)
+        second_task = asyncio.create_task(
+            second_client.post(
+                "/purchases",
+                headers=auth_headers(tmp_path, idempotency_key=key),
+                json=payload,
+            )
+        )
+        await asyncio.sleep(0.05)
+        erpnext_client.release.set()
+        first, second = await asyncio.gather(first_task, second_task)
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert first.json()["id"] == second.json()["id"]
+    assert erpnext_client.create_attempts == 1
+    assert erpnext_client.create_purchase_calls == 1
+
+
+@pytest.mark.anyio
 async def test_purchase_create_does_not_complete_until_draft_price_is_restored(
     tmp_path: Path,
 ) -> None:
@@ -906,7 +1027,7 @@ async def test_purchase_create_does_not_complete_until_draft_price_is_restored(
 
 
 @pytest.mark.anyio
-async def test_ambiguous_purchase_create_without_external_document_becomes_terminal(
+async def test_ambiguous_purchase_create_without_external_document_stays_recoverable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -946,6 +1067,12 @@ async def test_ambiguous_purchase_create_without_external_document_becomes_termi
     assert second_response.json() == first_response.json()
     assert erpnext_client.create_purchase_calls == 1
     assert erpnext_client.recovery_calls >= 1
+    with sqlite3.connect(make_test_settings(tmp_path).stock_idempotency_db_path) as connection:
+        idempotency_status = connection.execute(
+            "SELECT status FROM stock_idempotency WHERE idempotency_key = ?",
+            (key,),
+        ).fetchone()[0]
+    assert idempotency_status == "recovery_required"
 
 
 @pytest.mark.anyio

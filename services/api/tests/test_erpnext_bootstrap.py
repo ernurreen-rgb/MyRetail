@@ -54,6 +54,8 @@ def test_bootstrap_api_user_grants_minimal_stock_permissions() -> None:
     assert "cancel = 1" in purchase_receipt_block
 
     for fieldname in [
+        "myretail_stock_idempotency_key",
+        "myretail_purchase_idempotency_key",
         "myretail_sale_idempotency_key",
         "myretail_open_idempotency_key",
         "myretail_close_idempotency_key",

@@ -218,8 +218,13 @@ async def create_purchase(
             purchase,
             actor=tenant_context.user,
             idempotency_key=key,
+            tenant=tenant_context.tenant,
         ),
-        recover=lambda: client.recover_created_purchase(key),
+        recover=lambda: client.recover_created_purchase(
+            key,
+            tenant=tenant_context.tenant,
+            actor_email=tenant_context.user.email,
+        ),
     )
 
 
@@ -390,73 +395,147 @@ async def _idempotent_response(
             content=begin.record.response_body,
         )
 
+    if begin.acquired and begin.recovery_only:
+        return await _recover_or_pending_response(
+            store=store,
+            tenant=tenant,
+            key=key,
+            request_hash=request_hash,
+            fencing_token=begin.fencing_token,
+            status_code=status_code,
+            recover=recover,
+        )
+
     if not begin.acquired:
-        if recover is not None:
-            response = await _wait_or_recover_idempotency(
+        record = await _wait_idempotency(
+            store=store,
+            tenant=tenant,
+            key=key,
+            request_hash=request_hash,
+        )
+        if record is not None:
+            return JSONResponse(status_code=record.status_code, content=record.response_body)
+        begin = _begin_idempotency(store, tenant=tenant, key=key, request_hash=request_hash)
+        if begin.record is not None:
+            return JSONResponse(
+                status_code=begin.record.status_code,
+                content=begin.record.response_body,
+            )
+        if begin.acquired and begin.recovery_only:
+            return await _recover_or_pending_response(
                 store=store,
                 tenant=tenant,
                 key=key,
                 request_hash=request_hash,
+                fencing_token=begin.fencing_token,
                 status_code=status_code,
                 recover=recover,
             )
-            if response is not None:
-                return response
-        else:
-            record = await _wait_idempotency(
-                store=store,
-                tenant=tenant,
-                key=key,
-                request_hash=request_hash,
-            )
-            if record is not None:
-                return JSONResponse(status_code=record.status_code, content=record.response_body)
         raise _api_error(
             status.HTTP_409_CONFLICT,
             "IDEMPOTENCY_CONFLICT",
             "Запрос с этим Idempotency-Key ещё выполняется",
         )
 
+    fencing_token = begin.fencing_token
     try:
         result = await _call_erpnext(execute())
     except ERPNextAmbiguousCreateError:
-        recovered_response = await _wait_or_recover_idempotency(
-            store=store,
-            tenant=tenant,
-            key=key,
-            request_hash=request_hash,
-            status_code=status_code,
-            recover=recover,
-            timeout_seconds=CREATE_RECOVERY_TIMEOUT_SECONDS,
-            poll_seconds=CREATE_RECOVERY_POLL_SECONDS,
+        _mark_recovery_required(
+            store,
+            tenant,
+            key,
+            request_hash,
+            fencing_token,
+            lease_seconds=60.0,
         )
+        try:
+            recovered_response = await _wait_or_recover_idempotency(
+                store=store,
+                tenant=tenant,
+                key=key,
+                request_hash=request_hash,
+                fencing_token=fencing_token,
+                status_code=status_code,
+                recover=recover,
+                timeout_seconds=CREATE_RECOVERY_TIMEOUT_SECONDS,
+                poll_seconds=CREATE_RECOVERY_POLL_SECONDS,
+            )
+        except Exception:
+            _mark_recovery_required(
+                store,
+                tenant,
+                key,
+                request_hash,
+                fencing_token,
+                lease_seconds=0,
+            )
+            raise
         if recovered_response is not None:
             return recovered_response
-        return _complete_terminal_idempotency_error(
+        return _pending_idempotency_response(
             store=store,
             tenant=tenant,
             key=key,
             request_hash=request_hash,
+            fencing_token=fencing_token,
         )
-    except Exception:
-        recovered_response = await _recover_idempotent_response(
-            store=store,
+    except Exception as exc:
+        if recover is not None and isinstance(exc, HTTPException) and exc.status_code >= 500:
+            _mark_recovery_required(
+                store,
+                tenant,
+                key,
+                request_hash,
+                fencing_token,
+                lease_seconds=60.0,
+            )
+            try:
+                recovered_response = await _recover_idempotent_response(
+                    store=store,
+                    tenant=tenant,
+                    key=key,
+                    request_hash=request_hash,
+                    fencing_token=fencing_token,
+                    status_code=status_code,
+                    recover=recover,
+                )
+            except Exception as recovery_exc:
+                _mark_recovery_required(
+                    store,
+                    tenant,
+                    key,
+                    request_hash,
+                    fencing_token,
+                    lease_seconds=0,
+                )
+                raise exc from recovery_exc
+            if recovered_response is not None:
+                return recovered_response
+            _mark_recovery_required(
+                store,
+                tenant,
+                key,
+                request_hash,
+                fencing_token,
+                lease_seconds=0,
+            )
+            raise
+        store.release(
             tenant=tenant,
             key=key,
             request_hash=request_hash,
-            status_code=status_code,
-            recover=recover,
+            fencing_token=fencing_token,
         )
-        if recovered_response is not None:
-            return recovered_response
-        store.release(tenant=tenant, key=key, request_hash=request_hash)
         raise
 
     response_body = jsonable_encoder(result)
-    store.complete(
+    _complete_idempotency(
+        store,
         tenant=tenant,
         key=key,
         request_hash=request_hash,
+        fencing_token=fencing_token,
         status_code=status_code,
         response_body=response_body,
     )
@@ -469,6 +548,7 @@ async def _recover_idempotent_response(
     tenant: str,
     key: str,
     request_hash: str,
+    fencing_token: int,
     status_code: int,
     recover: Callable[[], Awaitable[T | None]] | None,
 ) -> JSONResponse | None:
@@ -478,10 +558,12 @@ async def _recover_idempotent_response(
     if result is None:
         return None
     response_body = jsonable_encoder(result)
-    store.complete(
+    _complete_idempotency(
+        store,
         tenant=tenant,
         key=key,
         request_hash=request_hash,
+        fencing_token=fencing_token,
         status_code=status_code,
         response_body=response_body,
     )
@@ -494,6 +576,7 @@ async def _wait_or_recover_idempotency(
     tenant: str,
     key: str,
     request_hash: str,
+    fencing_token: int,
     status_code: int,
     recover: Callable[[], Awaitable[T | None]],
     timeout_seconds: float = 30.0,
@@ -522,6 +605,7 @@ async def _wait_or_recover_idempotency(
             tenant=tenant,
             key=key,
             request_hash=request_hash,
+            fencing_token=fencing_token,
             status_code=status_code,
             recover=recover,
         )
@@ -531,23 +615,117 @@ async def _wait_or_recover_idempotency(
     return None
 
 
-def _complete_terminal_idempotency_error(
+def _pending_idempotency_response(
     *,
     store: IdempotencyStore,
     tenant: str,
     key: str,
     request_hash: str,
+    fencing_token: int,
 ) -> JSONResponse:
-    store.complete(
-        tenant=tenant,
-        key=key,
-        request_hash=request_hash,
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        response_body=ERPNEXT_UNAVAILABLE_RESPONSE,
+    _mark_recovery_required(
+        store,
+        tenant,
+        key,
+        request_hash,
+        fencing_token,
+        lease_seconds=0,
     )
     return JSONResponse(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         content=ERPNEXT_UNAVAILABLE_RESPONSE,
+    )
+
+
+async def _recover_or_pending_response(
+    *,
+    store: IdempotencyStore,
+    tenant: str,
+    key: str,
+    request_hash: str,
+    fencing_token: int,
+    status_code: int,
+    recover: Callable[[], Awaitable[T | None]] | None,
+) -> JSONResponse:
+    if recover is not None:
+        try:
+            response = await _recover_idempotent_response(
+                store=store,
+                tenant=tenant,
+                key=key,
+                request_hash=request_hash,
+                fencing_token=fencing_token,
+                status_code=status_code,
+                recover=recover,
+            )
+        except Exception:
+            _mark_recovery_required(
+                store,
+                tenant,
+                key,
+                request_hash,
+                fencing_token,
+                lease_seconds=0,
+            )
+            raise
+        if response is not None:
+            return response
+    return _pending_idempotency_response(
+        store=store,
+        tenant=tenant,
+        key=key,
+        request_hash=request_hash,
+        fencing_token=fencing_token,
+    )
+
+
+def _complete_idempotency(
+    store: IdempotencyStore,
+    *,
+    tenant: str,
+    key: str,
+    request_hash: str,
+    fencing_token: int,
+    status_code: int,
+    response_body: dict[str, object],
+) -> None:
+    if store.complete(
+        tenant=tenant,
+        key=key,
+        request_hash=request_hash,
+        fencing_token=fencing_token,
+        status_code=status_code,
+        response_body=response_body,
+    ):
+        return
+    raise _api_error(
+        status.HTTP_409_CONFLICT,
+        "IDEMPOTENCY_CONFLICT",
+        "Idempotency operation ownership changed",
+    )
+
+
+def _mark_recovery_required(
+    store: IdempotencyStore,
+    tenant: str,
+    key: str,
+    request_hash: str,
+    fencing_token: int,
+    *,
+    lease_seconds: float,
+) -> None:
+    if store.mark_recovery_required(
+        tenant=tenant,
+        key=key,
+        request_hash=request_hash,
+        fencing_token=fencing_token,
+        lease_seconds=lease_seconds,
+    ):
+        return
+    raise _api_error(
+        status.HTTP_409_CONFLICT,
+        "IDEMPOTENCY_CONFLICT",
+        "Idempotency recovery ownership changed",
     )
 
 

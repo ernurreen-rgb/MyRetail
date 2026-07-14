@@ -1169,12 +1169,24 @@ class ERPNextClient:
         *,
         actor: AuthenticatedUser,
         idempotency_key: str | None = None,
+        tenant: str | None = None,
     ) -> Purchase:
+        if idempotency_key is not None and tenant is None:
+            raise ERPNextConfigurationError(
+                "Purchase Receipt idempotency requires a tenant marker scope"
+            )
         supplier = await self._assert_supplier_active(purchase.supplier_id)
         await self._assert_warehouse_active(purchase.warehouse_id)
         lines = await self._build_purchase_lines(purchase.lines)
         original_prices = await self._current_buying_price_snapshots(
             [line.product_id for line in lines]
+        )
+        idempotency_marker = (
+            self._pos_idempotency_marker(
+                tenant, "create_purchase", actor.email, idempotency_key
+            )
+            if tenant is not None and idempotency_key is not None
+            else None
         )
         created_at = datetime.now(UTC)
         payload = self._to_purchase_receipt_payload(
@@ -1185,6 +1197,7 @@ class ERPNextClient:
             created_at=created_at,
             docstatus=0,
             create_idempotency_key=idempotency_key,
+            idempotency_marker=idempotency_marker,
             draft_price_snapshots=original_prices,
         )
         try:
@@ -1193,10 +1206,22 @@ class ERPNextClient:
                 "/api/resource/Purchase Receipt",
                 json_payload=payload,
             )
-        except (ERPNextTimeoutError, ERPNextUnavailableError) as exc:
-            created = await self.recover_created_purchase(idempotency_key)
+        except (ERPNextConflictError, ERPNextValidationError):
+            created = await self.recover_created_purchase(
+                idempotency_key,
+                tenant=tenant or "",
+                actor_email=actor.email,
+            )
             if created is not None:
-                await self._restore_buying_price_snapshots(original_prices)
+                return created
+            raise
+        except (ERPNextTimeoutError, ERPNextUnavailableError) as exc:
+            created = await self.recover_created_purchase(
+                idempotency_key,
+                tenant=tenant,
+                actor_email=actor.email,
+            )
+            if created is not None:
                 return created
             raise ERPNextAmbiguousCreateError(
                 "ERPNext Purchase Receipt create result is ambiguous"
@@ -1206,9 +1231,12 @@ class ERPNextClient:
         if isinstance(data, Mapping):
             purchase_id = str(data.get("name") or "")
         if not purchase_id:
-            created = await self.recover_created_purchase(idempotency_key)
+            created = await self.recover_created_purchase(
+                idempotency_key,
+                tenant=tenant,
+                actor_email=actor.email,
+            )
             if created is not None:
-                await self._restore_buying_price_snapshots(original_prices)
                 return created
             raise ERPNextAmbiguousCreateError(
                 "ERPNext Purchase Receipt create response does not contain name"
@@ -1216,9 +1244,12 @@ class ERPNextClient:
         try:
             created = await self.get_purchase(purchase_id)
         except (ERPNextProductNotFoundError, ERPNextTimeoutError, ERPNextUnavailableError) as exc:
-            created = await self.recover_created_purchase(idempotency_key)
+            created = await self.recover_created_purchase(
+                idempotency_key,
+                tenant=tenant,
+                actor_email=actor.email,
+            )
             if created is not None:
-                await self._restore_buying_price_snapshots(original_prices)
                 return created
             raise ERPNextAmbiguousCreateError(
                 "ERPNext Purchase Receipt was created but could not be read back"
@@ -1593,6 +1624,7 @@ class ERPNextClient:
         created_at: datetime,
         docstatus: int,
         create_idempotency_key: str | None = None,
+        idempotency_marker: str | None = None,
         draft_price_snapshots: Mapping[str, Mapping[str, object]] | None = None,
     ) -> dict[str, Any]:
         metadata = {
@@ -1613,7 +1645,7 @@ class ERPNextClient:
             metadata["myretail_purchase"]["create_idempotency_key"] = create_idempotency_key
         if draft_price_snapshots is not None:
             metadata["myretail_purchase"]["draft_price_snapshots"] = draft_price_snapshots
-        return {
+        payload = {
             "doctype": "Purchase Receipt",
             "company": self._company,
             "supplier": purchase.supplier_id,
@@ -1629,6 +1661,9 @@ class ERPNextClient:
                 for line in lines
             ],
         }
+        if idempotency_marker is not None:
+            payload["myretail_purchase_idempotency_key"] = idempotency_marker
+        return payload
 
     def _to_purchase_receipt_item(
         self,
@@ -1648,9 +1683,26 @@ class ERPNextClient:
             "amount": line.line_total,
         }
 
-    async def recover_created_purchase(self, idempotency_key: str | None) -> Purchase | None:
+    async def recover_created_purchase(
+        self,
+        idempotency_key: str | None,
+        *,
+        tenant: str,
+        actor_email: str,
+    ) -> Purchase | None:
         if idempotency_key is None:
             return None
+        marker = self._pos_idempotency_marker(
+            tenant, "create_purchase", actor_email, idempotency_key
+        )
+        filters = [
+            [
+                "Purchase Receipt",
+                "myretail_purchase_idempotency_key",
+                "=",
+                marker,
+            ]
+        ]
         rows = await self._query_resource(
             "Purchase Receipt",
             fields=[
@@ -1668,7 +1720,7 @@ class ERPNextClient:
                 "net_total",
                 "grand_total",
             ],
-            filters=[["Purchase Receipt", "remarks", "like", f"%{idempotency_key}%"]],
+            filters=filters,
             limit=2,
             order_by="creation desc",
         )
@@ -2432,24 +2484,72 @@ class ERPNextClient:
         movement: StockMovementCreate,
         *,
         actor: AuthenticatedUser,
+        tenant: str | None = None,
+        idempotency_key: str | None = None,
+        operation: str = "create_stock_movement",
     ) -> StockMovement:
+        if idempotency_key is not None and tenant is None:
+            raise ERPNextConfigurationError(
+                "Stock Entry idempotency requires a tenant marker scope"
+            )
         now = datetime.now(UTC)
         movement_lines = await self._build_stock_movement_lines(movement)
+        marker = (
+            self._pos_idempotency_marker(tenant, operation, actor.email, idempotency_key)
+            if tenant is not None and idempotency_key is not None
+            else None
+        )
         payload = self._to_stock_entry_payload(
             movement,
             lines=movement_lines,
             actor=actor,
             created_at=now,
+            idempotency_marker=marker,
         )
-        response = await self._request_json(
-            "POST",
-            "/api/resource/Stock Entry",
-            json_payload=payload,
-        )
+        try:
+            response = await self._request_json(
+                "POST",
+                "/api/resource/Stock Entry",
+                json_payload=payload,
+            )
+        except (ERPNextConflictError, ERPNextValidationError):
+            recovered = await self.recover_stock_movement(
+                tenant,
+                operation,
+                actor.email,
+                idempotency_key,
+            )
+            if recovered is not None:
+                return recovered
+            raise
+        except (ERPNextTimeoutError, ERPNextUnavailableError) as exc:
+            recovered = await self.recover_stock_movement(
+                tenant,
+                operation,
+                actor.email,
+                idempotency_key,
+            )
+            if recovered is not None:
+                return recovered
+            raise ERPNextAmbiguousCreateError(
+                "ERPNext Stock Entry create result is ambiguous"
+            ) from exc
         data = response.get("data")
         movement_id = ""
         if isinstance(data, Mapping):
             movement_id = str(data.get("name") or "")
+        if not movement_id and marker is not None:
+            recovered = await self.recover_stock_movement(
+                tenant,
+                operation,
+                actor.email,
+                idempotency_key,
+            )
+            if recovered is not None:
+                return recovered
+            raise ERPNextAmbiguousCreateError(
+                "ERPNext Stock Entry create response does not contain name"
+            )
         return StockMovement(
             id=movement_id or f"STOCK-{int(now.timestamp())}",
             type=movement.type,
@@ -2466,45 +2566,147 @@ class ERPNextClient:
             lines=movement_lines,
         )
 
+    async def recover_stock_movement(
+        self,
+        tenant: str | None,
+        operation: str,
+        user_email: str,
+        idempotency_key: str | None,
+    ) -> StockMovement | None:
+        if tenant is None or idempotency_key is None:
+            return None
+        marker = self._pos_idempotency_marker(
+            tenant, operation, user_email, idempotency_key
+        )
+        rows = await self._query_resource(
+            "Stock Entry",
+            fields=["name"],
+            filters=[
+                ["Stock Entry", "myretail_stock_idempotency_key", "=", marker]
+            ],
+            limit=1,
+        )
+        if not rows:
+            return None
+        movement_id = str(rows[0].get("name") or "")
+        return await self.get_stock_movement(movement_id) if movement_id else None
+
     async def cancel_stock_movement(
         self,
         movement_id: str,
         request: StockMovementCancelRequest,
         *,
         actor: AuthenticatedUser,
+        tenant: str | None = None,
+        idempotency_key: str | None = None,
     ) -> StockMovementCancelResponse:
         movement = await self.get_stock_movement(movement_id)
+        cancellation = await self._get_stock_movement_cancellation(movement_id)
         if movement.status == "cancelled" or movement.reversal_movement_id is not None:
             raise ERPNextConflictError(
                 "MOVEMENT_ALREADY_CANCELLED",
                 "Движение уже отменено",
             )
 
+        if cancellation is not None and cancellation.get("status") == "cancellation_pending":
+            raise ERPNextConflictError(
+                "MOVEMENT_ALREADY_CANCELLED",
+                "Stock movement cancellation is already pending",
+            )
+
         cancelled_at = datetime.now(UTC)
+        operation_marker = (
+            self._pos_idempotency_marker(
+                tenant, "cancel_stock_movement", actor.email, idempotency_key
+            )
+            if tenant is not None and idempotency_key is not None
+            else None
+        )
         await self._mark_stock_movement_cancellation_pending(
             movement,
             actor=actor,
             cancelled_at=cancelled_at,
+            operation_marker=operation_marker,
         )
         reversal_request = self._to_reversal_request(movement, request.reason)
         try:
-            reversal = await self.create_stock_movement(reversal_request, actor=actor)
+            reversal = await self.create_stock_movement(
+                reversal_request,
+                actor=actor,
+                tenant=tenant,
+                idempotency_key=idempotency_key,
+                operation="cancel_stock_movement",
+            )
         except (
             ERPNextAuthenticationError,
             ERPNextProductNotFoundError,
-            ERPNextUnavailableError,
             ERPNextValidationError,
             ERPNextConflictError,
         ):
             await self._mark_stock_movement_posted(movement)
             raise
 
-        await self._mark_stock_movement_cancelled(
-            movement,
-            actor=actor,
-            cancelled_at=cancelled_at,
-            reversal_movement_id=reversal.id,
+        try:
+            await self._mark_stock_movement_cancelled(
+                movement,
+                actor=actor,
+                cancelled_at=cancelled_at,
+                reversal_movement_id=reversal.id,
+                operation_marker=operation_marker,
+            )
+        except (ERPNextTimeoutError, ERPNextUnavailableError) as exc:
+            raise ERPNextAmbiguousCreateError(
+                "Stock movement reversal exists but cancellation confirmation is ambiguous"
+            ) from exc
+        cancelled = movement.model_copy(
+            update={
+                "status": "cancelled",
+                "cancelled_by": AuditUser(email=actor.email, full_name=actor.full_name),
+                "cancelled_at": cancelled_at,
+                "reversal_movement_id": reversal.id,
+            }
         )
+        return StockMovementCancelResponse(movement=cancelled, reversal=reversal)
+
+    async def recover_cancelled_stock_movement(
+        self,
+        movement_id: str,
+        request: StockMovementCancelRequest,
+        *,
+        actor: AuthenticatedUser,
+        tenant: str,
+        idempotency_key: str,
+    ) -> StockMovementCancelResponse | None:
+        _ = request
+        operation_marker = self._pos_idempotency_marker(
+            tenant, "cancel_stock_movement", actor.email, idempotency_key
+        )
+        reversal = await self.recover_stock_movement(
+            tenant,
+            "cancel_stock_movement",
+            actor.email,
+            idempotency_key,
+        )
+        if reversal is None:
+            return None
+
+        movement = await self.get_stock_movement(movement_id)
+        cancellation = await self._get_stock_movement_cancellation(movement_id)
+        cancelled_at = self._parse_optional_datetime(
+            cancellation.get("cancelled_at") if cancellation is not None else None
+        ) or datetime.now(UTC)
+        if (
+            cancellation is None
+            or cancellation.get("status") != "cancelled"
+            or cancellation.get("reversal_movement_id") != reversal.id
+        ):
+            await self._mark_stock_movement_cancelled(
+                movement,
+                actor=actor,
+                cancelled_at=cancelled_at,
+                reversal_movement_id=reversal.id,
+                operation_marker=operation_marker,
+            )
         cancelled = movement.model_copy(
             update={
                 "status": "cancelled",
@@ -3149,6 +3351,7 @@ class ERPNextClient:
         lines: list[StockMovementLine],
         actor: AuthenticatedUser,
         created_at: datetime,
+        idempotency_marker: str | None = None,
     ) -> dict[str, Any]:
         stock_entry_type = {
             "receipt": "Material Receipt",
@@ -3169,7 +3372,7 @@ class ERPNextClient:
                 "lines": [line.model_dump() for line in lines],
             }
         }
-        return {
+        payload = {
             "doctype": "Stock Entry",
             "stock_entry_type": stock_entry_type,
             "purpose": stock_entry_type,
@@ -3180,6 +3383,9 @@ class ERPNextClient:
                 for line, create_line in zip(lines, movement.lines, strict=True)
             ],
         }
+        if idempotency_marker is not None:
+            payload["myretail_stock_idempotency_key"] = idempotency_marker
+        return payload
 
     async def _mark_stock_movement_cancelled(
         self,
@@ -3188,6 +3394,7 @@ class ERPNextClient:
         actor: AuthenticatedUser,
         cancelled_at: datetime,
         reversal_movement_id: str,
+        operation_marker: str | None = None,
     ) -> None:
         await self._update_stock_movement_metadata(
             movement,
@@ -3195,6 +3402,7 @@ class ERPNextClient:
             actor=actor,
             cancelled_at=cancelled_at,
             reversal_movement_id=reversal_movement_id,
+            operation_marker=operation_marker,
         )
 
     async def _mark_stock_movement_cancellation_pending(
@@ -3203,6 +3411,7 @@ class ERPNextClient:
         *,
         actor: AuthenticatedUser,
         cancelled_at: datetime,
+        operation_marker: str | None = None,
     ) -> None:
         await self._update_stock_movement_metadata(
             movement,
@@ -3210,6 +3419,7 @@ class ERPNextClient:
             actor=actor,
             cancelled_at=cancelled_at,
             reversal_movement_id=None,
+            operation_marker=operation_marker,
         )
 
     async def _mark_stock_movement_posted(self, movement: StockMovement) -> None:
@@ -3219,6 +3429,7 @@ class ERPNextClient:
             actor=None,
             cancelled_at=None,
             reversal_movement_id=None,
+            operation_marker=None,
         )
 
     async def _update_stock_movement_metadata(
@@ -3229,6 +3440,7 @@ class ERPNextClient:
         actor: AuthenticatedUser | None,
         cancelled_at: datetime | None,
         reversal_movement_id: str | None,
+        operation_marker: str | None,
     ) -> None:
         metadata = {
             "myretail_cancellation": {
@@ -3254,6 +3466,8 @@ class ERPNextClient:
             )
         if reversal_movement_id is not None:
             metadata["myretail_cancellation"]["reversal_movement_id"] = reversal_movement_id
+        if operation_marker is not None:
+            metadata["myretail_cancellation"]["operation_marker"] = operation_marker
         await self._request_json(
             "POST",
             "/api/resource/Comment",
@@ -3405,12 +3619,20 @@ class ERPNextClient:
             created_by=self._audit_user(metadata.get("created_by"), row.get("owner")),
             created_at=self._parse_datetime(metadata.get("created_at") or row.get("modified")),
             cancelled_by=self._audit_user_or_none(
-                cancellation.get("cancelled_by")
+                (
+                    cancellation.get("cancelled_by")
+                    if cancellation.get("status") == "cancelled"
+                    else None
+                )
                 if cancellation is not None
                 else metadata.get("cancelled_by")
             ),
             cancelled_at=self._parse_optional_datetime(
-                cancellation.get("cancelled_at")
+                (
+                    cancellation.get("cancelled_at")
+                    if cancellation.get("status") == "cancelled"
+                    else None
+                )
                 if cancellation is not None
                 else metadata.get("cancelled_at")
             ),
@@ -3446,7 +3668,7 @@ class ERPNextClient:
 
     @staticmethod
     def _is_cancellation_status(cancellation: Mapping[str, Any]) -> bool:
-        return cancellation.get("status") in {"cancelled", "cancellation_pending"}
+        return cancellation.get("status") == "cancelled"
 
     def _stock_movement_lines_from_metadata(
         self,
@@ -3504,7 +3726,7 @@ class ERPNextClient:
     @staticmethod
     def _safe_movement_status(value: str, row: Mapping[str, Any]) -> str:
         if value == "cancellation_pending":
-            return "cancelled"
+            return "posted"
         if value in {"posted", "cancelled"}:
             return value
         return "cancelled" if int(row.get("docstatus") or 0) == 2 else "posted"

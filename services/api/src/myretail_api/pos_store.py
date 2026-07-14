@@ -238,6 +238,7 @@ class POSStore:
         payload: dict[str, Any],
         external_key: str | None = None,
         expected_shift_updated_at: str | None = None,
+        require_no_held_receipts: bool = False,
         lease_seconds: int = 60,
     ) -> POSIntentBeginResult:
         now = _now()
@@ -327,6 +328,23 @@ class POSStore:
                 if str(shift["updated_at"]) != expected_shift_updated_at:
                     connection.rollback()
                     raise POSStoreConflictError("SHIFT_CHANGED", "Смена изменилась")
+
+            if require_no_held_receipts:
+                shift_id = scope_id.removeprefix("shift:")
+                held = connection.execute(
+                    """
+                    SELECT 1 FROM pos_held_receipts
+                    WHERE tenant = ? AND shift_id = ? AND status = 'open'
+                    LIMIT 1
+                    """,
+                    (tenant, shift_id),
+                ).fetchone()
+                if held is not None:
+                    connection.rollback()
+                    raise POSStoreConflictError(
+                        "SHIFT_HAS_HELD_RECEIPTS",
+                        "Open held receipts block shift closing",
+                    )
 
             intent_id = f"POSOP-{uuid4().hex[:16].upper()}"
             operation_key = external_key or intent_id
@@ -879,6 +897,12 @@ class POSStore:
 
     def upsert_held_receipt(self, row: dict[str, Any]) -> dict[str, Any]:
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._assert_held_mutation_allowed(
+                connection,
+                tenant=str(row["tenant"]),
+                shift_id=str(row["shift_id"]),
+            )
             connection.execute(
                 """
                 INSERT INTO pos_held_receipts (
@@ -894,6 +918,7 @@ class POSStore:
                 """,
                 row,
             )
+            connection.commit()
         return self.get_held_receipt(row["tenant"], row["id"]) or row
 
     def get_held_receipt(self, tenant: str, held_id: str) -> dict[str, Any] | None:
@@ -920,6 +945,11 @@ class POSStore:
                 connection.rollback()
                 raise POSStoreConflictError("HELD_RECEIPT_NOT_FOUND", "Отложенный чек не найден")
             current = _dict(existing)
+            self._assert_held_mutation_allowed(
+                connection,
+                tenant=str(current["tenant"]),
+                shift_id=str(current["shift_id"]),
+            )
             if current["updated_at"] != expected_updated_at:
                 connection.rollback()
                 raise POSStoreConflictError("HELD_RECEIPT_CHANGED", "Отложенный чек изменился")
@@ -938,6 +968,21 @@ class POSStore:
 
     def delete_held_receipt(self, tenant: str, held_id: str) -> None:
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM pos_held_receipts "
+                "WHERE tenant = ? AND id = ? AND status = 'open'",
+                (tenant, held_id),
+            ).fetchone()
+            if existing is None:
+                connection.commit()
+                return
+            current = _dict(existing)
+            self._assert_held_mutation_allowed(
+                connection,
+                tenant=tenant,
+                shift_id=str(current["shift_id"]),
+            )
             connection.execute(
                 """
                 UPDATE pos_held_receipts
@@ -945,6 +990,36 @@ class POSStore:
                 WHERE tenant = ? AND id = ? AND status = 'open'
                 """,
                 (_now(), tenant, held_id),
+            )
+            connection.commit()
+
+    @staticmethod
+    def _assert_held_mutation_allowed(
+        connection: sqlite3.Connection,
+        *,
+        tenant: str,
+        shift_id: str,
+    ) -> None:
+        shift = connection.execute(
+            "SELECT status FROM pos_shifts WHERE tenant = ? AND id = ?",
+            (tenant, shift_id),
+        ).fetchone()
+        if shift is None:
+            raise POSStoreConflictError("SHIFT_NOT_FOUND", "Shift not found")
+        if str(shift["status"]) != "open":
+            raise POSStoreConflictError("SHIFT_CLOSED", "Shift is closed")
+        active = connection.execute(
+            """
+            SELECT 1 FROM pos_operation_intents
+            WHERE tenant = ? AND scope_id = ?
+              AND state IN ('reserved', 'erp_pending', 'recovery_required', 'materialized')
+            LIMIT 1
+            """,
+            (tenant, f"shift:{shift_id}"),
+        ).fetchone()
+        if active is not None:
+            raise POSStoreConflictError(
+                "SHIFT_CHANGED", "Another shift operation is in progress"
             )
 
     def complete_held_receipt(self, tenant: str, held_id: str) -> None:
