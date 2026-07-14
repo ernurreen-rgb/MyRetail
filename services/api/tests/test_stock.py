@@ -363,6 +363,34 @@ class BlockingCreateStockClient(StubStockERPNextClient):
         )
 
 
+class BlockingCancelStockClient(StubStockERPNextClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancel_calls = 0
+
+    async def cancel_stock_movement(
+        self,
+        movement_id: str,
+        request: StockMovementCancelRequest,
+        *,
+        actor: AuthenticatedUser,
+        tenant: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> StockMovementCancelResponse:
+        self.cancel_calls += 1
+        self.started.set()
+        await self.release.wait()
+        return await super().cancel_stock_movement(
+            movement_id,
+            request,
+            actor=actor,
+            tenant=tenant,
+            idempotency_key=idempotency_key,
+        )
+
+
 class AmbiguousStockCreateClient(StubStockERPNextClient):
     def __init__(self) -> None:
         super().__init__()
@@ -666,7 +694,8 @@ async def test_stock_cancel_timeout_stays_posted_until_reversal_is_recovered(
     monkeypatch.setattr(stock_router_module, "STOCK_RECOVERY_POLL_SECONDS", 0.001)
     erpnext_client = AmbiguousStockCancelClient()
     app = make_app(erpnext_client, tmp_path)
-    cancel_key = str(uuid4())
+    first_cancel_key = str(uuid4())
+    recovery_cancel_key = str(uuid4())
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
@@ -683,7 +712,7 @@ async def test_stock_cancel_timeout_stays_posted_until_reversal_is_recovered(
         movement_id = created.json()["id"]
         first = await client.post(
             f"/stock/movements/{movement_id}/cancel",
-            headers=auth_headers(tmp_path, idempotency_key=cancel_key),
+            headers=auth_headers(tmp_path, idempotency_key=first_cancel_key),
             json={"reason": "Wrong receipt"},
         )
         pending = await client.get(
@@ -692,7 +721,7 @@ async def test_stock_cancel_timeout_stays_posted_until_reversal_is_recovered(
         erpnext_client.allow_recovery = True
         second = await client.post(
             f"/stock/movements/{movement_id}/cancel",
-            headers=auth_headers(tmp_path, idempotency_key=cancel_key),
+            headers=auth_headers(tmp_path, idempotency_key=recovery_cancel_key),
             json={"reason": "Wrong receipt"},
         )
 
@@ -704,6 +733,67 @@ async def test_stock_cancel_timeout_stays_posted_until_reversal_is_recovered(
     assert second.json()["movement"]["status"] == "cancelled"
     assert erpnext_client.cancel_calls == 1
     assert len(erpnext_client.movements) == 2
+
+
+@pytest.mark.anyio
+async def test_concurrent_stock_cancel_different_keys_share_one_reversal(
+    tmp_path: Path,
+) -> None:
+    erpnext_client = BlockingCancelStockClient()
+    first_app = make_app(erpnext_client, tmp_path)
+    second_app = make_app(erpnext_client, tmp_path)
+
+    async with (
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=first_app),
+            base_url="http://first-api",
+        ) as first_client,
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=second_app),
+            base_url="http://second-api",
+        ) as second_client,
+    ):
+        created = await first_client.post(
+            "/stock/movements",
+            headers=auth_headers(tmp_path, idempotency_key=str(uuid4())),
+            json={
+                "type": "receipt",
+                "warehouse_id": "Stores - MR",
+                "lines": [{"product_id": "SKU-001", "quantity": "2.000"}],
+            },
+        )
+        movement_id = created.json()["id"]
+        first_cancel = asyncio.create_task(
+            first_client.post(
+                f"/stock/movements/{movement_id}/cancel",
+                headers=auth_headers(tmp_path, idempotency_key=str(uuid4())),
+                json={"reason": "Wrong receipt"},
+            )
+        )
+        await erpnext_client.started.wait()
+        second_cancel = asyncio.create_task(
+            second_client.post(
+                f"/stock/movements/{movement_id}/cancel",
+                headers=auth_headers(tmp_path, idempotency_key=str(uuid4())),
+                json={"reason": "Wrong receipt"},
+            )
+        )
+        await asyncio.sleep(0.05)
+        erpnext_client.release.set()
+        first_response, second_response = await asyncio.gather(
+            first_cancel,
+            second_cancel,
+        )
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert (
+        first_response.json()["reversal"]["id"]
+        == second_response.json()["reversal"]["id"]
+    )
+    assert erpnext_client.cancel_calls == 1
+    assert len(erpnext_client.movements) == 2
+    assert erpnext_client.balances[("SKU-001", "Stores - MR")] == Decimal("10.000")
 
 
 def test_stock_idempotency_fencing_rejects_stale_owner(tmp_path: Path) -> None:
@@ -778,10 +868,17 @@ def test_stock_idempotency_schema_migrates_existing_database(tmp_path: Path) -> 
                 "PRAGMA table_info(stock_idempotency)"
             ).fetchall()
         }
+        alias_table = connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'table' AND name = 'stock_idempotency_aliases'
+            """
+        ).fetchone()
 
     assert record is not None
     assert record.response_body == {"id": "OLD"}
-    assert {"lease_until", "fencing_token"}.issubset(columns)
+    assert {"lease_until", "fencing_token", "scope_key"}.issubset(columns)
+    assert alias_table is not None
 
 
 @pytest.mark.anyio

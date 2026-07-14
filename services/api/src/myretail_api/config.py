@@ -8,6 +8,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 API_ROOT = Path(__file__).resolve().parents[2]
 
 
+class UnsafeProductionStateError(RuntimeError):
+    """Raised when production would use process-local coordination state."""
+
+
 class POSCashierAssignment(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -49,3 +53,12 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def validate_production_state_storage(settings: Settings) -> None:
+    if settings.environment != "production":
+        return
+    raise UnsafeProductionStateError(
+        "Production requires shared transactional POS and idempotency state storage; "
+        "the current local SQLite stores are disabled in production"
+    )

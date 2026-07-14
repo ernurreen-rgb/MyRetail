@@ -28,6 +28,7 @@ from myretail_api.dependencies import (
 )
 from myretail_api.idempotency import (
     IdempotencyBeginResult,
+    IdempotencyCompletedScopeConflictError,
     IdempotencyConflictError,
     IdempotencyRecord,
     StockIdempotencyStore,
@@ -207,6 +208,7 @@ async def cancel_stock_movement(
         store=store,
         tenant=tenant_context.tenant,
         key=key,
+        scope_key=f"cancel_stock_movement:{movement_id}",
         request_hash=request_hash,
         status_code=status.HTTP_200_OK,
         execute=lambda: client.cancel_stock_movement(
@@ -380,8 +382,16 @@ async def _idempotent_stock_response(
     status_code: int,
     execute: Callable[[], Awaitable[T]],
     recover: Callable[[], Awaitable[T | None]],
+    scope_key: str | None = None,
 ) -> JSONResponse:
-    begin = _begin_idempotency(store, tenant=tenant, key=key, request_hash=request_hash)
+    begin = _begin_idempotency(
+        store,
+        tenant=tenant,
+        key=key,
+        request_hash=request_hash,
+        scope_key=scope_key,
+    )
+    storage_key = begin.storage_key or key
     if begin.record is not None:
         return JSONResponse(
             status_code=begin.record.status_code,
@@ -392,7 +402,7 @@ async def _idempotent_stock_response(
         return await _recover_stock_or_pending(
             store=store,
             tenant=tenant,
-            key=key,
+            key=storage_key,
             request_hash=request_hash,
             fencing_token=begin.fencing_token,
             status_code=status_code,
@@ -400,10 +410,22 @@ async def _idempotent_stock_response(
         )
 
     if not begin.acquired:
-        record = await _wait_idempotency(store, tenant=tenant, key=key, request_hash=request_hash)
+        record = await _wait_idempotency(
+            store,
+            tenant=tenant,
+            key=storage_key,
+            request_hash=request_hash,
+        )
         if record is not None:
             return JSONResponse(status_code=record.status_code, content=record.response_body)
-        begin = _begin_idempotency(store, tenant=tenant, key=key, request_hash=request_hash)
+        begin = _begin_idempotency(
+            store,
+            tenant=tenant,
+            key=key,
+            request_hash=request_hash,
+            scope_key=scope_key,
+        )
+        storage_key = begin.storage_key or key
         if begin.record is not None:
             return JSONResponse(
                 status_code=begin.record.status_code,
@@ -413,7 +435,7 @@ async def _idempotent_stock_response(
             return await _recover_stock_or_pending(
                 store=store,
                 tenant=tenant,
-                key=key,
+                key=storage_key,
                 request_hash=request_hash,
                 fencing_token=begin.fencing_token,
                 status_code=status_code,
@@ -432,7 +454,7 @@ async def _idempotent_stock_response(
         _mark_stock_recovery(
             store,
             tenant,
-            key,
+            storage_key,
             request_hash,
             fencing_token,
             lease_seconds=60.0,
@@ -445,7 +467,7 @@ async def _idempotent_stock_response(
                     return _complete_stock_response(
                         store=store,
                         tenant=tenant,
-                        key=key,
+                        key=storage_key,
                         request_hash=request_hash,
                         fencing_token=fencing_token,
                         status_code=status_code,
@@ -456,7 +478,7 @@ async def _idempotent_stock_response(
             _mark_stock_recovery(
                 store,
                 tenant,
-                key,
+                storage_key,
                 request_hash,
                 fencing_token,
                 lease_seconds=0,
@@ -465,7 +487,7 @@ async def _idempotent_stock_response(
         return _pending_stock_response(
             store=store,
             tenant=tenant,
-            key=key,
+            key=storage_key,
             request_hash=request_hash,
             fencing_token=fencing_token,
         )
@@ -474,7 +496,7 @@ async def _idempotent_stock_response(
             _mark_stock_recovery(
                 store,
                 tenant,
-                key,
+                storage_key,
                 request_hash,
                 fencing_token,
                 lease_seconds=60.0,
@@ -485,7 +507,7 @@ async def _idempotent_stock_response(
                 _mark_stock_recovery(
                     store,
                     tenant,
-                    key,
+                    storage_key,
                     request_hash,
                     fencing_token,
                     lease_seconds=0,
@@ -495,7 +517,7 @@ async def _idempotent_stock_response(
                 return _complete_stock_response(
                     store=store,
                     tenant=tenant,
-                    key=key,
+                    key=storage_key,
                     request_hash=request_hash,
                     fencing_token=fencing_token,
                     status_code=status_code,
@@ -504,7 +526,7 @@ async def _idempotent_stock_response(
             _mark_stock_recovery(
                 store,
                 tenant,
-                key,
+                storage_key,
                 request_hash,
                 fencing_token,
                 lease_seconds=0,
@@ -512,7 +534,7 @@ async def _idempotent_stock_response(
             raise
         store.release(
             tenant=tenant,
-            key=key,
+            key=storage_key,
             request_hash=request_hash,
             fencing_token=fencing_token,
         )
@@ -521,7 +543,7 @@ async def _idempotent_stock_response(
     return _complete_stock_response(
         store=store,
         tenant=tenant,
-        key=key,
+        key=storage_key,
         request_hash=request_hash,
         fencing_token=fencing_token,
         status_code=status_code,
@@ -649,9 +671,21 @@ def _begin_idempotency(
     tenant: str,
     key: str,
     request_hash: str,
+    scope_key: str | None = None,
 ) -> IdempotencyBeginResult:
     try:
-        return store.begin(tenant=tenant, key=key, request_hash=request_hash)
+        return store.begin(
+            tenant=tenant,
+            key=key,
+            request_hash=request_hash,
+            scope_key=scope_key,
+        )
+    except IdempotencyCompletedScopeConflictError as exc:
+        raise _api_error(
+            status.HTTP_409_CONFLICT,
+            "MOVEMENT_ALREADY_CANCELLED",
+            "Движение уже отменено",
+        ) from exc
     except IdempotencyConflictError as exc:
         raise _api_error(
             status.HTTP_409_CONFLICT,
