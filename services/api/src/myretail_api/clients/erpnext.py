@@ -2585,6 +2585,26 @@ class ERPNextClient:
         movement_id = str(rows[0].get("name") or "")
         return await self.get_stock_movement(movement_id) if movement_id else None
 
+    async def _recover_stock_cancellation_reversal(
+        self,
+        cancellation: Mapping[str, Any] | None,
+        stable_operation_marker: str | None,
+    ) -> tuple[StockMovement | None, str | None]:
+        markers: list[str] = []
+        existing_operation_marker = (
+            cancellation.get("operation_marker") if cancellation is not None else None
+        )
+        if isinstance(existing_operation_marker, str) and existing_operation_marker:
+            markers.append(existing_operation_marker)
+        if stable_operation_marker is not None and stable_operation_marker not in markers:
+            markers.append(stable_operation_marker)
+
+        for marker in markers:
+            reversal = await self._recover_stock_movement_by_marker(marker)
+            if reversal is not None:
+                return reversal, marker
+        return None, stable_operation_marker
+
     async def cancel_stock_movement(
         self,
         movement_id: str,
@@ -2602,7 +2622,7 @@ class ERPNextClient:
                 "Движение уже отменено",
             )
 
-        operation_marker = (
+        stable_operation_marker = (
             self._stock_cancellation_marker(tenant, movement_id)
             if tenant is not None
             else None
@@ -2615,22 +2635,27 @@ class ERPNextClient:
                 movement,
                 actor=actor,
                 cancelled_at=cancelled_at,
-                operation_marker=operation_marker,
+                operation_marker=stable_operation_marker,
             )
-        elif operation_marker is None:
+        elif stable_operation_marker is None:
             raise ERPNextConflictError(
                 "MOVEMENT_ALREADY_CANCELLED",
                 "Stock movement cancellation is already pending",
             )
 
-        existing_reversal = await self._recover_stock_movement_by_marker(operation_marker)
+        existing_reversal, recovered_operation_marker = (
+            await self._recover_stock_cancellation_reversal(
+                cancellation,
+                stable_operation_marker,
+            )
+        )
         if existing_reversal is not None:
             await self._mark_stock_movement_cancelled(
                 movement,
                 actor=actor,
                 cancelled_at=cancelled_at,
                 reversal_movement_id=existing_reversal.id,
-                operation_marker=operation_marker,
+                operation_marker=recovered_operation_marker,
             )
             cancelled = movement.model_copy(
                 update={
@@ -2656,7 +2681,7 @@ class ERPNextClient:
                 tenant=tenant,
                 idempotency_key=idempotency_key,
                 operation="cancel_stock_movement",
-                idempotency_marker=operation_marker,
+                idempotency_marker=stable_operation_marker,
             )
         except (
             ERPNextAuthenticationError,
@@ -2673,7 +2698,7 @@ class ERPNextClient:
                 actor=actor,
                 cancelled_at=cancelled_at,
                 reversal_movement_id=reversal.id,
-                operation_marker=operation_marker,
+                operation_marker=stable_operation_marker,
             )
         except (ERPNextTimeoutError, ERPNextUnavailableError) as exc:
             raise ERPNextAmbiguousCreateError(
@@ -2699,15 +2724,18 @@ class ERPNextClient:
         idempotency_key: str,
     ) -> StockMovementCancelResponse | None:
         _ = request
-        operation_marker = self._stock_cancellation_marker(tenant, movement_id)
-        reversal = await self._recover_stock_movement_by_marker(
-            operation_marker,
+        stable_operation_marker = self._stock_cancellation_marker(tenant, movement_id)
+        cancellation = await self._get_stock_movement_cancellation(movement_id)
+        reversal, recovered_operation_marker = (
+            await self._recover_stock_cancellation_reversal(
+                cancellation,
+                stable_operation_marker,
+            )
         )
         if reversal is None:
             return None
 
         movement = await self.get_stock_movement(movement_id)
-        cancellation = await self._get_stock_movement_cancellation(movement_id)
         cancelled_at = self._parse_optional_datetime(
             cancellation.get("cancelled_at") if cancellation is not None else None
         ) or datetime.now(UTC)
@@ -2721,7 +2749,7 @@ class ERPNextClient:
                 actor=actor,
                 cancelled_at=cancelled_at,
                 reversal_movement_id=reversal.id,
-                operation_marker=operation_marker,
+                operation_marker=recovered_operation_marker,
             )
         cancelled = movement.model_copy(
             update={

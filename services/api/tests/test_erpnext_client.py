@@ -1226,6 +1226,190 @@ async def test_adjustment_rejects_mixed_increase_and_decrease_directions() -> No
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("entrypoint", ["cancel", "recover"])
+async def test_stock_cancel_recovers_legacy_pending_reversal_before_stable_marker(
+    entrypoint: str,
+) -> None:
+    movement_id = "MAT-STE-2026-00001"
+    reversal_id = "MAT-STE-2026-00002"
+    legacy_key = "00000000-0000-0000-0000-000000000102"
+    retry_key = "00000000-0000-0000-0000-000000000202"
+    legacy_marker = hashlib.sha256(
+        f"myretail:cancel_stock_movement:owner@example.com:{legacy_key}".encode()
+    ).hexdigest()
+    stable_marker = hashlib.sha256(
+        f"myretail:cancel_stock_movement:{movement_id}".encode()
+    ).hexdigest()
+    original_metadata = {
+        "myretail": {
+            "type": "receipt",
+            "status": "posted",
+            "warehouse_id": "Stores - MR",
+            "destination_warehouse_id": None,
+            "reason_code": None,
+            "comment": "Delivery",
+            "created_by": {"email": "owner@example.com", "full_name": "Owner"},
+            "created_at": "2026-06-29T08:00:00Z",
+            "lines": [
+                {
+                    "product_id": "SKU-001",
+                    "quantity": "2.000",
+                    "before_quantity": "0.000",
+                    "after_quantity": "2.000",
+                }
+            ],
+        }
+    }
+    pending_cancellation = {
+        "myretail_cancellation": {
+            **original_metadata["myretail"],
+            "status": "cancellation_pending",
+            "cancelled_by": {"email": "owner@example.com", "full_name": "Owner"},
+            "cancelled_at": "2026-06-29T08:05:00Z",
+            "operation_marker": legacy_marker,
+        }
+    }
+    reversal_metadata = {
+        "myretail": {
+            "type": "write_off",
+            "status": "posted",
+            "warehouse_id": "Stores - MR",
+            "reason_code": "other",
+            "comment": f"Отмена движения {movement_id}: Wrong delivery",
+            "created_by": {"email": "owner@example.com", "full_name": "Owner"},
+            "created_at": "2026-06-29T08:05:01Z",
+            "lines": [
+                {
+                    "product_id": "SKU-001",
+                    "quantity": "2.000",
+                    "before_quantity": "2.000",
+                    "after_quantity": "0.000",
+                }
+            ],
+        }
+    }
+    queried_markers: list[str] = []
+    terminal_cancellations: list[dict[str, object]] = []
+    stock_entry_posts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal stock_entry_posts
+        if request.url.path in {
+            f"/api/resource/Stock%20Entry/{movement_id}",
+            f"/api/resource/Stock Entry/{movement_id}",
+        }:
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "name": movement_id,
+                        "stock_entry_type": "Material Receipt",
+                        "docstatus": 1,
+                        "to_warehouse": "Stores - MR",
+                        "owner": "owner@example.com",
+                        "modified": "2026-06-29T08:00:00Z",
+                        "remarks": json.dumps(original_metadata, separators=(",", ":")),
+                    }
+                },
+            )
+        if request.url.path in {
+            f"/api/resource/Stock%20Entry/{reversal_id}",
+            f"/api/resource/Stock Entry/{reversal_id}",
+        }:
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "name": reversal_id,
+                        "stock_entry_type": "Material Issue",
+                        "docstatus": 1,
+                        "from_warehouse": "Stores - MR",
+                        "owner": "owner@example.com",
+                        "modified": "2026-06-29T08:05:01Z",
+                        "remarks": json.dumps(reversal_metadata, separators=(",", ":")),
+                    }
+                },
+            )
+        if request.url.path == "/api/resource/Comment":
+            if request.method == "GET":
+                filters = json.loads(request.url.params["filters"])
+                reference_names = next(
+                    (
+                        item[3]
+                        for item in filters
+                        if item[1] == "reference_name" and item[2] == "in"
+                    ),
+                    [],
+                )
+                data = []
+                if movement_id in reference_names:
+                    data.append(
+                        {
+                            "reference_name": movement_id,
+                            "content": json.dumps(
+                                pending_cancellation,
+                                separators=(",", ":"),
+                            ),
+                            "creation": "2026-06-29 08:05:00",
+                        }
+                    )
+                return httpx.Response(200, json={"data": data})
+            metadata = json.loads(json.loads(request.content)["content"])[
+                "myretail_cancellation"
+            ]
+            terminal_cancellations.append(metadata)
+            return httpx.Response(200, json={"data": {"name": "COMMENT-FINAL"}})
+        if request.url.path in {"/api/resource/Stock%20Entry", "/api/resource/Stock Entry"}:
+            if request.method == "POST":
+                stock_entry_posts += 1
+                return httpx.Response(200, json={"data": {"name": "DUPLICATE"}})
+            filters = json.loads(request.url.params["filters"])
+            marker = str(filters[0][3])
+            queried_markers.append(marker)
+            if marker == legacy_marker:
+                return httpx.Response(200, json={"data": [{"name": reversal_id}]})
+            assert marker == stable_marker
+            return httpx.Response(200, json={"data": []})
+        if request.url.path == "/api/resource/Bin":
+            return httpx.Response(
+                200,
+                json={"data": [{"actual_qty": "2.000", "reserved_qty": "0.000"}]},
+            )
+        return httpx.Response(404)
+
+    client = ERPNextClient(make_settings(), transport=httpx.MockTransport(handler))
+    actor = AuthenticatedUser(email="owner@example.com", full_name="Owner", roles=["Owner"])
+    request = StockMovementCancelRequest(reason="Wrong delivery")
+    if entrypoint == "cancel":
+        result = await client.cancel_stock_movement(
+            movement_id,
+            request,
+            actor=actor,
+            tenant="myretail",
+            idempotency_key=retry_key,
+        )
+    else:
+        result = await client.recover_cancelled_stock_movement(
+            movement_id,
+            request,
+            actor=actor,
+            tenant="myretail",
+            idempotency_key=retry_key,
+        )
+
+    assert result is not None
+    assert result.movement.status == "cancelled"
+    assert result.movement.reversal_movement_id == reversal_id
+    assert result.reversal.id == reversal_id
+    assert queried_markers == [legacy_marker]
+    assert stock_entry_posts == 0
+    assert len(terminal_cancellations) == 1
+    assert terminal_cancellations[0]["status"] == "cancelled"
+    assert terminal_cancellations[0]["reversal_movement_id"] == reversal_id
+    assert terminal_cancellations[0]["operation_marker"] == legacy_marker
+
+
+@pytest.mark.anyio
 async def test_cancel_stock_movement_persists_status_and_blocks_repeat_cancel() -> None:
     reversal_posts = 0
     cancellation_events: list[str] = []
