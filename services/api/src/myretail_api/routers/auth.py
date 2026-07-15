@@ -1,6 +1,7 @@
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from starlette.concurrency import run_in_threadpool
 
 from myretail_api.clients.erpnext import (
     ERPNextClient,
@@ -40,7 +41,8 @@ async def login(
     tenant = request.tenant.strip()
     email = request.email.strip()
     client_ip = http_request.client.host if http_request.client else "unknown"
-    retry_after = rate_limiter.check_and_record(
+    retry_after = await run_in_threadpool(
+        rate_limiter.check_and_record,
         tenant=tenant,
         client_ip=client_ip,
         login=email,
@@ -63,7 +65,12 @@ async def login(
     except ERPNextUserLoginError as exc:
         raise _invalid_credentials() from exc
     except (ERPNextRoleVerificationError, ERPNextUnavailableError) as exc:
-        rate_limiter.clear(tenant=tenant, client_ip=client_ip, login=email)
+        await run_in_threadpool(
+            rate_limiter.discard,
+            tenant=tenant,
+            client_ip=client_ip,
+            login=email,
+        )
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="ERPNext authentication is unavailable",
@@ -92,13 +99,23 @@ async def login(
             user=user,
         )
     except AuthConfigurationError as exc:
-        rate_limiter.clear(tenant=tenant, client_ip=client_ip, login=email)
+        await run_in_threadpool(
+            rate_limiter.discard,
+            tenant=tenant,
+            client_ip=client_ip,
+            login=email,
+        )
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Auth integration is not configured",
         ) from exc
 
-    rate_limiter.clear(tenant=tenant, client_ip=client_ip, login=email)
+    await run_in_threadpool(
+        rate_limiter.clear,
+        tenant=tenant,
+        client_ip=client_ip,
+        login=email,
+    )
     return LoginResponse(
         access_token=access_token,
         expires_in=expires_in,

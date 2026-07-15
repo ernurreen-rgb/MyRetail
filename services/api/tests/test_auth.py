@@ -1,18 +1,26 @@
+import asyncio
 import base64
 import hashlib
 import hmac
 import json
+import threading
+import time
 from pathlib import Path
 
 import httpx
 import pytest
 from pydantic import SecretStr
 
-from myretail_api.clients.erpnext import ERPNextUser, ERPNextUserLoginError
+from myretail_api.clients.erpnext import (
+    ERPNextUnavailableError,
+    ERPNextUser,
+    ERPNextUserLoginError,
+)
 from myretail_api.config import Settings, get_settings
 from myretail_api.dependencies import get_erpnext_client
 from myretail_api.main import create_app
 from myretail_api.models.auth import AuthenticatedUser
+from myretail_api.rate_limit import get_login_rate_limiter
 from myretail_api.security import (
     TokenValidationError,
     create_access_token,
@@ -35,6 +43,20 @@ class SuccessfulAuthClient:
 class FailingAuthClient:
     async def authenticate_user(self, *, email: str, password: str) -> ERPNextUser:
         raise ERPNextUserLoginError("bad credentials")
+
+
+class UnavailableAuthClient:
+    async def authenticate_user(self, *, email: str, password: str) -> ERPNextUser:
+        raise ERPNextUnavailableError("unavailable")
+
+
+class BlockingRateLimiter:
+    def __init__(self, release: threading.Event) -> None:
+        self._release = release
+
+    def check_and_record(self, **_: object) -> int:
+        self._release.wait(timeout=1)
+        return 60
 
 
 class UnmappedRoleAuthClient:
@@ -329,6 +351,99 @@ async def test_login_rate_limit_blocks_repeated_failures(tmp_path: Path) -> None
     assert second.status_code == 401
     assert blocked.status_code == 429
     assert int(blocked.headers["Retry-After"]) > 0
+
+
+@pytest.mark.anyio
+async def test_login_global_client_limit_cannot_be_bypassed_with_tenant_or_login_variation(
+    tmp_path: Path,
+) -> None:
+    settings = make_test_settings(tmp_path / "rate-limit.sqlite3")
+    settings.auth_rate_limit_attempts = 10
+    settings.auth_rate_limit_client_attempts = 2
+    app = create_app()
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_erpnext_client] = FailingAuthClient
+    transport = httpx.ASGITransport(app=app, client=("192.0.2.10", 1234))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first = await client.post(
+            "/auth/login",
+            json={"tenant": "unknown-a", "email": "one@example.com", "password": "wrong"},
+        )
+        second = await client.post(
+            "/auth/login",
+            json={"tenant": "unknown-b", "email": "two@example.com", "password": "wrong"},
+        )
+        blocked = await client.post(
+            "/auth/login",
+            json={"tenant": "unknown-c", "email": "three@example.com", "password": "wrong"},
+        )
+
+    assert first.status_code == 401
+    assert second.status_code == 401
+    assert blocked.status_code == 429
+    assert int(blocked.headers["Retry-After"]) > 0
+
+
+@pytest.mark.anyio
+async def test_login_infrastructure_failure_discards_only_current_rate_limit_attempt(
+    tmp_path: Path,
+) -> None:
+    settings = make_test_settings(tmp_path / "rate-limit.sqlite3")
+    settings.auth_rate_limit_attempts = 2
+    app = create_app()
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_erpnext_client] = FailingAuthClient
+    transport = httpx.ASGITransport(app=app, client=("192.0.2.10", 1234))
+    payload = {
+        "tenant": "myretail",
+        "email": "damir@example.com",
+        "password": "wrong-password",
+    }
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first_failure = await client.post("/auth/login", json=payload)
+        app.dependency_overrides[get_erpnext_client] = UnavailableAuthClient
+        infrastructure_failure = await client.post("/auth/login", json=payload)
+        app.dependency_overrides[get_erpnext_client] = FailingAuthClient
+        second_failure = await client.post("/auth/login", json=payload)
+        blocked = await client.post("/auth/login", json=payload)
+
+    assert first_failure.status_code == 401
+    assert infrastructure_failure.status_code == 503
+    assert second_failure.status_code == 401
+    assert blocked.status_code == 429
+
+
+@pytest.mark.anyio
+async def test_login_rate_limit_sqlite_wait_does_not_block_async_health_requests(
+    tmp_path: Path,
+) -> None:
+    settings = make_test_settings(tmp_path / "rate-limit.sqlite3")
+    release = threading.Event()
+    app = create_app()
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_erpnext_client] = FailingAuthClient
+    app.dependency_overrides[get_login_rate_limiter] = lambda: BlockingRateLimiter(release)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        started_at = time.perf_counter()
+        login_task = asyncio.create_task(
+            client.post(
+                "/auth/login",
+                json={"tenant": "myretail", "email": "user@example.com", "password": "wrong"},
+            )
+        )
+        await asyncio.sleep(0)
+        health = await client.get("/health")
+        health_elapsed = time.perf_counter() - started_at
+        release.set()
+        login = await login_task
+
+    assert health.status_code == 200
+    assert health_elapsed < 0.5
+    assert login.status_code == 429
 
 
 def auth_headers(

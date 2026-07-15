@@ -26,7 +26,9 @@ class Settings(BaseSettings):
     auth_secret: SecretStr | None = None
     auth_token_ttl_seconds: int = Field(default=3600, gt=0, le=86_400)
     auth_rate_limit_attempts: int = Field(default=5, ge=1, le=100)
+    auth_rate_limit_client_attempts: int = Field(default=50, ge=1, le=10_000)
     auth_rate_limit_window_seconds: int = Field(default=300, ge=1, le=86_400)
+    auth_rate_limit_capacity: int = Field(default=10_000, ge=2, le=1_000_000)
     auth_rate_limit_db_path: Path = API_ROOT / ".data" / "login-rate-limit.sqlite3"
     erpnext_base_url: str = "http://myretail.localhost:8080"
     erpnext_api_key: SecretStr | None = None
