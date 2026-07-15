@@ -34,6 +34,31 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e "services/api[dev]"
 ```
 
+The editable command remains the supported local Windows development workflow. CI and future
+production images use the committed Linux x86_64 / CPython 3.11 dependency artifacts instead:
+
+- `services/api/requirements.lock` contains the hash-locked runtime dependency graph;
+- `services/api/requirements-dev.lock` also contains test, build, and supply-chain tooling;
+- `services/api/sbom.cdx.json` is the reproducible CycloneDX runtime SBOM.
+
+CI installs the development lock with `--require-hashes`, installs the local API package with
+`--no-deps --no-build-isolation`, and blocks lock or SBOM drift. A future production API image
+must install `requirements.lock` with `--require-hashes` and then install the prebuilt MyRetail API
+wheel with `--no-deps`; there is no production API image in this repository yet.
+
+Regenerate artifacts only in the pinned Linux target. The normal update path first installs the
+existing development lock, then runs the generator; add `--upgrade` only for an intentional
+dependency refresh:
+
+```powershell
+docker run --rm --mount "type=bind,source=${PWD},target=/workspace" -w /workspace `
+  python:3.11-slim@sha256:baf89808ec37adeaab83cec287adb4a2afa4a11c1d51e961c7ec737877e61af6 `
+  sh -c "python -m pip install --require-hashes -r services/api/requirements-dev.lock && python services/api/scripts/supply_chain.py --write"
+```
+
+When intentionally changing the pinned supply-chain tool versions themselves, bootstrap those
+exact versions in the pinned container first; the generator fails closed on a tool/version mismatch.
+
 ## Run
 
 Web application:
