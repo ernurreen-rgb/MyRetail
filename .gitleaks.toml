@@ -1,0 +1,11 @@
+title = "MyRetail secret scanning"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Synthetic UUID used as an Idempotency-Key fixture in proxy tests"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexes = ['''^123e4567-e89b-42d3-a456-426614174[0]{3}$''']
+paths = ['''(?:^|/)apps/web/src/lib/(?:pos|stock|purchases)-proxy\.test\.ts$''']
