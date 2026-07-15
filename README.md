@@ -31,12 +31,15 @@ On the current workstation, Docker Desktop is installed in `E:\Docker\app` and i
 ```powershell
 npm.cmd install
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e "services/api[dev]"
+.\.venv\Scripts\python.exe -m pip install --require-hashes -r services/api/requirements-bootstrap.lock
+.\.venv\Scripts\python.exe -m pip install --no-build-isolation -e "services/api[dev]"
 ```
 
-The editable command remains the supported local Windows development workflow. CI and future
-production images use the committed Linux x86_64 / CPython 3.11 dependency artifacts instead:
+The bootstrap lock upgrades the package installer and build backend before any editable build. It
+is cross-platform and hash-verified, while the application locks target Linux x86_64 / CPython 3.11:
 
+- `services/api/requirements-bootstrap.lock` contains pip, setuptools, wheel, Hatchling, and their
+  exact build dependencies for local Windows setup;
 - `services/api/requirements.lock` contains the hash-locked runtime dependency graph;
 - `services/api/requirements-dev.lock` also contains test, build, and supply-chain tooling;
 - `services/api/sbom.cdx.json` is the reproducible CycloneDX runtime SBOM.

@@ -22,6 +22,8 @@ from packaging.utils import canonicalize_name
 
 API_DIR = Path(__file__).resolve().parents[1]
 PYPROJECT = API_DIR / "pyproject.toml"
+BOOTSTRAP_INPUT = API_DIR / "requirements-bootstrap.in"
+BOOTSTRAP_LOCK = API_DIR / "requirements-bootstrap.lock"
 RUNTIME_LOCK = API_DIR / "requirements.lock"
 DEV_LOCK = API_DIR / "requirements-dev.lock"
 SBOM = API_DIR / "sbom.cdx.json"
@@ -73,6 +75,7 @@ def compile_lock(
     destination: Path,
     current_lock: Path,
     *,
+    source: Path = PYPROJECT,
     extras: tuple[str, ...] = (),
     include_editable_build_deps: bool = False,
     upgrade: bool = False,
@@ -85,7 +88,7 @@ def compile_lock(
         "-m",
         "piptools",
         "compile",
-        str(PYPROJECT),
+        str(source),
         "--output-file",
         str(destination),
         "--resolver",
@@ -110,6 +113,18 @@ def compile_lock(
     if include_editable_build_deps:
         command.extend(("--build-deps-for", "editable"))
     run(command)
+
+
+def ensure_bootstrap_matches_dev(bootstrap_lock: Path, dev_lock: Path) -> None:
+    bootstrap_versions = read_locked_versions(bootstrap_lock)
+    dev_versions = read_locked_versions(dev_lock)
+    mismatched = {
+        name: (version, dev_versions.get(name))
+        for name, version in bootstrap_versions.items()
+        if dev_versions.get(name) != version
+    }
+    if mismatched:
+        raise SystemExit(f"Bootstrap and development locks disagree: {mismatched}")
 
 
 def install_runtime_metadata(runtime_lock: Path, destination: Path) -> None:
@@ -332,11 +347,18 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="myretail-supply-chain-") as temporary:
         temporary_dir = Path(temporary)
+        bootstrap_lock = temporary_dir / BOOTSTRAP_LOCK.name
         runtime_lock = temporary_dir / RUNTIME_LOCK.name
         dev_lock = temporary_dir / DEV_LOCK.name
         sbom = temporary_dir / SBOM.name
         runtime_metadata = temporary_dir / "runtime-site-packages"
 
+        compile_lock(
+            bootstrap_lock,
+            BOOTSTRAP_LOCK,
+            source=BOOTSTRAP_INPUT,
+            upgrade=args.upgrade,
+        )
         compile_lock(runtime_lock, RUNTIME_LOCK, upgrade=args.upgrade)
         compile_lock(
             dev_lock,
@@ -345,18 +367,27 @@ def main() -> int:
             include_editable_build_deps=True,
             upgrade=args.upgrade,
         )
+        ensure_bootstrap_matches_dev(bootstrap_lock, dev_lock)
         generate_sbom(runtime_lock, sbom, runtime_metadata)
 
-        generated = ((RUNTIME_LOCK, runtime_lock), (DEV_LOCK, dev_lock), (SBOM, sbom))
+        generated = (
+            (BOOTSTRAP_LOCK, bootstrap_lock),
+            (RUNTIME_LOCK, runtime_lock),
+            (DEV_LOCK, dev_lock),
+            (SBOM, sbom),
+        )
         if args.write:
             for destination, source in generated:
                 shutil.copyfile(source, destination)
-            print("Updated requirements.lock, requirements-dev.lock, and sbom.cdx.json.")
+            print(
+                "Updated requirements-bootstrap.lock, requirements.lock, "
+                "requirements-dev.lock, and sbom.cdx.json."
+            )
             return 0
 
         artifacts_match = [diff_artifact(expected, actual) for expected, actual in generated]
         if all(artifacts_match):
-            print("Python dependency locks and CycloneDX SBOM are reproducible and current.")
+            print("Python bootstrap/runtime/dev locks and CycloneDX SBOM are current.")
             return 0
         return 1
 
