@@ -1,15 +1,43 @@
+const ALLOWED_ORIGIN_PROTOCOLS = new Set(["http:", "https:"]);
+
+function parseConfiguredOrigin(configuredOrigin: string) {
+  try {
+    const url = new URL(configuredOrigin);
+
+    if (
+      !ALLOWED_ORIGIN_PROTOCOLS.has(url.protocol) ||
+      url.username ||
+      url.password ||
+      url.pathname !== "/" ||
+      url.search ||
+      url.hash ||
+      (process.env.NODE_ENV === "production" && url.protocol !== "https:")
+    ) {
+      return null;
+    }
+
+    return url.origin;
+  } catch {
+    return null;
+  }
+}
+
 export function getExpectedOrigin(request: Request) {
   const configuredOrigin = process.env.MYRETAIL_WEB_ORIGIN?.trim();
 
   if (configuredOrigin) {
-    try {
-      return new URL(configuredOrigin).origin;
-    } catch {
-      return null;
-    }
+    return parseConfiguredOrigin(configuredOrigin);
   }
 
-  return new URL(request.url).origin;
+  if (process.env.NODE_ENV === "production") {
+    return null;
+  }
+
+  try {
+    return new URL(request.url).origin;
+  } catch {
+    return null;
+  }
 }
 
 function isDevelopmentLoopbackAlias(origin: URL, expectedOrigin: URL) {
@@ -38,6 +66,16 @@ export function getVerifiedRequestOrigin(request: Request) {
   try {
     const parsedOrigin = new URL(origin);
     const parsedExpectedOrigin = new URL(expectedOrigin);
+
+    if (
+      parsedOrigin.username ||
+      parsedOrigin.password ||
+      parsedOrigin.pathname !== "/" ||
+      parsedOrigin.search ||
+      parsedOrigin.hash
+    ) {
+      return null;
+    }
 
     if (
       parsedOrigin.origin !== parsedExpectedOrigin.origin &&

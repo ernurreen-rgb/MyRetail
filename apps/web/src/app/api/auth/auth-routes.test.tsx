@@ -9,21 +9,23 @@ const LOGIN_URL = "http://localhost:3000/api/auth/login";
 const LOGOUT_URL = "http://localhost:3000/api/auth/logout";
 
 function loginRequest({
+  url = LOGIN_URL,
   contentType = "application/json",
   fetchSite,
-  origin = "http://localhost:3000",
+  origin = new URL(url).origin,
 }: {
+  url?: string;
   contentType?: string;
   fetchSite?: "same-origin" | "cross-site";
   origin?: string;
 } = {}) {
-  return new Request(LOGIN_URL, {
+  return new Request(url, {
     method: "POST",
     headers: {
       "Content-Type": contentType,
       Origin: origin,
       "Sec-Fetch-Site":
-        fetchSite ?? (origin === "http://localhost:3000" ? "same-origin" : "cross-site"),
+        fetchSite ?? (origin === new URL(url).origin ? "same-origin" : "cross-site"),
     },
     body:
       contentType === "application/json"
@@ -38,6 +40,7 @@ function loginRequest({
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
   delete process.env.MYRETAIL_API_URL;
   delete process.env.MYRETAIL_WEB_ORIGIN;
 });
@@ -66,6 +69,84 @@ describe("POST /api/auth/login", () => {
 
     expect(response.status).toBe(403);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "http://user:password@localhost:3000",
+    "http://localhost:3000/untrusted-path",
+    "http://localhost:3000?untrusted=query",
+    "http://localhost:3000#untrusted-fragment",
+  ])("rejects malformed request Origin %s", async (origin) => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await login(loginRequest({ fetchSite: "same-origin", origin }));
+
+    expect(response.status).toBe(403);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("fails closed in production when the trusted web origin is not configured", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await login(
+      loginRequest({ url: "https://retail.example.test/api/auth/login" }),
+    );
+
+    expect(response.status).toBe(403);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "http://retail.example.test",
+    "ftp://retail.example.test",
+    "https://user:password@retail.example.test",
+    "https://retail.example.test/untrusted-path",
+    "https://retail.example.test?untrusted=query",
+    "https://retail.example.test#untrusted-fragment",
+  ])("rejects unsafe production web origin config %s", async (configuredOrigin) => {
+    vi.stubEnv("NODE_ENV", "production");
+    process.env.MYRETAIL_WEB_ORIGIN = configuredOrigin;
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await login(
+      loginRequest({ url: "https://retail.example.test/api/auth/login" }),
+    );
+
+    expect(response.status).toBe(403);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("accepts an explicit HTTPS production web origin", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    process.env.MYRETAIL_API_URL = "http://api.test";
+    process.env.MYRETAIL_WEB_ORIGIN = "https://retail.example.test";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        Response.json({
+          access_token: "signed-token",
+          token_type: "bearer",
+          expires_in: 3_600,
+          tenant: "myretail",
+          user: {
+            email: "owner@example.com",
+            full_name: "Owner",
+            roles: ["Owner"],
+          },
+        }),
+      ),
+    );
+
+    const response = await login(
+      loginRequest({ url: "https://retail.example.test/api/auth/login" }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("set-cookie")).toContain("Secure");
   });
 
   it("accepts a same-origin HTML form fallback and redirects after login", async () => {
