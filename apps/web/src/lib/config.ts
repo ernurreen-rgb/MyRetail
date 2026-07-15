@@ -3,6 +3,8 @@ const ALLOWED_API_PROTOCOLS = new Set(["http:", "https:"]);
 const ENDPOINT_CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/u;
 
 function getValidatedApiBaseUrl() {
+  // This is trusted deployment configuration, never request-derived input. Validation below
+  // still fails closed so a malformed or unsafe deployment cannot redirect authenticated BFF calls.
   const configuredValue = process.env.MYRETAIL_API_URL ?? DEFAULT_API_BASE_URL;
   let url: URL;
 
