@@ -112,6 +112,16 @@ def make_test_settings(
     )
 
 
+def assert_sensitive_response_headers(response: httpx.Response) -> None:
+    assert response.headers["cache-control"] == "private, no-store, max-age=0"
+    assert response.headers["pragma"] == "no-cache"
+    assert response.headers["referrer-policy"] == "no-referrer"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["content-security-policy"] == (
+        "default-src 'none'; frame-ancestors 'none'; sandbox"
+    )
+
+
 @pytest.mark.parametrize("erpnext_role", ["Administrator", "System Manager"])
 def test_owner_mapping_requires_erpnext_owner_roles(erpnext_role: str) -> None:
     assert map_erpnext_roles([erpnext_role]) == ["Owner"]
@@ -164,6 +174,7 @@ async def test_login_returns_myretail_token(tmp_path: Path) -> None:
         "roles": ["Owner"],
     }
     assert body["access_token"]
+    assert_sensitive_response_headers(response)
 
 
 @pytest.mark.anyio
@@ -229,6 +240,8 @@ async def test_login_rejects_invalid_password(tmp_path: Path) -> None:
         )
 
     assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+    assert_sensitive_response_headers(response)
     assert response.json() == {"detail": "Invalid email or password"}
 
 
@@ -543,6 +556,8 @@ async def test_current_session_rejects_invalid_token() -> None:
         )
 
     assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+    assert_sensitive_response_headers(response)
 
 
 @pytest.mark.anyio
