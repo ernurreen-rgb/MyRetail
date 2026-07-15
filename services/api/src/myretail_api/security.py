@@ -19,6 +19,12 @@ class TokenValidationError(RuntimeError):
 
 
 POS_SOURCE_ROLES = {"Cashier", "Sales User", "Stock User", "Accounts User"}
+MYRETAIL_ADMIN_ROLE = "MyRetail Admin"
+
+# Bump this value when a deployed authorization policy must invalidate every
+# token issued under the previous policy. The signed claim keeps rollout
+# invalidation independent from per-process memory or local state stores.
+AUTHORIZATION_POLICY_VERSION = 2
 
 
 def map_erpnext_roles(erpnext_roles: list[str], *, has_pos_assignment: bool = False) -> list[str]:
@@ -27,8 +33,7 @@ def map_erpnext_roles(erpnext_roles: list[str], *, has_pos_assignment: bool = Fa
 
     if role_set.intersection({"Administrator", "System Manager"}):
         mapped.add("Owner")
-    manager_roles = {"Sales Manager", "Stock Manager", "Accounts Manager", "Item Manager"}
-    if role_set.intersection(manager_roles):
+    if MYRETAIL_ADMIN_ROLE in role_set:
         mapped.add("Admin")
     if has_pos_assignment and role_set.intersection(POS_SOURCE_ROLES):
         mapped.add("Cashier")
@@ -63,6 +68,7 @@ def create_access_token(
         "email": user.email,
         "full_name": user.full_name,
         "roles": user.roles,
+        "authz_version": AUTHORIZATION_POLICY_VERSION,
         "iat": int(issued_at.timestamp()),
         "exp": int(expires_at.timestamp()),
     }
@@ -94,6 +100,13 @@ def parse_access_token(
     current_time = now or datetime.now(UTC)
     if expires_at <= int(current_time.timestamp()):
         raise TokenValidationError("Token has expired")
+    authorization_policy_version = payload.get("authz_version")
+    if (
+        not isinstance(authorization_policy_version, int)
+        or isinstance(authorization_policy_version, bool)
+        or authorization_policy_version != AUTHORIZATION_POLICY_VERSION
+    ):
+        raise TokenValidationError("Token authorization policy is no longer valid")
 
     tenant = _str_claim(payload, "tenant")
     email = _str_claim(payload, "email")
