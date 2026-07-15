@@ -138,7 +138,10 @@ async def test_pos_sale_and_closing_use_same_register_scoped_erpnext_identity() 
             "/api/resource/POS Opening Entry",
         }:
             assert request.headers["Authorization"] == "token test-key:test-secret"
-            return httpx.Response(200, json={"data": [{"name": "OPEN-1"}]})
+            return httpx.Response(
+                200,
+                json={"data": [{"name": "OPEN-1", "docstatus": 1, "status": "Open"}]},
+            )
         if request.url.path in {
             "/api/resource/POS%20Closing%20Entry",
             "/api/resource/POS Closing Entry",
@@ -277,7 +280,7 @@ async def test_pos_recovery_uses_exact_scoped_marker_filter() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path in {"/api/resource/Sales%20Invoice", "/api/resource/Sales Invoice"}:
             seen_filters.append(json.loads(request.url.params["filters"]))
-            return httpx.Response(200, json={"data": [{"name": "SINV-1"}]})
+            return httpx.Response(200, json={"data": [{"name": "SINV-1", "docstatus": 1}]})
         return httpx.Response(404)
 
     client = ERPNextClient(make_settings(), transport=httpx.MockTransport(handler))
@@ -288,7 +291,180 @@ async def test_pos_recovery_uses_exact_scoped_marker_filter() -> None:
     marker = hashlib.sha256(f"myretail:create_sale:cashier@example.kz:{key}".encode()).hexdigest()
     assert recovered == "SINV-1"
     assert ["Sales Invoice", "myretail_sale_idempotency_key", "=", marker] in seen_filters[0]
+    assert ["Sales Invoice", "docstatus", "=", 1] in seen_filters[0]
     assert all("like" not in str(filter_part).lower() for filter_part in seen_filters[0])
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("method_name", "operation", "doctype", "row", "terminal_status"),
+    [
+        (
+            "recover_pos_sale",
+            "create_sale",
+            "Sales Invoice",
+            {"name": "SINV-DRAFT", "docstatus": 0},
+            None,
+        ),
+        (
+            "recover_pos_sale",
+            "create_sale",
+            "Sales Invoice",
+            {"name": "SINV-CANCELLED", "docstatus": 2},
+            None,
+        ),
+        (
+            "recover_pos_sale",
+            "create_sale",
+            "Sales Invoice",
+            {"name": "SINV-MALFORMED", "docstatus": "1"},
+            None,
+        ),
+        (
+            "recover_pos_opening",
+            "open_shift",
+            "POS Opening Entry",
+            {"name": "OPEN-DRAFT", "docstatus": 0, "status": "Draft"},
+            "Open",
+        ),
+        (
+            "recover_pos_opening",
+            "open_shift",
+            "POS Opening Entry",
+            {"name": "OPEN-CANCELLED", "docstatus": 2, "status": "Cancelled"},
+            "Open",
+        ),
+        (
+            "recover_pos_opening",
+            "open_shift",
+            "POS Opening Entry",
+            {"name": "OPEN-CLOSED", "docstatus": 1, "status": "Closed"},
+            "Open",
+        ),
+        (
+            "recover_pos_closing",
+            "close_shift",
+            "POS Closing Entry",
+            {"name": "CLOSE-DRAFT", "docstatus": 0, "status": "Draft"},
+            "Submitted",
+        ),
+        (
+            "recover_pos_closing",
+            "close_shift",
+            "POS Closing Entry",
+            {"name": "CLOSE-CANCELLED", "docstatus": 2, "status": "Cancelled"},
+            "Submitted",
+        ),
+        (
+            "recover_pos_closing",
+            "close_shift",
+            "POS Closing Entry",
+            {"name": "CLOSE-QUEUED", "docstatus": 1, "status": "Queued"},
+            "Submitted",
+        ),
+        (
+            "recover_pos_closing",
+            "close_shift",
+            "POS Closing Entry",
+            {"name": "CLOSE-FAILED", "docstatus": 1, "status": "Failed"},
+            "Submitted",
+        ),
+    ],
+)
+async def test_pos_recovery_rejects_non_terminal_erp_documents(
+    method_name: str,
+    operation: str,
+    doctype: str,
+    row: dict[str, object],
+    terminal_status: str | None,
+) -> None:
+    seen_filters: list[list[object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_filters.append(json.loads(request.url.params["filters"]))
+        return httpx.Response(200, json={"data": [row]})
+
+    client = ERPNextClient(make_settings(), transport=httpx.MockTransport(handler))
+    recover = getattr(client, method_name)
+
+    recovered = await recover(
+        "myretail",
+        operation,
+        "cashier@example.kz",
+        "00000000-0000-0000-0000-000000000001",
+    )
+
+    assert recovered is None
+    assert [doctype, "docstatus", "=", 1] in seen_filters[0]
+    if terminal_status is not None:
+        assert [doctype, "status", "=", terminal_status] in seen_filters[0]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("method_name", "operation", "row", "expected"),
+    [
+        ("recover_pos_sale", "create_sale", {"name": "SINV-1", "docstatus": 1}, "SINV-1"),
+        (
+            "recover_pos_opening",
+            "open_shift",
+            {"name": "OPEN-1", "docstatus": 1, "status": "Open"},
+            "OPEN-1",
+        ),
+        (
+            "recover_pos_closing",
+            "close_shift",
+            {"name": "CLOSE-1", "docstatus": 1, "status": "Submitted"},
+            "CLOSE-1",
+        ),
+    ],
+)
+async def test_pos_recovery_accepts_only_terminal_erp_documents(
+    method_name: str,
+    operation: str,
+    row: dict[str, object],
+    expected: str,
+) -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [row]})
+
+    client = ERPNextClient(make_settings(), transport=httpx.MockTransport(handler))
+    recover = getattr(client, method_name)
+
+    recovered = await recover(
+        "myretail",
+        operation,
+        "cashier@example.kz",
+        "00000000-0000-0000-0000-000000000001",
+    )
+
+    assert recovered == expected
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"name": "OPEN-DRAFT", "docstatus": 0, "status": "Draft"},
+        {"name": "OPEN-CANCELLED", "docstatus": 2, "status": "Cancelled"},
+        {"name": "OPEN-CLOSED", "docstatus": 1, "status": "Closed"},
+    ],
+)
+async def test_pos_opening_lookup_rejects_non_open_documents(row: dict[str, object]) -> None:
+    seen_filters: list[list[object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_filters.append(json.loads(request.url.params["filters"]))
+        return httpx.Response(200, json={"data": [row]})
+
+    client = ERPNextClient(make_settings(), transport=httpx.MockTransport(handler))
+
+    with pytest.raises(ERPNextConflictError) as exc_info:
+        await client._find_opening_name("myretail", "SHIFT-1")
+
+    assert exc_info.value.code == "SHIFT_NOT_FOUND"
+    assert ["POS Opening Entry", "docstatus", "=", 1] in seen_filters[0]
+    assert ["POS Opening Entry", "status", "=", "Open"] in seen_filters[0]
 
 
 @pytest.mark.anyio

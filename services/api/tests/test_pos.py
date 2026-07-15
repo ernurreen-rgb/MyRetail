@@ -13,7 +13,7 @@ from myretail_api.clients.erpnext import (
     ERPNextConflictError,
     ERPNextValidationError,
 )
-from myretail_api.config import Settings, get_settings
+from myretail_api.config import POSCashierAssignment, Settings, get_settings
 from myretail_api.dependencies import get_erpnext_client, get_pos_store
 from myretail_api.main import create_app
 from myretail_api.models.auth import AuthenticatedUser
@@ -2283,3 +2283,53 @@ async def test_returns_scope_and_owner_history_filters(tmp_path: Path) -> None:
     assert owner_history.json()["count"] == 1
     assert owner_history.json()["items"][0]["cashier_email"] == "other@example.kz"
     assert foreign_detail.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_reassigned_cashier_keeps_historical_read_but_cannot_create_return(
+    tmp_path: Path,
+) -> None:
+    erpnext = StubPOSErpnextClient()
+    settings = make_settings(tmp_path)
+    app = make_app(erpnext, tmp_path, settings=settings)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        shift = await open_shift(client, tmp_path)
+        sale = await create_sale(client, tmp_path, shift_id=str(shift["id"]))
+        settings.pos_cashier_assignments["cashier@example.kz"] = POSCashierAssignment(
+            register_ids={"POS-2"},
+            warehouse_ids={"WH-2"},
+        )
+        body = {
+            "sale_id": sale["id"],
+            "register_id": "POS-1",
+            "shift_id": shift["id"],
+            "refund_method": "cash",
+            "reason": "other",
+            "lines": [{"line_id": f"{sale['id']}:line:1", "quantity": "1.000"}],
+        }
+
+        historical_sale = await client.get(
+            f"/pos/sales/{sale['id']}", headers=auth_headers(tmp_path)
+        )
+        historical_options = await client.get(
+            f"/pos/sales/{sale['id']}/return-options", headers=auth_headers(tmp_path)
+        )
+        denied = await client.post(
+            "/pos/returns",
+            headers=auth_headers(tmp_path, key=str(uuid4())),
+            json=body,
+        )
+        owner_return = await client.post(
+            "/pos/returns",
+            headers=auth_headers(tmp_path, roles=["Owner"], key=str(uuid4())),
+            json=body,
+        )
+
+    assert historical_sale.status_code == 200
+    assert historical_options.status_code == 200
+    assert denied.status_code == 403
+    assert denied.json()["error"]["code"] == "POS_FORBIDDEN"
+    assert owner_return.status_code == 201
+    assert len(erpnext.returns) == 1
