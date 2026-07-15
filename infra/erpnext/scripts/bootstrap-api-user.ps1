@@ -69,6 +69,7 @@ foreach ($required in @("SITE_NAME", "HTTP_PORT", "ADMIN_PASSWORD")) {
 $baseUrl = "http://$($erpEnv.SITE_NAME):$($erpEnv.HTTP_PORT)"
 $serviceUser = "myretail-api@local.test"
 $serviceRole = "MyRetail API Reader"
+$myRetailAdminRole = "MyRetail Admin"
 $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
 
 Invoke-RestMethod `
@@ -78,17 +79,29 @@ Invoke-RestMethod `
     -ContentType "application/x-www-form-urlencoded" `
     -Body @{ usr = "Administrator"; pwd = $erpEnv.ADMIN_PASSWORD } | Out-Null
 
-$encodedRole = [Uri]::EscapeDataString($serviceRole)
-try {
-    Invoke-ErpRequest -Method Get -Uri "$baseUrl/api/resource/Role/$encodedRole" -Session $session | Out-Null
+function Ensure-ErpRole {
+    param(
+        [Parameter(Mandatory)][string]$RoleName,
+        [Parameter(Mandatory)][int]$DeskAccess
+    )
+
+    $encodedRole = [Uri]::EscapeDataString($RoleName)
+    $roleBody = @{
+        role_name = $RoleName
+        desk_access = $DeskAccess
+    }
+    try {
+        Invoke-ErpRequest -Method Get -Uri "$baseUrl/api/resource/Role/$encodedRole" -Session $session | Out-Null
+        Invoke-ErpRequest -Method Put -Uri "$baseUrl/api/resource/Role/$encodedRole" -Session $session -Body $roleBody | Out-Null
+    }
+    catch {
+        if ($_.Exception.Response.StatusCode.value__ -ne 404) { throw }
+        Invoke-ErpRequest -Method Post -Uri "$baseUrl/api/resource/Role" -Session $session -Body $roleBody | Out-Null
+    }
 }
-catch {
-    if ($_.Exception.Response.StatusCode.value__ -ne 404) { throw }
-    Invoke-ErpRequest -Method Post -Uri "$baseUrl/api/resource/Role" -Session $session -Body @{
-        role_name = $serviceRole
-        desk_access = 0
-    } | Out-Null
-}
+
+Ensure-ErpRole -RoleName $serviceRole -DeskAccess 0
+Ensure-ErpRole -RoleName $myRetailAdminRole -DeskAccess 0
 
 $permissionFields = [Uri]::EscapeDataString('["name"]')
 $permissionDefinitions = @(

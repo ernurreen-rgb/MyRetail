@@ -379,13 +379,10 @@ class IdempotencyStore:
         request_hash: str,
         scope_key: str,
     ) -> tuple[object, ...] | None:
-        fields = """
-            request_hash, status, status_code, response_body,
-            lease_until, fencing_token, idempotency_key, scope_key
-        """
         direct_row = connection.execute(
-            f"""
-            SELECT {fields}
+            """
+            SELECT request_hash, status, status_code, response_body,
+                   lease_until, fencing_token, idempotency_key, scope_key
             FROM stock_idempotency
             WHERE tenant = ? AND idempotency_key = ?
             """,
@@ -421,8 +418,9 @@ class IdempotencyStore:
             )
 
         scoped_row = connection.execute(
-            f"""
-            SELECT {fields}
+            """
+            SELECT request_hash, status, status_code, response_body,
+                   lease_until, fencing_token, idempotency_key, scope_key
             FROM stock_idempotency
             WHERE tenant = ? AND scope_key = ?
             """,

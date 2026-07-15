@@ -1852,6 +1852,69 @@ def test_openapi_sales_history_contains_v1_filters(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_pos_history_filters_bind_sql_shaped_values(tmp_path: Path) -> None:
+    erpnext = StubPOSErpnextClient()
+    app = make_app(erpnext, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        shift = await open_shift(client, tmp_path)
+        sale = await create_sale(client, tmp_path, shift_id=str(shift["id"]))
+        created_return = await client.post(
+            "/pos/returns",
+            headers=auth_headers(tmp_path, key=str(uuid4())),
+            json={
+                "sale_id": sale["id"],
+                "register_id": "POS-1",
+                "shift_id": shift["id"],
+                "refund_method": "cash",
+                "reason": "other",
+                "lines": [{"line_id": f"{sale['id']}:line:1", "quantity": "1.000"}],
+            },
+        )
+        assert created_return.status_code == 201
+        return_id = created_return.json()["return_id"]
+        sql_shaped_value = "%' OR 1=1; DROP TABLE pos_sales; --"
+        owner_headers = auth_headers(tmp_path, roles=["Owner"])
+        sales_attack = await client.get(
+            "/pos/sales",
+            headers=owner_headers,
+            params={
+                "q": sql_shaped_value,
+                "register_id": sql_shaped_value,
+                "cashier_email": sql_shaped_value,
+            },
+        )
+        returns_attack = await client.get(
+            "/pos/returns",
+            headers=owner_headers,
+            params={
+                "q": sql_shaped_value,
+                "sale_id": sql_shaped_value,
+                "register_id": sql_shaped_value,
+                "cashier_email": sql_shaped_value,
+            },
+        )
+        sales_after = await client.get(
+            "/pos/sales", headers=owner_headers, params={"q": sale["id"]}
+        )
+        returns_after = await client.get(
+            "/pos/returns",
+            headers=owner_headers,
+            params={"q": return_id},
+        )
+
+    assert sales_attack.status_code == 200
+    assert sales_attack.json()["count"] == 0
+    assert returns_attack.status_code == 200
+    assert returns_attack.json()["count"] == 0
+    assert sales_after.status_code == 200
+    assert sales_after.json()["count"] == 1
+    assert returns_after.status_code == 200
+    assert returns_after.json()["count"] == 1
+
+
+@pytest.mark.anyio
 async def test_return_options_and_partial_return_are_idempotent_and_block_over_return(
     tmp_path: Path,
 ) -> None:

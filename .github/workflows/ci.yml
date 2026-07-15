@@ -10,11 +10,40 @@ permissions:
   contents: read
 
 jobs:
+  secrets:
+    runs-on: ubuntu-latest
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - name: Install Gitleaks
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          archive_path="${RUNNER_TEMP}/${archive}"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${archive}" \
+            --output "${archive_path}"
+          printf '%s  %s\n' "${GITLEAKS_SHA256}" "${archive_path}" | sha256sum --check --strict
+          tar --extract --gzip --file "${archive_path}" --directory "${RUNNER_TEMP}" gitleaks
+          chmod 0755 "${RUNNER_TEMP}/gitleaks"
+      - name: Scan committed secrets
+        run: >-
+          "${RUNNER_TEMP}/gitleaks" git .
+          --config .gitleaks.toml
+          --redact=100
+          --no-banner
+          --log-opts="--all"
+
   web:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           cache: npm
@@ -28,11 +57,17 @@ jobs:
   api:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.11"
           cache: pip
       - run: python -m pip install -e "services/api[dev]"
+      - name: Audit Python dependencies
+        uses: pypa/gh-action-pip-audit@1220774d901786e6f652ae159f7b6bc8fea6d266 # v1.1.0
+        with:
+          inputs: services/api/
+      - name: Scan Python code
+        run: python -m bandit -r services/api/src
       - run: python -m ruff check services/api
       - run: python -m pytest services/api/tests

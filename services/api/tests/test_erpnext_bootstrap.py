@@ -78,6 +78,18 @@ def test_bootstrap_api_user_grants_minimal_stock_permissions() -> None:
     assert "$posCredentialMap" in script
 
 
+def test_bootstrap_creates_explicit_myretail_admin_marker_role() -> None:
+    root = Path(__file__).resolve().parents[3]
+    script = (root / "infra/erpnext/scripts/bootstrap-api-user.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert '$myRetailAdminRole = "MyRetail Admin"' in script
+    assert "function Ensure-ErpRole" in script
+    assert "Ensure-ErpRole -RoleName $serviceRole -DeskAccess 0" in script
+    assert "Ensure-ErpRole -RoleName $myRetailAdminRole -DeskAccess 0" in script
+
+
 def test_stock_qa_data_scripts_seed_balances_and_reservation() -> None:
     root = Path(__file__).resolve().parents[3]
     scripts_dir = root / "infra/erpnext/scripts"
