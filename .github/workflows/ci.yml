@@ -38,5 +38,7 @@ jobs:
         uses: pypa/gh-action-pip-audit@1220774d901786e6f652ae159f7b6bc8fea6d266 # v1.1.0
         with:
           inputs: services/api/
+      - name: Scan Python code
+        run: python -m bandit -r services/api/src
       - run: python -m ruff check services/api
       - run: python -m pytest services/api/tests
