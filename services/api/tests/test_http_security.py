@@ -2,6 +2,7 @@ import httpx
 import pytest
 from fastapi import Response
 
+from myretail_api.dependencies import get_erpnext_client
 from myretail_api.main import create_app
 
 
@@ -22,7 +23,9 @@ def anyio_backend() -> str:
     ],
 )
 async def test_sensitive_api_routes_are_not_cacheable_on_errors(path: str) -> None:
-    transport = httpx.ASGITransport(app=create_app())
+    app = create_app()
+    app.dependency_overrides[get_erpnext_client] = object
+    transport = httpx.ASGITransport(app=app)
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get(path, headers={"X-MyRetail-Tenant": "myretail"})
