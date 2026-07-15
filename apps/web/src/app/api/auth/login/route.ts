@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 
 import { DEFAULT_TENANT, isLoginResponse, type LoginFormValues } from "@/lib/auth";
-import { getApiBaseUrl } from "@/lib/config";
+import { buildApiUrl } from "@/lib/config";
 import {
   getExpectedOrigin,
   getVerifiedRequestOrigin,
@@ -179,11 +179,10 @@ export async function POST(request: Request) {
     );
   }
 
-  const apiBaseUrl = getApiBaseUrl().replace(/\/+$/, "");
   let apiResponse: Response;
 
   try {
-    apiResponse = await fetch(`${apiBaseUrl}/auth/login`, {
+    apiResponse = await fetch(buildApiUrl("/auth/login"), {
       method: "POST",
       headers: {
         "Content-Type": "application/json",

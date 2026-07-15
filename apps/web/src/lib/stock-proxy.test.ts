@@ -1,13 +1,8 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const proxyDependencies = vi.hoisted(() => ({
-  getApiBaseUrl: vi.fn(),
   isSameOriginMutation: vi.fn(),
   getAuthSession: vi.fn(),
-}));
-
-vi.mock("@/lib/config", () => ({
-  getApiBaseUrl: proxyDependencies.getApiBaseUrl,
 }));
 
 vi.mock("@/lib/request-security", () => ({
@@ -47,9 +42,14 @@ function jsonRequest(
 }
 
 beforeEach(() => {
-  proxyDependencies.getApiBaseUrl.mockReset().mockReturnValue("http://api.test");
+  process.env.MYRETAIL_API_URL = "http://api.test";
   proxyDependencies.isSameOriginMutation.mockReset().mockReturnValue(true);
   proxyDependencies.getAuthSession.mockReset().mockResolvedValue(authSession);
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  delete process.env.MYRETAIL_API_URL;
 });
 
 describe("stock proxy", () => {

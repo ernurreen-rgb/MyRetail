@@ -3,13 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AuthSession } from "@/lib/auth";
 
 const proxyMocks = vi.hoisted(() => ({
-  getApiBaseUrl: vi.fn(),
   getAuthSession: vi.fn(),
   isSameOriginMutation: vi.fn(),
-}));
-
-vi.mock("@/lib/config", () => ({
-  getApiBaseUrl: proxyMocks.getApiBaseUrl,
 }));
 
 vi.mock("@/lib/request-security", () => ({
@@ -33,7 +28,7 @@ const session: AuthSession = {
 };
 
 beforeEach(() => {
-  proxyMocks.getApiBaseUrl.mockReturnValue("http://api.example.test");
+  process.env.MYRETAIL_API_URL = "http://api.example.test";
   proxyMocks.getAuthSession.mockResolvedValue(session);
   proxyMocks.isSameOriginMutation.mockReturnValue(true);
 });
@@ -41,9 +36,23 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.clearAllMocks();
+  delete process.env.MYRETAIL_API_URL;
 });
 
 describe("product BFF proxy", () => {
+  it("fails closed before fetch when an endpoint tries to escape the API origin", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await proxyProductRequest({
+      endpoint: "//attacker.example/collect",
+      request: new Request("http://localhost:3000/api/products"),
+    });
+
+    expect(response.status).toBe(503);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("sanitizes backend 403 and never exposes bearer tokens in the browser response", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(

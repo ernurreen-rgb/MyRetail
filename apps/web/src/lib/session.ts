@@ -9,7 +9,7 @@ import {
   type SessionResponse,
   isSessionResponse,
 } from "@/lib/auth";
-import { getApiBaseUrl } from "@/lib/config";
+import { buildApiUrl } from "@/lib/config";
 
 const MIN_SESSION_SECONDS = 60;
 const MAX_SESSION_SECONDS = 60 * 60 * 8;
@@ -59,10 +59,8 @@ export async function getAuthSession(): Promise<AuthSession | null> {
 async function fetchSessionContext(
   session: AuthSessionCredentials,
 ): Promise<SessionResponse | null> {
-  const apiBaseUrl = getApiBaseUrl().replace(/\/+$/, "");
-
   try {
-    const response = await fetch(`${apiBaseUrl}/auth/me`, {
+    const response = await fetch(buildApiUrl("/auth/me"), {
       cache: "no-store",
       headers: {
         Authorization: `Bearer ${session.accessToken}`,

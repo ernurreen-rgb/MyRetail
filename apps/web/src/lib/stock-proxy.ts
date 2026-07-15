@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 
-import { getApiBaseUrl } from "@/lib/config";
+import { buildApiUrl } from "@/lib/config";
 import { isSameOriginMutation } from "@/lib/request-security";
 import { getAuthSession } from "@/lib/session";
 
@@ -36,17 +36,6 @@ async function readRequestJson(request: Request): Promise<unknown> {
   } catch {
     return null;
   }
-}
-
-function buildEndpointUrl(endpoint: string, request: Request) {
-  const apiBaseUrl = getApiBaseUrl().replace(/\/+$/, "");
-  const url = new URL(`${apiBaseUrl}${endpoint}`);
-
-  for (const [key, value] of new URL(request.url).searchParams) {
-    url.searchParams.append(key, value);
-  }
-
-  return url;
 }
 
 export async function proxyStockRequest({
@@ -95,7 +84,7 @@ export async function proxyStockRequest({
   let apiResponse: Response;
 
   try {
-    apiResponse = await fetch(buildEndpointUrl(endpoint, request), {
+    apiResponse = await fetch(buildApiUrl(endpoint, new URL(request.url).searchParams), {
       method,
       headers,
       body: hasJsonBody ? JSON.stringify(requestBody) : undefined,
