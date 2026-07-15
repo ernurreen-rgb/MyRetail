@@ -3,10 +3,14 @@ from typing import Any
 from fastapi import FastAPI, Request, status
 from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from myretail_api.config import Settings, get_settings, validate_production_state_storage
+from myretail_api.http_security import (
+    ApiSecurityHeadersMiddleware,
+    apply_api_security_headers,
+)
 from myretail_api.routers.auth import router as auth_router
 from myretail_api.routers.health import router as health_router
 from myretail_api.routers.pos import router as pos_router
@@ -22,6 +26,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         version="0.1.0",
         summary="Stable API gateway between MyRetail clients and ERPNext.",
     )
+    app.add_middleware(ApiSecurityHeadersMiddleware)
+    app.add_exception_handler(Exception, internal_server_error_handler)
     app.add_exception_handler(StarletteHTTPException, product_http_exception_handler)
     app.add_exception_handler(RequestValidationError, product_validation_exception_handler)
     app.include_router(auth_router)
@@ -32,6 +38,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(suppliers_router)
     app.include_router(purchases_router)
     return app
+
+
+async def internal_server_error_handler(request: Request, exc: Exception) -> Response:
+    del exc
+    response = PlainTextResponse(
+        "Internal Server Error",
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+    )
+    apply_api_security_headers(response.headers, path=request.url.path)
+    return response
 
 
 async def product_http_exception_handler(

@@ -21,6 +21,9 @@ async def test_health_endpoint() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok", "service": "myretail-api"}
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert "cache-control" not in response.headers
+    assert "content-security-policy" not in response.headers
 
 
 def test_production_rejects_local_sqlite_state() -> None:
