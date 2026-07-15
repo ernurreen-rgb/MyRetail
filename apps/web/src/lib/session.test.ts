@@ -70,4 +70,13 @@ describe("verifyAuthSession", () => {
 
     await expect(verifyAuthSession(session)).resolves.toBe(false);
   });
+
+  it("fails closed without fetch for an unsafe configured API URL", async () => {
+    process.env.MYRETAIL_API_URL = "file:///etc/passwd";
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(verifyAuthSession(session)).resolves.toBe(false);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });

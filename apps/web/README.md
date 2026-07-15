@@ -14,6 +14,8 @@ npm.cmd run dev:web
 
 Если адрес API отличается от локального значения по умолчанию, скопируйте `.env.example` в `.env.local` и измените `MYRETAIL_API_URL`.
 
+`MYRETAIL_API_URL` должен быть абсолютным HTTP(S)-адресом без credentials, query string или fragment. Допустим безопасный base path, например `https://internal.example/myretail-api`; frontend добавляет только проверенные относительные API endpoints и завершает запрос fail closed при небезопасной конфигурации.
+
 ## Команды
 
 ```powershell

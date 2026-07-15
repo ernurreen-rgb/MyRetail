@@ -1,5 +1,5 @@
 import type { AuthSession } from "@/lib/auth";
-import { getApiBaseUrl } from "@/lib/config";
+import { buildApiUrl } from "@/lib/config";
 import {
   type ProductsState,
   isProductsResponse,
@@ -41,10 +41,8 @@ function toProductsErrorMessage(status: number, payload: unknown) {
 }
 
 export async function getProducts(session: AuthSession): Promise<ProductsState> {
-  const apiBaseUrl = getApiBaseUrl().replace(/\/+$/, "");
-
   try {
-    const response = await fetch(`${apiBaseUrl}/products`, {
+    const response = await fetch(buildApiUrl("/products"), {
       cache: "no-store",
       headers: {
         Authorization: `Bearer ${session.accessToken}`,
