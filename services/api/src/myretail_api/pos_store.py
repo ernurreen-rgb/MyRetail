@@ -1407,15 +1407,13 @@ class POSStore:
             filters.append("state = ?")
             params.append(state)
         where = " AND ".join(filters)
+        # `where` contains only the fixed clauses above; request values stay bound params.
+        count_sql = f"SELECT COUNT(*) FROM pos_returns WHERE {where}"  # nosec B608
+        rows_sql = f"SELECT * FROM pos_returns WHERE {where}"  # nosec B608
+        rows_sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
         with self._connect() as connection:
-            count = connection.execute(
-                f"SELECT COUNT(*) FROM pos_returns WHERE {where}", params
-            ).fetchone()[0]
-            rows = connection.execute(
-                f"SELECT * FROM pos_returns WHERE {where} "
-                "ORDER BY created_at DESC LIMIT ? OFFSET ?",
-                [*params, limit, offset],
-            ).fetchall()
+            count = connection.execute(count_sql, params).fetchone()[0]
+            rows = connection.execute(rows_sql, [*params, limit, offset]).fetchall()
         return [_dict(row) for row in rows if row is not None], int(count)
 
     def list_sales(
@@ -1458,15 +1456,13 @@ class POSStore:
             filters.append("created_at < ?")
             params.append(_date_start(date_to + timedelta(days=1)))
         where = " AND ".join(filters)
+        # `where` contains only the fixed clauses above; request values stay bound params.
+        count_sql = f"SELECT COUNT(*) FROM pos_sales WHERE {where}"  # nosec B608
+        rows_sql = f"SELECT * FROM pos_sales WHERE {where}"  # nosec B608
+        rows_sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
         with self._connect() as connection:
-            count = connection.execute(
-                f"SELECT COUNT(*) FROM pos_sales WHERE {where}",
-                params,
-            ).fetchone()[0]
-            rows = connection.execute(
-                f"SELECT * FROM pos_sales WHERE {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
-                [*params, limit, offset],
-            ).fetchall()
+            count = connection.execute(count_sql, params).fetchone()[0]
+            rows = connection.execute(rows_sql, [*params, limit, offset]).fetchall()
         return [_dict(row) for row in rows if row is not None], int(count)
 
     def _ensure_schema(self) -> None:
