@@ -16,6 +16,8 @@ npm.cmd run dev:web
 
 `MYRETAIL_API_URL` должен быть абсолютным HTTP(S)-адресом без credentials, query string или fragment. Допустим безопасный base path, например `https://internal.example/myretail-api`; frontend добавляет только проверенные относительные API endpoints и завершает запрос fail closed при небезопасной конфигурации.
 
+`MYRETAIL_WEB_ORIGIN` задаёт единственный доверенный browser origin для CSRF-проверок и redirect. В production он обязателен, должен использовать HTTPS и не может содержать credentials, path, query string или fragment. Локальная разработка без этой переменной сохраняет request-derived loopback origin и alias `localhost`/`127.0.0.1` на одном protocol/port.
+
 ## Команды
 
 ```powershell
