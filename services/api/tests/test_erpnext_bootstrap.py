@@ -64,6 +64,7 @@ def test_bootstrap_api_user_grants_minimal_stock_permissions() -> None:
         "myretail_cashier_email",
     ]:
         assert fieldname in script
+    assert '"MYRETAIL_ERPNEXT_API_USER=$serviceUser"' in script
     assert "MYRETAIL_ERPNEXT_POS_USER" in script
     assert "MYRETAIL_ERPNEXT_POS_USER_MAP" in script
     assert "MYRETAIL_ERPNEXT_POS_CREDENTIALS_MAP" in script

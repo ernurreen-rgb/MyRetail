@@ -1522,6 +1522,7 @@ async def test_stock_cancel_recovers_legacy_pending_reversal_before_stable_marke
                     data.append(
                         {
                             "reference_name": movement_id,
+                            "owner": "myretail-api@local.test",
                             "content": json.dumps(
                                 pending_cancellation,
                                 separators=(",", ":"),
@@ -1643,6 +1644,7 @@ async def test_cancel_stock_movement_persists_status_and_blocks_repeat_cancel() 
                         "data": [
                             {
                                 "reference_name": "MAT-STE-2026-00001",
+                                "owner": "myretail-api@local.test",
                                 "content": content,
                                 "creation": f"2026-06-29 08:00:0{index}",
                             }
@@ -1675,7 +1677,25 @@ async def test_cancel_stock_movement_persists_status_and_blocks_repeat_cancel() 
             )
         if request.url.path in {"/api/resource/Stock%20Entry", "/api/resource/Stock Entry"}:
             if request.method == "GET":
-                assert json.loads(request.url.params["filters"]) == [
+                filters = json.loads(request.url.params["filters"])
+                if filters[0][1] == "name":
+                    assert filters == [
+                        ["Stock Entry", "name", "in", ["MAT-STE-2026-00002"]],
+                        ["Stock Entry", "docstatus", "=", 1],
+                    ]
+                    return httpx.Response(
+                        200,
+                        json={
+                            "data": [
+                                {
+                                    "name": "MAT-STE-2026-00002",
+                                    "docstatus": 1,
+                                    "myretail_stock_idempotency_key": marker,
+                                }
+                            ]
+                        },
+                    )
+                assert filters == [
                     ["Stock Entry", "myretail_stock_idempotency_key", "=", marker]
                 ]
                 return httpx.Response(200, json={"data": []})
@@ -1766,6 +1786,7 @@ async def test_cancel_stock_movement_blocks_repeat_when_final_mark_fails() -> No
                         "data": [
                             {
                                 "reference_name": "MAT-STE-2026-00001",
+                                "owner": "myretail-api@local.test",
                                 "content": content,
                                 "creation": f"2026-06-29 08:00:0{index}",
                             }
@@ -2480,6 +2501,8 @@ async def test_submit_purchase_recovers_price_sync_without_second_submit() -> No
             )
         if request.url.path == "/api/method/frappe.client.submit":
             state["submit_count"] += 1
+            submitted_doc = json.loads(request.content)["doc"]
+            purchase_doc["remarks"] = submitted_doc["remarks"]
             purchase_doc["docstatus"] = 1
             purchase_doc["modified"] = "2026-06-30T08:01:00Z"
             state["price"] = "600.00"
@@ -2490,6 +2513,7 @@ async def test_submit_purchase_recovers_price_sync_without_second_submit() -> No
             body = json.loads(request.content)
             comments.append(
                 {
+                    "owner": "myretail-api@local.test",
                     "content": body["content"],
                     "creation": f"2026-06-30T08:0{len(comments)}:00Z",
                 }
@@ -2557,6 +2581,8 @@ async def test_submit_purchase_recovers_price_sync_without_second_submit() -> No
     assert first_event["original_prices"] == {
         "QA-MILK-001": {"exists": True, "price": "510.00"}
     }
+    submitted_metadata = json.loads(str(purchase_doc["remarks"]))["myretail_purchase"]
+    assert submitted_metadata["draft_price_snapshots"] == first_event["original_prices"]
 
 
 @pytest.mark.anyio
@@ -2565,6 +2591,9 @@ async def test_cancel_purchase_restores_previous_buying_price_and_blocks_repeat(
         "myretail_purchase": {
             "created_by": {"email": "owner@example.com", "full_name": "Owner"},
             "created_at": "2026-06-30T08:00:00Z",
+            "draft_price_snapshots": {
+                "QA-MILK-001": {"exists": True, "price": "510.00"}
+            },
             "lines": [
                 {
                     "product_id": "QA-MILK-001",
@@ -2595,6 +2624,7 @@ async def test_cancel_purchase_restores_previous_buying_price_and_blocks_repeat(
     }
     comments: list[dict[str, object]] = [
         {
+            "owner": "myretail-api@local.test",
             "content": json.dumps(
                 {
                     "myretail_purchase_event": {
@@ -2609,7 +2639,22 @@ async def test_cancel_purchase_restores_previous_buying_price_and_blocks_repeat(
                 separators=(",", ":"),
             ),
             "creation": "2026-06-30T08:01:00Z",
-        }
+        },
+        {
+            "owner": "attacker@example.com",
+            "content": json.dumps(
+                {
+                    "myretail_purchase_event": {
+                        "status": "price_synced",
+                        "original_prices": {
+                            "QA-MILK-001": {"exists": True, "price": "0.01"}
+                        },
+                    }
+                },
+                separators=(",", ":"),
+            ),
+            "creation": "2026-06-30T08:01:30Z",
+        },
     ]
     state = {
         "price": "600.00",
@@ -2625,11 +2670,18 @@ async def test_cancel_purchase_restores_previous_buying_price_and_blocks_repeat(
         }:
             return httpx.Response(200, json={"data": purchase_doc})
         if request.url.path == "/api/resource/Comment" and request.method == "GET":
+            assert [
+                "Comment",
+                "owner",
+                "=",
+                "myretail-api@local.test",
+            ] in json.loads(request.url.params["filters"])
             return httpx.Response(200, json={"data": comments})
         if request.url.path == "/api/resource/Comment" and request.method == "POST":
             body = json.loads(request.content)
             comments.append(
                 {
+                    "owner": "myretail-api@local.test",
                     "content": body["content"],
                     "creation": f"2026-06-30T08:0{len(comments) + 1}:00Z",
                 }
@@ -2713,3 +2765,175 @@ async def test_cancel_purchase_restores_previous_buying_price_and_blocks_repeat(
             actor=actor,
         )
     assert exc_info.value.code == "PURCHASE_ALREADY_CANCELLED"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("attack", ["untrusted_owner", "mismatched_marker"])
+async def test_forged_stock_cancellation_comment_is_not_terminal(attack: str) -> None:
+    movement_id = "MAT-STE-2026-00001"
+    reversal_id = "MAT-STE-2026-00999"
+    claimed_marker = "a" * 64
+    actual_marker = claimed_marker if attack == "untrusted_owner" else "b" * 64
+    comment_owner = (
+        "attacker@example.com"
+        if attack == "untrusted_owner"
+        else "myretail-api@local.test"
+    )
+    original_metadata = {
+        "myretail": {
+            "type": "receipt",
+            "status": "posted",
+            "warehouse_id": "Stores - MR",
+            "destination_warehouse_id": None,
+            "reason_code": None,
+            "comment": "Delivery",
+            "created_by": {"email": "owner@example.com", "full_name": "Owner"},
+            "created_at": "2026-06-29T08:00:00Z",
+            "lines": [
+                {
+                    "product_id": "SKU-001",
+                    "quantity": "2.000",
+                    "before_quantity": "0.000",
+                    "after_quantity": "2.000",
+                }
+            ],
+        }
+    }
+    forged_cancellation = {
+        "myretail_cancellation": {
+            "status": "cancelled",
+            "reversal_movement_id": reversal_id,
+            "operation_marker": claimed_marker,
+            "cancelled_by": {
+                "email": "attacker@example.com",
+                "full_name": "Attacker",
+            },
+            "cancelled_at": "2026-06-29T08:05:00Z",
+        }
+    }
+    reversal_lookups = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal reversal_lookups
+        if request.url.path in {
+            f"/api/resource/Stock%20Entry/{movement_id}",
+            f"/api/resource/Stock Entry/{movement_id}",
+        }:
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "name": movement_id,
+                        "stock_entry_type": "Material Receipt",
+                        "docstatus": 1,
+                        "to_warehouse": "Stores - MR",
+                        "owner": "owner@example.com",
+                        "modified": "2026-06-29T08:00:00Z",
+                        "remarks": json.dumps(original_metadata, separators=(",", ":")),
+                    }
+                },
+            )
+        if request.url.path == "/api/resource/Comment":
+            filters = json.loads(request.url.params["filters"])
+            assert [
+                "Comment",
+                "owner",
+                "=",
+                "myretail-api@local.test",
+            ] in filters
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "reference_name": movement_id,
+                            "owner": comment_owner,
+                            "content": json.dumps(
+                                forged_cancellation,
+                                separators=(",", ":"),
+                            ),
+                            "creation": "2026-06-29T08:05:00Z",
+                        }
+                    ]
+                },
+            )
+        if request.url.path in {"/api/resource/Stock%20Entry", "/api/resource/Stock Entry"}:
+            reversal_lookups += 1
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "name": reversal_id,
+                            "docstatus": 1,
+                            "myretail_stock_idempotency_key": actual_marker,
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(404)
+
+    client = ERPNextClient(make_settings(), transport=httpx.MockTransport(handler))
+
+    movement = await client.get_stock_movement(movement_id)
+
+    assert movement.status == "posted"
+    assert movement.reversal_movement_id is None
+    assert movement.cancelled_by is None
+    assert movement.cancelled_at is None
+    assert reversal_lookups == (0 if attack == "untrusted_owner" else 1)
+
+
+@pytest.mark.anyio
+async def test_purchase_legacy_snapshot_accepts_only_trusted_comment_owner() -> None:
+    trusted_event = {
+        "myretail_purchase_event": {
+            "status": "price_synced",
+            "original_prices": {
+                "QA-MILK-001": {"exists": True, "price": "510.00"}
+            },
+        }
+    }
+    forged_event = {
+        "myretail_purchase_event": {
+            "status": "price_synced",
+            "original_prices": {
+                "QA-MILK-001": {"exists": True, "price": "0.01"}
+            },
+        }
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/resource/Comment"
+        assert [
+            "Comment",
+            "owner",
+            "=",
+            "myretail-api@local.test",
+        ] in json.loads(request.url.params["filters"])
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "owner": "myretail-api@local.test",
+                        "content": json.dumps(trusted_event, separators=(",", ":")),
+                        "creation": "2026-06-30T08:01:00Z",
+                    },
+                    {
+                        "owner": "attacker@example.com",
+                        "content": json.dumps(forged_event, separators=(",", ":")),
+                        "creation": "2026-06-30T08:02:00Z",
+                    },
+                ]
+            },
+        )
+
+    client = ERPNextClient(make_settings(), transport=httpx.MockTransport(handler))
+
+    events = await client._get_purchase_events("PREC-LEGACY")
+
+    assert len(events) == 1
+    assert client._purchase_original_prices(events) == {
+        "QA-MILK-001": {"exists": True, "price": "510.00"}
+    }
