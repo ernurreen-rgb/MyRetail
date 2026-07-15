@@ -6,7 +6,7 @@ from uuid import uuid4
 
 import httpx
 import pytest
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
 from myretail_api.clients.erpnext import (
     ERPNextAmbiguousCreateError,
@@ -21,9 +21,12 @@ from myretail_api.models.pos import (
     POSProduct,
     POSProductList,
     Register,
+    Sale,
     SaleCreateRequest,
+    Shift,
     ShiftCloseRequest,
     ShiftOpenRequest,
+    ShiftRegisterRef,
 )
 from myretail_api.models.stock import WarehouseRef
 from myretail_api.pos_service import _request_hash
@@ -1849,6 +1852,26 @@ def test_openapi_sales_history_contains_v1_filters(tmp_path: Path) -> None:
 
     expected = {"q", "register_id", "cashier_email", "date_from", "date_to", "limit", "offset"}
     assert expected <= params
+
+
+def test_shift_and_sale_register_remain_required_public_fields() -> None:
+    register = ShiftRegisterRef(id="POS-1", name="Касса 1")
+    schemas = create_app().openapi()["components"]["schemas"]
+
+    for model, schema_name in ((Shift, "Shift"), (Sale, "Sale")):
+        assert model.model_fields["register_ref"].is_required()
+        with pytest.raises(ValidationError) as exc_info:
+            model.model_validate({})
+        assert ("register",) in {error["loc"] for error in exc_info.value.errors()}
+
+        instance = model.model_construct(register_ref=register)
+        assert instance.register == register
+        assert instance.model_dump()["register"] == register.model_dump()
+
+        schema = schemas[schema_name]
+        assert "register" in schema["required"]
+        assert "register" in schema["properties"]
+        assert "register_ref" not in schema["properties"]
 
 
 @pytest.mark.anyio
