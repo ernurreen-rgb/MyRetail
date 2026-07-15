@@ -555,6 +555,7 @@ $apiEnv = @(
     "MYRETAIL_ERPNEXT_SELLING_PRICE_LIST=$(Get-ApiSetting -Name 'MYRETAIL_ERPNEXT_SELLING_PRICE_LIST' -Default 'Standard Selling')"
     "MYRETAIL_ERPNEXT_BUYING_PRICE_LIST=$(Get-ApiSetting -Name 'MYRETAIL_ERPNEXT_BUYING_PRICE_LIST' -Default 'Standard Buying')"
     "MYRETAIL_ERPNEXT_COMPANY=$(Get-ApiSetting -Name 'MYRETAIL_ERPNEXT_COMPANY' -Default 'MyRetail Demo')"
+    "MYRETAIL_ERPNEXT_API_USER=$serviceUser"
     "MYRETAIL_ERPNEXT_POS_USER=$(Get-ApiSetting -Name 'MYRETAIL_ERPNEXT_POS_USER' -Default $serviceUser)"
     "MYRETAIL_ERPNEXT_POS_USER_MAP=$($posUserMap | ConvertTo-Json -Compress)"
     "MYRETAIL_ERPNEXT_POS_CREDENTIALS_MAP=$($posCredentialMap | ConvertTo-Json -Compress)"

@@ -166,6 +166,7 @@ class ERPNextClient:
         self._selling_price_list = settings.erpnext_selling_price_list
         self._buying_price_list = settings.erpnext_buying_price_list
         self._company = settings.erpnext_company
+        self._api_user = settings.erpnext_api_user
         self._pos_user = settings.erpnext_pos_user
         self._pos_user_map = settings.erpnext_pos_user_map
         self._pos_credentials_map = settings.erpnext_pos_credentials_map
@@ -1317,6 +1318,7 @@ class ERPNextClient:
             lines=purchase.lines or self._purchase_line_creates_from_row(row),
         )
         lines = await self._build_purchase_lines(create_like.lines)
+        draft_price_snapshots = self._purchase_draft_price_snapshots(row)
         payload = self._to_purchase_receipt_payload(
             create_like,
             supplier=supplier,
@@ -1324,6 +1326,12 @@ class ERPNextClient:
             actor=self._actor_from_metadata(metadata, row.get("owner")),
             created_at=self._parse_datetime(metadata.get("created_at") or row.get("creation")),
             docstatus=0,
+            create_idempotency_key=(
+                metadata.get("create_idempotency_key")
+                if isinstance(metadata.get("create_idempotency_key"), str)
+                else None
+            ),
+            draft_price_snapshots=draft_price_snapshots,
         )
         payload.pop("doctype", None)
         payload.pop("docstatus", None)
@@ -1370,6 +1378,13 @@ class ERPNextClient:
             await self._assert_supplier_active(str(row.get("supplier") or ""))
             original_prices = await self._current_buying_price_snapshots(
                 self._purchase_item_codes(row)
+            )
+            row = dict(row)
+            # Keep the restore authority on the Purchase Receipt submitted to ERPNext.
+            # Comment events remain audit/recovery hints and cannot override this snapshot.
+            row["remarks"] = self._purchase_remarks_with_price_snapshots(
+                row,
+                original_prices,
             )
             submitted_at = datetime.now(UTC)
             await self._add_purchase_event(
@@ -1816,7 +1831,9 @@ class ERPNextClient:
         latest_event = self._latest_purchase_event(events)
         if latest_event.get("status") == "price_synced":
             return
-        original_prices = self._purchase_original_prices(events)
+        original_prices = self._purchase_draft_price_snapshots(row)
+        if original_prices is None:
+            original_prices = self._purchase_original_prices(events)
         if original_prices is None:
             original_prices = await self._current_buying_price_snapshots(
                 self._purchase_item_codes(row)
@@ -1860,7 +1877,10 @@ class ERPNextClient:
         latest_event = self._latest_purchase_event(events)
         if latest_event.get("status") == "cancelled":
             return
-        original_prices = self._purchase_original_prices(events) or {}
+        original_prices = self._purchase_draft_price_snapshots(row)
+        if original_prices is None:
+            original_prices = self._purchase_original_prices(events)
+        original_prices = original_prices or {}
         for item_code in self._purchase_item_codes(row):
             replacement_price = await self._latest_posted_purchase_price(
                 item_code,
@@ -2000,17 +2020,22 @@ class ERPNextClient:
     async def _get_purchase_events(self, purchase_id: str) -> list[Mapping[str, Any]]:
         rows = await self._query_resource_all(
             "Comment",
-            fields=["content", "creation"],
+            fields=["owner", "content", "creation"],
             filters=[
                 ["Comment", "reference_doctype", "=", "Purchase Receipt"],
                 ["Comment", "reference_name", "=", purchase_id],
                 ["Comment", "comment_type", "=", "Info"],
                 ["Comment", "content", "like", "%myretail_purchase_event%"],
+                ["Comment", "owner", "=", self._api_user],
             ],
             order_by="creation asc",
         )
         events: list[Mapping[str, Any]] = []
         for row in rows:
+            # Frappe owns this field on insert; callers cannot assign another user as owner.
+            # The local check remains defense in depth if an ERP filter is changed later.
+            if not self._is_trusted_comment_owner(row.get("owner")):
+                continue
             event = self._extract_myretail_purchase_event(row.get("content"))
             if event is not None:
                 events.append(event)
@@ -2060,6 +2085,19 @@ class ERPNextClient:
             for item_code, snapshot in snapshots.items()
             if isinstance(snapshot, Mapping)
         }
+
+    def _purchase_remarks_with_price_snapshots(
+        self,
+        row: Mapping[str, Any],
+        snapshots: Mapping[str, Mapping[str, object]],
+    ) -> str:
+        metadata = dict(self._extract_myretail_purchase_metadata(row.get("remarks")))
+        metadata["draft_price_snapshots"] = snapshots
+        return json.dumps(
+            {"myretail_purchase": metadata},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
 
     async def _to_purchase(
         self,
@@ -2928,19 +2966,97 @@ class ERPNextClient:
 
         rows = await self._query_resource_all(
             "Comment",
-            fields=["reference_name", "content", "creation"],
-            filters=filters,
+            fields=["reference_name", "owner", "content", "creation"],
+            filters=[*filters, ["Comment", "owner", "=", self._api_user]],
             order_by="creation asc",
         )
-        cancellations: dict[str, Mapping[str, Any]] = {}
+        candidates: list[tuple[str, Mapping[str, Any]]] = []
+        reversal_ids: set[str] = set()
         for row in rows:
+            if not self._is_trusted_comment_owner(row.get("owner")):
+                continue
             movement_id = row.get("reference_name")
             if not isinstance(movement_id, str) or not movement_id:
                 continue
             cancellation = self._extract_myretail_cancellation(row.get("content"))
-            if cancellation is not None:
-                cancellations[movement_id] = cancellation
+            if cancellation is None:
+                continue
+            candidates.append((movement_id, cancellation))
+            if cancellation.get("status") == "cancelled":
+                reversal_id = cancellation.get("reversal_movement_id")
+                if isinstance(reversal_id, str) and reversal_id:
+                    reversal_ids.add(reversal_id)
+
+        reversal_markers: dict[str, str] = {}
+        if reversal_ids:
+            # A terminal Comment is only a projection hint. The submitted reversal and
+            # its unique operation marker are the authoritative cancellation evidence.
+            reversal_rows: list[Mapping[str, Any]] = []
+            sorted_reversal_ids = sorted(reversal_ids)
+            for offset in range(0, len(sorted_reversal_ids), 100):
+                reversal_rows.extend(
+                    await self._query_resource_all(
+                        "Stock Entry",
+                        fields=["name", "docstatus", "myretail_stock_idempotency_key"],
+                        filters=[
+                            [
+                                "Stock Entry",
+                                "name",
+                                "in",
+                                sorted_reversal_ids[offset : offset + 100],
+                            ],
+                            ["Stock Entry", "docstatus", "=", 1],
+                        ],
+                    )
+                )
+            reversal_markers = {
+                reversal_id: marker
+                for row in reversal_rows
+                if isinstance((reversal_id := row.get("name")), str)
+                and reversal_id
+                and int(row.get("docstatus") or 0) == 1
+                and isinstance((marker := row.get("myretail_stock_idempotency_key")), str)
+                and marker
+            }
+
+        cancellations: dict[str, Mapping[str, Any]] = {}
+        for movement_id, cancellation in candidates:
+            terminal_is_invalid = (
+                cancellation.get("status") == "cancelled"
+                and not self._is_valid_terminal_cancellation(
+                    movement_id,
+                    cancellation,
+                    reversal_markers,
+                )
+            )
+            if terminal_is_invalid:
+                continue
+            cancellations[movement_id] = cancellation
         return cancellations
+
+    def _is_trusted_comment_owner(self, owner: Any) -> bool:
+        return (
+            isinstance(owner, str)
+            and bool(owner)
+            and owner.casefold() == self._api_user.casefold()
+        )
+
+    @staticmethod
+    def _is_valid_terminal_cancellation(
+        movement_id: str,
+        cancellation: Mapping[str, Any],
+        reversal_markers: Mapping[str, str],
+    ) -> bool:
+        reversal_id = cancellation.get("reversal_movement_id")
+        operation_marker = cancellation.get("operation_marker")
+        return (
+            isinstance(reversal_id, str)
+            and bool(reversal_id)
+            and reversal_id != movement_id
+            and isinstance(operation_marker, str)
+            and bool(operation_marker)
+            and reversal_markers.get(reversal_id) == operation_marker
+        )
 
     async def _get_item(self, item_code: str) -> Mapping[str, Any]:
         payload = await self._request_json(

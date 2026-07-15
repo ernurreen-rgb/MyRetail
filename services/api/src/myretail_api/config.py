@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     erpnext_selling_price_list: str = "Standard Selling"
     erpnext_buying_price_list: str = "Standard Buying"
     erpnext_company: str = "MyRetail Demo"
+    erpnext_api_user: str = "myretail-api@local.test"
     erpnext_pos_user: str = "myretail-api@local.test"
     erpnext_pos_user_map: dict[str, str] = Field(default_factory=dict)
     erpnext_pos_credentials_map: dict[str, str] = Field(default_factory=dict)
