@@ -109,10 +109,15 @@ ShiftStatus = Literal["open", "closed"]
 
 
 class Shift(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(
+        frozen=True,
+        serialize_by_alias=True,
+        validate_by_alias=True,
+        validate_by_name=False,
+    )
 
     id: str
-    register: ShiftRegisterRef
+    register_ref: ShiftRegisterRef = Field(alias="register")
     warehouse: WarehouseRef
     cashier: CashierRef
     status: ShiftStatus
@@ -124,6 +129,10 @@ class Shift(BaseModel):
     opened_at: datetime
     closed_at: datetime | None = None
     updated_at: datetime
+
+    @property
+    def register(self) -> ShiftRegisterRef:
+        return self.register_ref
 
 
 class ShiftOpenRequest(BaseModel):
@@ -229,13 +238,18 @@ class SaleLine(BaseModel):
 
 
 class Sale(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(
+        frozen=True,
+        serialize_by_alias=True,
+        validate_by_alias=True,
+        validate_by_name=False,
+    )
 
     id: str
     receipt_number: str
     status: Literal["completed"] = "completed"
     shift_id: str
-    register: ShiftRegisterRef
+    register_ref: ShiftRegisterRef = Field(alias="register")
     warehouse: WarehouseRef
     cashier: CashierRef
     currency: str = "KZT"
@@ -248,6 +262,10 @@ class Sale(BaseModel):
     created_at: datetime
     return_status: Literal["none", "partial", "full"] = "none"
     returned_total: str = "0.00"
+
+    @property
+    def register(self) -> ShiftRegisterRef:
+        return self.register_ref
 
 
 ReturnStatus = Literal["none", "partial", "full"]
