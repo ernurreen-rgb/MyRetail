@@ -788,14 +788,16 @@ class ERPNextClient:
         marker = self._pos_idempotency_marker(tenant, operation, user_email, idempotency_key)
         rows = await self._query_resource(
             "POS Opening Entry",
-            fields=["name"],
+            fields=["name", "docstatus", "status"],
             filters=[
                 ["POS Opening Entry", "myretail_tenant", "=", tenant],
                 ["POS Opening Entry", "myretail_open_idempotency_key", "=", marker],
+                ["POS Opening Entry", "docstatus", "=", 1],
+                ["POS Opening Entry", "status", "=", "Open"],
             ],
             limit=1,
         )
-        return str(rows[0]["name"]) if rows else None
+        return self._terminal_pos_document_name(rows, expected_status="Open")
 
     async def recover_pos_closing(
         self, tenant: str, operation: str, user_email: str, idempotency_key: str
@@ -803,14 +805,16 @@ class ERPNextClient:
         marker = self._pos_idempotency_marker(tenant, operation, user_email, idempotency_key)
         rows = await self._query_resource(
             "POS Closing Entry",
-            fields=["name"],
+            fields=["name", "docstatus", "status"],
             filters=[
                 ["POS Closing Entry", "myretail_tenant", "=", tenant],
                 ["POS Closing Entry", "myretail_close_idempotency_key", "=", marker],
+                ["POS Closing Entry", "docstatus", "=", 1],
+                ["POS Closing Entry", "status", "=", "Submitted"],
             ],
             limit=1,
         )
-        return str(rows[0]["name"]) if rows else None
+        return self._terminal_pos_document_name(rows, expected_status="Submitted")
 
     async def recover_pos_sale(
         self, tenant: str, operation: str, user_email: str, idempotency_key: str
@@ -818,14 +822,30 @@ class ERPNextClient:
         marker = self._pos_idempotency_marker(tenant, operation, user_email, idempotency_key)
         rows = await self._query_resource(
             "Sales Invoice",
-            fields=["name"],
+            fields=["name", "docstatus"],
             filters=[
                 ["Sales Invoice", "myretail_tenant", "=", tenant],
                 ["Sales Invoice", "myretail_sale_idempotency_key", "=", marker],
+                ["Sales Invoice", "docstatus", "=", 1],
             ],
             limit=1,
         )
-        return str(rows[0]["name"]) if rows else None
+        return self._terminal_pos_document_name(rows)
+
+    @staticmethod
+    def _terminal_pos_document_name(
+        rows: list[Mapping[str, Any]], *, expected_status: str | None = None
+    ) -> str | None:
+        for row in rows:
+            docstatus = row.get("docstatus")
+            if not isinstance(docstatus, int) or isinstance(docstatus, bool) or docstatus != 1:
+                continue
+            if expected_status is not None and row.get("status") != expected_status:
+                continue
+            name = row.get("name")
+            if isinstance(name, str) and name:
+                return name
+        return None
 
     async def list_product_options(self) -> ProductOptions:
         categories = await self._list_options("Item Group")
@@ -3236,16 +3256,19 @@ class ERPNextClient:
     async def _find_opening_name(self, tenant: str, shift_id: str) -> str:
         rows = await self._query_resource(
             "POS Opening Entry",
-            fields=["name"],
+            fields=["name", "docstatus", "status"],
             filters=[
                 ["POS Opening Entry", "myretail_tenant", "=", tenant],
                 ["POS Opening Entry", "myretail_shift_id", "=", shift_id],
+                ["POS Opening Entry", "docstatus", "=", 1],
+                ["POS Opening Entry", "status", "=", "Open"],
             ],
             limit=1,
         )
-        if not rows:
+        opening_name = self._terminal_pos_document_name(rows, expected_status="Open")
+        if opening_name is None:
             raise ERPNextConflictError("SHIFT_NOT_FOUND", "Смена не найдена")
-        return str(rows[0]["name"])
+        return opening_name
 
     def _pos_user_for_register(self, register_id: str) -> str:
         return self._pos_user_map.get(register_id, self._pos_user)

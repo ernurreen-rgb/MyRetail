@@ -702,6 +702,7 @@ class POSService:
             raise POSApiError(409, "SHIFT_NOT_OPEN", "Смена не найдена")
         shift = self._to_shift(shift_row)
         if not ADMIN_ROLES.intersection(context.user.roles):
+            self._require_register_assignment(context, sale.register, shift.warehouse)
             if shift.cashier.email != context.user.email:
                 raise POSApiError(403, "POS_FORBIDDEN", "Продажа недоступна для этого кассира")
             if shift.status != "open":
