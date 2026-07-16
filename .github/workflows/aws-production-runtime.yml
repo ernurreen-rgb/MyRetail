@@ -82,13 +82,15 @@ jobs:
             -backend-config="encrypt=true" \
             -backend-config="kms_key_id=${TF_STATE_KMS_KEY_ARN}" \
             -backend-config="use_lockfile=true"
-          echo "cluster=$(terraform -chdir=infra/aws/production output -raw ecs_cluster_name)" >> "${GITHUB_OUTPUT}"
-          echo "security_group=$(terraform -chdir=infra/aws/production output -raw api_security_group_id)" >> "${GITHUB_OUTPUT}"
-          echo "database_endpoint=$(terraform -chdir=infra/aws/production output -raw database_endpoint)" >> "${GITHUB_OUTPUT}"
-          echo "database_bootstrap_task=$(terraform -chdir=infra/aws/production output -raw database_bootstrap_task_definition_arn)" >> "${GITHUB_OUTPUT}"
-          echo "migration_task=$(terraform -chdir=infra/aws/production output -raw migration_task_definition_arn)" >> "${GITHUB_OUTPUT}"
-          echo "preflight_task=$(terraform -chdir=infra/aws/production output -raw preflight_task_definition_arn)" >> "${GITHUB_OUTPUT}"
-          echo "monitor_task=$(terraform -chdir=infra/aws/production output -raw monitor_task_definition_arn)" >> "${GITHUB_OUTPUT}"
+          {
+            echo "cluster=$(terraform -chdir=infra/aws/production output -raw ecs_cluster_name)"
+            echo "security_group=$(terraform -chdir=infra/aws/production output -raw api_security_group_id)"
+            echo "database_endpoint=$(terraform -chdir=infra/aws/production output -raw database_endpoint)"
+            echo "database_bootstrap_task=$(terraform -chdir=infra/aws/production output -raw database_bootstrap_task_definition_arn)"
+            echo "migration_task=$(terraform -chdir=infra/aws/production output -raw migration_task_definition_arn)"
+            echo "preflight_task=$(terraform -chdir=infra/aws/production output -raw preflight_task_definition_arn)"
+            echo "monitor_task=$(terraform -chdir=infra/aws/production output -raw monitor_task_definition_arn)"
+          } >> "${GITHUB_OUTPUT}"
           terraform -chdir=infra/aws/production output -json app_subnet_ids \
             | jq --compact-output . > "${RUNNER_TEMP}/app-subnets.json"
           terraform -chdir=infra/aws/production output -json runtime_secret_arns \
@@ -260,7 +262,7 @@ jobs:
               echo "- \`${label}\`: \`${task_arn}\`"
             done < "${RUNNER_TEMP}/verified-tasks.tsv"
             echo
-            echo 'Next gate: set `MONITORING_ENABLED=true`, apply the Terraform plan, then collect alert, restore and smoke evidence.'
+            echo "Next gate: set \`MONITORING_ENABLED=true\`, apply the Terraform plan, then collect alert, restore and smoke evidence."
           } >> "${GITHUB_STEP_SUMMARY}"
       - name: Remove ephemeral files
         if: always()

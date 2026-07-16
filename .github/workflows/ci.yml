@@ -293,7 +293,7 @@ jobs:
             --env MYRETAIL_WEB_ORIGIN=https://myretail.example.com \
             "${image}"
           port="$(docker port "${container}" 3000/tcp | awk -F: '{print $NF}')"
-          for attempt in $(seq 1 30); do
+          for ((attempt = 1; attempt <= 30; attempt++)); do
             if curl --fail --silent --show-error "http://127.0.0.1:${port}/api/health"; then
               exit 0
             fi

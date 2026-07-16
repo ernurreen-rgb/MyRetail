@@ -95,10 +95,10 @@ jobs:
           output="${RUNNER_TEMP}/production-images.json"
           jq --null-input \
             --arg commit_sha "${GITHUB_SHA}" \
-            --arg api "${REGISTRY}/myretail-production/api@$(aws ecr describe-images --repository-name myretail-production/api --image-ids imageTag=${GITHUB_SHA} --query 'imageDetails[0].imageDigest' --output text)" \
-            --arg migration "${REGISTRY}/myretail-production/migration@$(aws ecr describe-images --repository-name myretail-production/migration --image-ids imageTag=${GITHUB_SHA} --query 'imageDetails[0].imageDigest' --output text)" \
-            --arg database_bootstrap "${REGISTRY}/myretail-production/database-bootstrap@$(aws ecr describe-images --repository-name myretail-production/database-bootstrap --image-ids imageTag=${GITHUB_SHA} --query 'imageDetails[0].imageDigest' --output text)" \
-            --arg web "${REGISTRY}/myretail-production/web@$(aws ecr describe-images --repository-name myretail-production/web --image-ids imageTag=${GITHUB_SHA} --query 'imageDetails[0].imageDigest' --output text)" \
+            --arg api "${REGISTRY}/myretail-production/api@$(aws ecr describe-images --repository-name myretail-production/api --image-ids "imageTag=${GITHUB_SHA}" --query 'imageDetails[0].imageDigest' --output text)" \
+            --arg migration "${REGISTRY}/myretail-production/migration@$(aws ecr describe-images --repository-name myretail-production/migration --image-ids "imageTag=${GITHUB_SHA}" --query 'imageDetails[0].imageDigest' --output text)" \
+            --arg database_bootstrap "${REGISTRY}/myretail-production/database-bootstrap@$(aws ecr describe-images --repository-name myretail-production/database-bootstrap --image-ids "imageTag=${GITHUB_SHA}" --query 'imageDetails[0].imageDigest' --output text)" \
+            --arg web "${REGISTRY}/myretail-production/web@$(aws ecr describe-images --repository-name myretail-production/web --image-ids "imageTag=${GITHUB_SHA}" --query 'imageDetails[0].imageDigest' --output text)" \
             '{
               commit_sha: $commit_sha,
               images: {
