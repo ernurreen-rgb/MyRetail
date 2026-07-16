@@ -160,6 +160,21 @@ class SQLitePOSRepository:
             erpnext_invoice_id,
         )
 
+    async def materialize_return_intent(
+        self,
+        tenant: str,
+        intent_id: str,
+        fencing_token: int,
+        erpnext_invoice_id: str,
+    ) -> dict[str, Any]:
+        return await self._run_tenant_intent(
+            tenant,
+            intent_id,
+            self._store.materialize_return_intent,
+            fencing_token,
+            erpnext_invoice_id,
+        )
+
     async def append_cash_event(
         self,
         *,
@@ -1071,6 +1086,318 @@ class PostgresPOSRepository:
             )
         return _legacy_sale(projected)
 
+    async def materialize_return_intent(
+        self,
+        tenant: str,
+        intent_id: str,
+        fencing_token: int,
+        erpnext_invoice_id: str,
+    ) -> dict[str, Any]:
+        async with self._engine.begin() as connection:
+            await _set_tenant(connection, tenant)
+            intent = await _owned_intent(
+                connection,
+                tenant=tenant,
+                intent_id=intent_id,
+                owner_id=self._owner_id,
+                fencing_token=fencing_token,
+                operation="create_return",
+            )
+            payload = _object(intent["payload"])
+            return_row = _object(payload.get("return"))
+            if str(return_row.get("tenant")) != tenant:
+                raise POSStoreConflictError(
+                    "IDEMPOTENCY_CONFLICT",
+                    "Operation tenant does not match projection tenant",
+                )
+            sale_id = str(return_row["sale_id"])
+            shift_id = str(return_row["shift_id"])
+            sale = await _locked_row(
+                connection,
+                """
+                SELECT * FROM myretail_state.pos_sales
+                WHERE tenant_id = :tenant AND sale_id = :row_id
+                FOR UPDATE
+                """,
+                tenant=tenant,
+                row_id=sale_id,
+            )
+            if sale is None:
+                raise POSStoreConflictError("SALE_NOT_FOUND", "Sale not found")
+            shift = await _locked_row(
+                connection,
+                """
+                SELECT * FROM myretail_state.pos_shifts
+                WHERE tenant_id = :tenant AND shift_id = :row_id
+                FOR UPDATE
+                """,
+                tenant=tenant,
+                row_id=shift_id,
+            )
+            if shift is None:
+                raise POSStoreConflictError("SHIFT_NOT_FOUND", "Shift not found")
+            if shift["status"] != "open":
+                raise POSStoreConflictError("SHIFT_CLOSED", "Shift is closed")
+            stored_lines = _array(return_row["lines_json"])
+            existing = (
+                (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT * FROM myretail_state.pos_returns
+                            WHERE tenant_id = :tenant
+                              AND erpnext_return_invoice_id = :erpnext_invoice_id
+                            FOR UPDATE
+                            """
+                        ),
+                        {"tenant": tenant, "erpnext_invoice_id": erpnext_invoice_id},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if existing is None:
+                submitted = (
+                    (
+                        await connection.execute(
+                            text(
+                                """
+                                SELECT lines FROM myretail_state.pos_returns
+                                WHERE tenant_id = :tenant AND sale_id = :sale_id
+                                  AND state = 'submitted'
+                                FOR UPDATE
+                                """
+                            ),
+                            {"tenant": tenant, "sale_id": sale_id},
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                snapshot = _validated_return_snapshot(
+                    sale_id=sale_id,
+                    sale_lines=_array(sale["lines"]),
+                    submitted_lines=submitted,
+                    stored_lines=stored_lines,
+                )
+                refund_total = _money(
+                    sum(
+                        (Decimal(line["line_total"]) for line in snapshot),
+                        Decimal("0.00"),
+                    )
+                )
+                if snapshot != stored_lines or refund_total != _money(
+                    return_row["refund_total"]
+                ):
+                    raise POSStoreConflictError(
+                        "IDEMPOTENCY_CONFLICT",
+                        "Stored return snapshot no longer matches the sale",
+                    )
+                try:
+                    await connection.execute(
+                        text(
+                            """
+                            INSERT INTO myretail_state.pos_returns (
+                                tenant_id, return_id, sale_id, receipt_number,
+                                return_receipt_number, state, refund_method, reason,
+                                comment, register_id, shift_id, cashier_email, currency,
+                                refund_total, lines, erpnext_return_invoice_id,
+                                idempotency_key, created_by_email, created_at,
+                                cancelled_by, cancelled_at, cancel_reason, cancel_comment,
+                                updated_at
+                            ) VALUES (
+                                :tenant, :return_id, :sale_id, :receipt_number,
+                                :erpnext_invoice_id, 'submitted', :refund_method, :reason,
+                                :comment, :register_id, :shift_id, :cashier_email, :currency,
+                                :refund_total, CAST(:lines AS jsonb), :erpnext_invoice_id,
+                                :idempotency_key, :created_by_email,
+                                CAST(:created_at AS timestamptz), NULL, NULL, NULL, NULL,
+                                CAST(:updated_at AS timestamptz)
+                            )
+                            """
+                        ),
+                        {
+                            **return_row,
+                            "tenant": tenant,
+                            "return_id": str(return_row["id"]),
+                            "lines": _json(snapshot),
+                            "erpnext_invoice_id": erpnext_invoice_id,
+                            "created_at": _datetime(return_row["created_at"]),
+                            "updated_at": _datetime(return_row["updated_at"]),
+                        },
+                    )
+                except IntegrityError as exc:
+                    raise POSStoreConflictError(
+                        "IDEMPOTENCY_CONFLICT", "Return is already materialized"
+                    ) from exc
+                result_id = str(return_row["id"])
+            else:
+                result_id = str(existing["return_id"])
+                if not (
+                    result_id == str(return_row["id"])
+                    and str(existing["sale_id"]) == sale_id
+                    and str(existing["shift_id"]) == shift_id
+                    and _money(existing["refund_total"])
+                    == _money(return_row["refund_total"])
+                    and _array(existing["lines"]) == stored_lines
+                ):
+                    raise POSStoreConflictError(
+                        "IDEMPOTENCY_CONFLICT",
+                        "ERPNext return invoice is bound to another projection",
+                    )
+
+            cash_event = _object(payload.get("cash_event"))
+            event_id = UUID(str(cash_event["event_id"]))
+            event_created_at = _datetime(cash_event["created_at"])
+            amount_delta = _cash_event_amount(
+                source_type="return",
+                effect_kind="return",
+                amount_delta=f"-{return_row['refund_total']}",
+            )
+            inserted_event = (
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO myretail_state.pos_shift_cash_events (
+                            tenant_id, event_id, shift_id, source_type, source_id,
+                            effect_kind, amount_delta, created_at
+                        ) VALUES (
+                            :tenant, CAST(:event_id AS uuid), :shift_id, 'return',
+                            :source_id, 'return', :amount_delta,
+                            CAST(:created_at AS timestamptz)
+                        )
+                        ON CONFLICT DO NOTHING
+                        RETURNING *
+                        """
+                    ),
+                    {
+                        "tenant": tenant,
+                        "event_id": str(event_id),
+                        "shift_id": shift_id,
+                        "source_id": result_id,
+                        "amount_delta": amount_delta,
+                        "created_at": event_created_at,
+                    },
+                )
+            ).mappings().one_or_none()
+            persisted_event = inserted_event or (
+                (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT * FROM myretail_state.pos_shift_cash_events
+                            WHERE tenant_id = :tenant AND source_type = 'return'
+                              AND source_id = :source_id AND effect_kind = 'return'
+                            """
+                        ),
+                        {"tenant": tenant, "source_id": result_id},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            expected_event = POSCashEvent(
+                event_id=event_id,
+                tenant_id=tenant,
+                shift_id=shift_id,
+                source_type="return",
+                source_id=result_id,
+                effect_kind="return",
+                amount_delta=amount_delta,
+                created_at=event_created_at,
+            )
+            if persisted_event is None or _cash_event(persisted_event) != expected_event:
+                raise POSStoreConflictError(
+                    "IDEMPOTENCY_CONFLICT",
+                    "Cash event identity is already bound to another effect",
+                )
+            cash_returns_total = (
+                await connection.execute(
+                    text(
+                        """
+                        SELECT COALESCE(-SUM(amount_delta), 0)
+                        FROM myretail_state.pos_shift_cash_events
+                        WHERE tenant_id = :tenant AND shift_id = :shift_id
+                          AND source_type = 'return'
+                        """
+                    ),
+                    {"tenant": tenant, "shift_id": shift_id},
+                )
+            ).scalar_one()
+            if Decimal(str(cash_returns_total)) < 0:
+                raise POSStoreConflictError(
+                    "IDEMPOTENCY_CONFLICT", "Cash return ledger total is invalid"
+                )
+            expected_cash = (
+                Decimal(str(shift["opening_cash"]))
+                + Decimal(str(shift["sales_total"]))
+                - Decimal(str(cash_returns_total))
+            )
+            updated = await connection.execute(
+                text(
+                    """
+                    UPDATE myretail_state.pos_shifts
+                    SET cash_returns_total = :cash_returns_total,
+                        expected_cash = :expected_cash,
+                        updated_at = CAST(:updated_at AS timestamptz)
+                    WHERE tenant_id = :tenant AND shift_id = :shift_id
+                      AND status = 'open'
+                    """
+                ),
+                {
+                    "tenant": tenant,
+                    "shift_id": shift_id,
+                    "cash_returns_total": cash_returns_total,
+                    "expected_cash": expected_cash,
+                    "updated_at": _datetime(return_row["created_at"]),
+                },
+            )
+            if updated.rowcount != 1:
+                raise POSStoreConflictError("SHIFT_CHANGED", "Shift changed")
+            completed = await connection.execute(
+                text(
+                    """
+                    UPDATE myretail_state.workflow_intents
+                    SET state = 'completed', erp_doc_type = 'Sales Invoice',
+                        erp_document_id = :erp_document_id, result_id = :result_id,
+                        lease_owner = NULL, lease_until = NULL,
+                        completed_at = clock_timestamp(), updated_at = clock_timestamp()
+                    WHERE tenant_id = :tenant
+                      AND intent_id = CAST(:intent_id AS uuid)
+                      AND lease_owner = CAST(:owner_id AS uuid)
+                      AND fencing_token = :fencing_token
+                      AND state IN ('reserved', 'erp_pending', 'recovery_required')
+                    """
+                ),
+                {
+                    "tenant": tenant,
+                    "intent_id": intent_id,
+                    "owner_id": str(self._owner_id),
+                    "fencing_token": fencing_token,
+                    "erp_document_id": erpnext_invoice_id,
+                    "result_id": result_id,
+                },
+            )
+            if completed.rowcount != 1:
+                raise POSStoreConflictError(
+                    "IDEMPOTENCY_CONFLICT",
+                    "Operation lease no longer belongs to this request",
+                )
+            projected = await _locked_row(
+                connection,
+                """
+                SELECT * FROM myretail_state.pos_returns
+                WHERE tenant_id = :tenant AND return_id = :row_id
+                """,
+                tenant=tenant,
+                row_id=result_id,
+            )
+            if projected is None:
+                raise POSStoreConflictError(
+                    "IDEMPOTENCY_CONFLICT", "Return projection is missing"
+                )
+        return _legacy_return(projected)
+
     async def append_cash_event(
         self,
         *,
@@ -1494,6 +1821,190 @@ class PostgresPOSRepository:
                 "ERPNext return invoice is already materialized",
             ) from exc
         return await self.get_return(tenant, return_id) or {}
+
+    async def materialize_legacy_return(
+        self,
+        tenant: str,
+        return_id: str,
+        erpnext_invoice_id: str,
+        cash_event_id: str,
+    ) -> dict[str, Any]:
+        async with self._engine.begin() as connection:
+            await _set_tenant(connection, tenant)
+            row = await _locked_row(
+                connection,
+                """
+                SELECT * FROM myretail_state.pos_returns
+                WHERE tenant_id = :tenant AND return_id = :row_id
+                FOR UPDATE
+                """,
+                tenant=tenant,
+                row_id=return_id,
+            )
+            if row is None:
+                raise POSStoreConflictError("RETURN_NOT_FOUND", "Return not found")
+            if row["state"] == "pending_recovery":
+                await connection.execute(
+                    text(
+                        """
+                        UPDATE myretail_state.pos_returns
+                        SET state = 'submitted',
+                            erpnext_return_invoice_id = :erpnext_invoice_id,
+                            return_receipt_number = :erpnext_invoice_id,
+                            updated_at = clock_timestamp()
+                        WHERE tenant_id = :tenant AND return_id = :return_id
+                          AND state = 'pending_recovery'
+                        """
+                    ),
+                    {
+                        "tenant": tenant,
+                        "return_id": return_id,
+                        "erpnext_invoice_id": erpnext_invoice_id,
+                    },
+                )
+            elif not (
+                row["state"] == "submitted"
+                and str(row["erpnext_return_invoice_id"]) == erpnext_invoice_id
+            ):
+                raise POSStoreConflictError(
+                    "IDEMPOTENCY_CONFLICT",
+                    "Legacy return is bound to another ERPNext result",
+                )
+            shift_id = str(row["shift_id"])
+            shift = await _locked_row(
+                connection,
+                """
+                SELECT * FROM myretail_state.pos_shifts
+                WHERE tenant_id = :tenant AND shift_id = :row_id
+                FOR UPDATE
+                """,
+                tenant=tenant,
+                row_id=shift_id,
+            )
+            if shift is None:
+                raise POSStoreConflictError("SHIFT_NOT_FOUND", "Shift not found")
+            if shift["status"] != "open":
+                raise POSStoreConflictError(
+                    "POS_OPENING_OUTDATED",
+                    "POS Opening Entry is outdated for cash refund",
+                )
+            event_id = UUID(cash_event_id)
+            event_created_at = _datetime(row["created_at"])
+            amount_delta = _cash_event_amount(
+                source_type="return",
+                effect_kind="return",
+                amount_delta=f"-{row['refund_total']}",
+            )
+            inserted = (
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO myretail_state.pos_shift_cash_events (
+                            tenant_id, event_id, shift_id, source_type, source_id,
+                            effect_kind, amount_delta, created_at
+                        ) VALUES (
+                            :tenant, CAST(:event_id AS uuid), :shift_id, 'return',
+                            :source_id, 'return', :amount_delta,
+                            CAST(:created_at AS timestamptz)
+                        )
+                        ON CONFLICT DO NOTHING
+                        RETURNING *
+                        """
+                    ),
+                    {
+                        "tenant": tenant,
+                        "event_id": str(event_id),
+                        "shift_id": shift_id,
+                        "source_id": return_id,
+                        "amount_delta": amount_delta,
+                        "created_at": event_created_at,
+                    },
+                )
+            ).mappings().one_or_none()
+            persisted = inserted or (
+                (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT * FROM myretail_state.pos_shift_cash_events
+                            WHERE tenant_id = :tenant AND source_type = 'return'
+                              AND source_id = :source_id AND effect_kind = 'return'
+                            """
+                        ),
+                        {"tenant": tenant, "source_id": return_id},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            expected_event = POSCashEvent(
+                event_id=event_id,
+                tenant_id=tenant,
+                shift_id=shift_id,
+                source_type="return",
+                source_id=return_id,
+                effect_kind="return",
+                amount_delta=amount_delta,
+                created_at=event_created_at,
+            )
+            if persisted is None or _cash_event(persisted) != expected_event:
+                raise POSStoreConflictError(
+                    "IDEMPOTENCY_CONFLICT",
+                    "Cash event identity is already bound to another effect",
+                )
+            cash_returns_total = (
+                await connection.execute(
+                    text(
+                        """
+                        SELECT COALESCE(-SUM(amount_delta), 0)
+                        FROM myretail_state.pos_shift_cash_events
+                        WHERE tenant_id = :tenant AND shift_id = :shift_id
+                          AND source_type = 'return'
+                        """
+                    ),
+                    {"tenant": tenant, "shift_id": shift_id},
+                )
+            ).scalar_one()
+            expected_cash = (
+                Decimal(str(shift["opening_cash"]))
+                + Decimal(str(shift["sales_total"]))
+                - Decimal(str(cash_returns_total))
+            )
+            updated = await connection.execute(
+                text(
+                    """
+                    UPDATE myretail_state.pos_shifts
+                    SET cash_returns_total = :cash_returns_total,
+                        expected_cash = :expected_cash,
+                        updated_at = CAST(:updated_at AS timestamptz)
+                    WHERE tenant_id = :tenant AND shift_id = :shift_id
+                      AND status = 'open'
+                    """
+                ),
+                {
+                    "tenant": tenant,
+                    "shift_id": shift_id,
+                    "cash_returns_total": cash_returns_total,
+                    "expected_cash": expected_cash,
+                    "updated_at": event_created_at,
+                },
+            )
+            if updated.rowcount != 1:
+                raise POSStoreConflictError("SHIFT_CHANGED", "Shift changed")
+            projected = await _locked_row(
+                connection,
+                """
+                SELECT * FROM myretail_state.pos_returns
+                WHERE tenant_id = :tenant AND return_id = :row_id
+                """,
+                tenant=tenant,
+                row_id=return_id,
+            )
+            if projected is None:
+                raise POSStoreConflictError(
+                    "IDEMPOTENCY_CONFLICT", "Return projection is missing"
+                )
+        return _legacy_return(projected)
 
     async def mark_return_cancelled(
         self,
@@ -2079,6 +2590,72 @@ def _cash_event_amount(
 
 def _quantity(value: Decimal) -> str:
     return f"{value.quantize(Decimal('0.001')):.3f}"
+
+
+async def _locked_row(
+    connection: AsyncConnection,
+    statement: str,
+    *,
+    tenant: str,
+    row_id: str,
+) -> Mapping[str, Any] | None:
+    return (
+        (
+            await connection.execute(
+                text(statement),
+                {"tenant": tenant, "row_id": row_id},
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+
+
+def _validated_return_snapshot(
+    *,
+    sale_id: str,
+    sale_lines: list[dict[str, Any]],
+    submitted_lines: Any,
+    stored_lines: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    returned_by_line = _returned_quantities(submitted_lines)
+    snapshot: list[dict[str, str]] = []
+    for requested in stored_lines:
+        line_id = str(requested["line_id"])
+        index = _sale_line_index(sale_id, line_id)
+        if index is None or index >= len(sale_lines):
+            raise POSStoreConflictError(
+                "RETURN_LINE_NOT_FOUND",
+                "Sale line not found",
+                {"line_id": line_id},
+            )
+        source = sale_lines[index]
+        requested_quantity = Decimal(str(requested["quantity"]))
+        available = Decimal(str(source["quantity"])) - returned_by_line.get(
+            line_id, Decimal("0")
+        )
+        if requested_quantity > available:
+            raise POSStoreConflictError(
+                "RETURN_QUANTITY_EXCEEDED",
+                "Return quantity exceeds available quantity",
+                {
+                    "line_id": line_id,
+                    "available_to_return_quantity": _quantity(available),
+                },
+            )
+        net_unit_price = _net_unit_price(source)
+        snapshot.append(
+            {
+                "line_id": line_id,
+                "item_id": str(source["product_id"]),
+                "item_name": str(source["name"]),
+                "quantity": _quantity(requested_quantity),
+                "unit": str(source["unit"]),
+                "unit_price": _money(net_unit_price),
+                "line_total": _money(requested_quantity * net_unit_price),
+            }
+        )
+    return snapshot
 
 
 def _object(value: object) -> dict[str, Any]:

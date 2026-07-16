@@ -30,7 +30,7 @@ Startup и PostgreSQL acceptance обязаны доказать:
 
 ### Schema, RLS и pre-auth exception
 
-- Alembic revision точно равна package constant `20260716_03`;
+- Alembic revision точно равна package constant `20260716_04`;
 - table inventory точно равен утверждённым tenant + pre-auth tables;
 - любая extra table блокирует startup до review и новой versioned migration;
 - каждая tenant table имеет ровно одну ожидаемую permissive policy для `myretail_api`,
@@ -47,7 +47,7 @@ Startup и PostgreSQL acceptance обязаны доказать:
 В disposable database CI выполняет:
 
 1. clean `upgrade head`;
-2. `current == 20260716_03 (head)`;
+2. `current == 20260716_04 (head)`;
 3. `downgrade base`;
 4. отсутствие active revision;
 5. повторный `upgrade head` и сверку current;

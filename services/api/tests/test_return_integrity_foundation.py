@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -149,6 +150,77 @@ async def test_sqlite_cash_event_is_append_only_and_exact_once(tmp_path: Path) -
         shift_id=shift_id,
         created_at=created_at,
     )
+
+
+def test_sqlite_legacy_return_cash_events_are_backfilled_exactly_once(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "return-backfill.sqlite3"
+    store = POSStore(database_path)
+    tenant_id = f"return-backfill-{uuid4()}"
+    shift_id = f"SHIFT-{uuid4()}"
+    return_id = f"RETURN-{uuid4()}"
+    created_at = datetime.now(UTC).replace(microsecond=0)
+    timestamp = created_at.isoformat().replace("+00:00", "Z")
+    store.create_shift(shift_row(tenant_id, shift_id, created_at))
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO pos_returns (
+                id, tenant, sale_id, receipt_number, return_receipt_number,
+                state, refund_method, reason, comment, register_id, shift_id,
+                cashier_email, currency, refund_total, lines_json,
+                erpnext_return_invoice_id, idempotency_key, created_by_email,
+                created_at, cancelled_by, cancelled_at, cancel_reason,
+                cancel_comment, updated_at
+            ) VALUES (
+                ?, ?, 'SALE-LEGACY', 'SINV-LEGACY', 'RET-LEGACY', 'submitted',
+                'cash', 'other', NULL, 'POS-1', ?, 'cashier@example.test',
+                'KZT', '100.00', '[]', 'RET-LEGACY', ?,
+                'cashier@example.test', ?, NULL, NULL, NULL, NULL, ?
+            )
+            """,
+            (return_id, tenant_id, shift_id, str(uuid4()), timestamp, timestamp),
+        )
+        connection.commit()
+
+    POSStore(database_path)
+    with sqlite3.connect(database_path) as connection:
+        first_events = connection.execute(
+            "SELECT effect_kind, amount_delta FROM pos_shift_cash_events "
+            "WHERE tenant = ? AND source_id = ? ORDER BY effect_kind",
+            (tenant_id, return_id),
+        ).fetchall()
+        first_totals = connection.execute(
+            "SELECT cash_returns_total, expected_cash FROM pos_shifts WHERE id = ?",
+            (shift_id,),
+        ).fetchone()
+        connection.execute(
+            """
+            UPDATE pos_returns
+            SET state = 'cancelled', cancelled_at = ?, updated_at = ?
+            WHERE tenant = ? AND id = ?
+            """,
+            (timestamp, timestamp, tenant_id, return_id),
+        )
+        connection.commit()
+    assert first_events == [("return", "-100.00")]
+    assert first_totals == ("100.00", "9900.00")
+
+    POSStore(database_path)
+    POSStore(database_path)
+    with sqlite3.connect(database_path) as connection:
+        final_events = connection.execute(
+            "SELECT effect_kind, amount_delta FROM pos_shift_cash_events "
+            "WHERE tenant = ? AND source_id = ? ORDER BY effect_kind",
+            (tenant_id, return_id),
+        ).fetchall()
+        final_totals = connection.execute(
+            "SELECT cash_returns_total, expected_cash FROM pos_shifts WHERE id = ?",
+            (shift_id,),
+        ).fetchone()
+    assert final_events == [("return", "-100.00"), ("return_cancel", "100.00")]
+    assert final_totals == ("0.00", "10000.00")
 
 
 @pytest.mark.anyio

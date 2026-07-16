@@ -80,7 +80,7 @@ CI использует disposable PostgreSQL container с host `trust` толь
 
 ## Phase 6A.6 acceptance
 
-Текущий package-owned head — `20260716_03`. Startup дополнительно проверяет отсутствие
+Текущий package-owned head — `20260716_04`. Startup дополнительно проверяет отсутствие
 role memberships у `myretail_api`, точный owner schema/tables, точный table inventory и
 отсутствие elevated table grants. Immutable `workflow_intent_aliases` и
 `pos_shift_cash_events` имеют только `SELECT/INSERT`; остальные tenant tables сохраняют

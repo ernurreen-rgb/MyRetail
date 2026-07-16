@@ -56,7 +56,8 @@ transaction требуется для cancel в Phase 7C.
 Обязательные проверки Phase 7A:
 
 - migration `upgrade head → downgrade base → upgrade head`;
-- packaged head и startup preflight равны `20260716_03`;
+- foundation создан в `20260716_03`; текущий packaged head и startup preflight равны
+  `20260716_04` после Phase 7B cash-ledger backfill;
 - точный table inventory, RLS и least-privilege grants;
 - alias attach/find/replay/conflict на SQLite и PostgreSQL;
 - конкурентный append одного cash event через два независимых repository/pool:
