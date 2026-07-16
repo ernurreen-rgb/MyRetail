@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from pathlib import Path
 from uuid import uuid4
@@ -8,6 +9,7 @@ from uuid import uuid4
 import httpx
 import pytest
 from pydantic import SecretStr
+from sqlalchemy import text
 
 from myretail_api.config import Settings
 from myretail_api.dependencies import get_erpnext_client
@@ -52,6 +54,7 @@ class ProjectionERPNextStub:
         self.returns: list[str] = []
         self.cancelled_returns: set[str] = set()
         self._sale_lock = asyncio.Lock()
+        self._return_lock = asyncio.Lock()
 
     async def list_pos_registers(self, tenant: str) -> list[Register]:
         _ = tenant
@@ -101,9 +104,11 @@ class ProjectionERPNextStub:
 
     async def create_pos_sales_return(self, **kwargs: object) -> str:
         _ = kwargs
-        invoice = f"RET-{len(self.returns) + 1}"
-        self.returns.append(invoice)
-        return invoice
+        async with self._return_lock:
+            await asyncio.sleep(0.05)
+            invoice = f"RET-{len(self.returns) + 1}"
+            self.returns.append(invoice)
+            return invoice
 
     async def recover_pos_return(self, *args: object) -> None:
         _ = args
@@ -318,7 +323,6 @@ async def test_postgresql_request_path_is_shared_and_exact_once_across_two_pools
             assert filtered_sales.json()["count"] == 1
             assert filtered_sales.json()["items"][0]["receipt_number"] == "SINV-2"
 
-            return_key = str(uuid4())
             return_body = {
                 "sale_id": first_sale.json()["id"],
                 "register_id": "POS-1",
@@ -332,20 +336,30 @@ async def test_postgresql_request_path_is_shared_and_exact_once_across_two_pools
                     }
                 ],
             }
-            returned = await first.post(
-                "/pos/returns",
-                headers=headers(settings, key=return_key),
-                json=return_body,
-            )
-            return_replay = await second.post(
-                "/pos/returns",
-                headers=headers(settings, key=return_key),
-                json=return_body,
+            returned, return_replay = await asyncio.gather(
+                first.post(
+                    "/pos/returns",
+                    headers=headers(settings, key=str(uuid4())),
+                    json=return_body,
+                ),
+                second.post(
+                    "/pos/returns",
+                    headers=headers(settings, key=str(uuid4())),
+                    json=return_body,
+                ),
             )
             assert returned.status_code == 201, returned.text
             assert return_replay.status_code == 201, return_replay.text
             assert return_replay.json()["return_id"] == returned.json()["return_id"]
             assert erpnext.returns == ["RET-1"]
+            after_return = await second.get(
+                "/pos/shifts/current",
+                params={"register_id": "POS-1"},
+                headers=headers(settings),
+            )
+            assert after_return.status_code == 200, after_return.text
+            assert after_return.json()["sales_total"] == "200.00"
+            assert after_return.json()["expected_cash"] == "10100.00"
 
             cancel_key = str(uuid4())
             cancelled = await second.post(
@@ -589,5 +603,146 @@ async def test_postgresql_sale_projection_recovers_after_runtime_recreation(
         )
         assert count == 1
         assert [row["id"] for row in rows] == [sale_id]
+
+        async with second_runtime.engine.begin() as connection:
+            await connection.execute(
+                text("SELECT set_config('myretail.tenant_id', :tenant, true)"),
+                {"tenant": tenant},
+            )
+            await connection.execute(
+                text(
+                    """
+                    UPDATE myretail_state.workflow_intents
+                    SET state = 'completed', lease_owner = NULL, lease_until = NULL,
+                        completed_at = clock_timestamp(), updated_at = clock_timestamp()
+                    WHERE tenant_id = :tenant
+                      AND intent_id = CAST(:intent_id AS uuid)
+                      AND state = 'materialized'
+                    """
+                ),
+                {"tenant": tenant, "intent_id": str(recovered.intent["id"])},
+            )
+
+        return_id = f"RETURN-{uuid4()}"
+        return_key = str(uuid4())
+        created_at = "2026-07-16T12:02:00Z"
+        return_intent = await second.begin_operation_intent(
+            tenant=tenant,
+            operation="create_return",
+            scope_id=f"shift:{shift_id}",
+            user_email="cashier@example.test",
+            business_hash=f"return-{uuid4()}",
+            payload={
+                "return": {
+                    "id": return_id,
+                    "tenant": tenant,
+                    "sale_id": sale_id,
+                    "receipt_number": "SINV-RECOVERED",
+                    "return_receipt_number": "",
+                    "state": "submitted",
+                    "refund_method": "cash",
+                    "reason": "customer_request",
+                    "comment": None,
+                    "register_id": "POS-1",
+                    "shift_id": shift_id,
+                    "cashier_email": "cashier@example.test",
+                    "currency": "KZT",
+                    "refund_total": "100.00",
+                    "lines_json": json.dumps(
+                        [
+                            {
+                                "line_id": f"{sale_id}:line:1",
+                                "item_id": "SKU-1",
+                                "item_name": "Milk",
+                                "quantity": "1.000",
+                                "unit": "Nos",
+                                "unit_price": "100.00",
+                                "line_total": "100.00",
+                            }
+                        ]
+                    ),
+                    "erpnext_return_invoice_id": "",
+                    "idempotency_key": return_key,
+                    "created_by_email": "cashier@example.test",
+                    "created_at": created_at,
+                    "updated_at": created_at,
+                },
+                "cash_event": {
+                    "event_id": str(uuid4()),
+                    "created_at": created_at,
+                },
+            },
+            expected_shift_updated_at="2026-07-16T12:01:00Z",
+        )
+        stale_token = int(return_intent.intent["fencing_token"])
+        assert await second.mark_operation_erp_pending(
+            tenant, str(return_intent.intent["id"]), stale_token
+        )
+        assert await second.mark_operation_recovery_required(
+            tenant, str(return_intent.intent["id"]), stale_token
+        )
+        return_takeover = await second.claim_operation_intent(
+            tenant, str(return_intent.intent["id"])
+        )
+        assert return_takeover.acquired
+        assert int(return_takeover.intent["fencing_token"]) > stale_token
+
+        with pytest.raises(POSStoreConflictError, match="lease"):
+            await second.materialize_return_intent(
+                tenant,
+                str(return_intent.intent["id"]),
+                stale_token,
+                "RET-STALE",
+            )
+        assert await second.get_return(tenant, return_id) is None
+        assert await second.list_cash_events(
+            tenant_id=tenant, shift_id=shift_id
+        ) == []
+
+        returned = await second.materialize_return_intent(
+            tenant,
+            str(return_takeover.intent["id"]),
+            int(return_takeover.intent["fencing_token"]),
+            "RET-RECOVERED",
+        )
+        shift_after_return = await second.get_shift(tenant, shift_id)
+        cash_events = await second.list_cash_events(
+            tenant_id=tenant, shift_id=shift_id
+        )
+        async with second_runtime.engine.connect() as connection:
+            transaction = await connection.begin()
+            try:
+                await connection.execute(
+                    text("SELECT set_config('myretail.tenant_id', :tenant, true)"),
+                    {"tenant": tenant},
+                )
+                internal_cash_returns_total = (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT cash_returns_total
+                            FROM myretail_state.pos_shifts
+                            WHERE tenant_id = :tenant AND shift_id = :shift_id
+                            """
+                        ),
+                        {"tenant": tenant, "shift_id": shift_id},
+                    )
+                ).scalar_one()
+            finally:
+                await transaction.rollback()
+        terminal = await second.claim_operation_intent(
+            tenant, str(return_takeover.intent["id"])
+        )
+        assert returned["id"] == return_id
+        assert returned["erpnext_return_invoice_id"] == "RET-RECOVERED"
+        assert shift_after_return is not None
+        assert str(internal_cash_returns_total) == "100.000000"
+        assert shift_after_return["expected_cash"] == "10000.00"
+        assert len(cash_events) == 1
+        assert cash_events[0].source_id == return_id
+        assert cash_events[0].amount_delta == "-100.00"
+        assert not terminal.acquired
+        assert terminal.intent["state"] == "completed"
+        assert terminal.intent["result_id"] == return_id
     finally:
         await second_runtime.close()

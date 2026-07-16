@@ -7,7 +7,7 @@ from datetime import time as datetime_time
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 
 class POSStoreConflictError(RuntimeError):
@@ -990,6 +990,228 @@ class POSStore:
             connection.commit()
         return self.get_sale(str(sale_row["tenant"]), result_id) or sale_row
 
+    def materialize_return_intent(
+        self, intent_id: str, fencing_token: int, erpnext_invoice_id: str
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            intent = self._owned_intent(
+                connection, intent_id, fencing_token, operation="create_return"
+            )
+            payload = _intent_payload(intent)
+            return_row = dict(payload["return"])
+            if str(return_row.get("tenant")) != str(intent["tenant"]):
+                connection.rollback()
+                raise POSStoreConflictError(
+                    "IDEMPOTENCY_CONFLICT",
+                    "Operation tenant does not match projection tenant",
+                )
+            stored_lines = json.loads(str(return_row["lines_json"]))
+            sale = connection.execute(
+                "SELECT * FROM pos_sales WHERE tenant = ? AND id = ?",
+                (return_row["tenant"], return_row["sale_id"]),
+            ).fetchone()
+            if sale is None:
+                connection.rollback()
+                raise POSStoreConflictError("SALE_NOT_FOUND", "Sale not found")
+            shift = connection.execute(
+                "SELECT * FROM pos_shifts WHERE tenant = ? AND id = ?",
+                (return_row["tenant"], return_row["shift_id"]),
+            ).fetchone()
+            if shift is None:
+                connection.rollback()
+                raise POSStoreConflictError("SHIFT_NOT_FOUND", "Shift not found")
+            shift_data = dict(shift)
+            if shift_data["status"] != "open":
+                connection.rollback()
+                raise POSStoreConflictError("SHIFT_CLOSED", "Shift is closed")
+
+            existing = connection.execute(
+                """
+                SELECT * FROM pos_returns
+                WHERE tenant = ? AND erpnext_return_invoice_id = ?
+                """,
+                (return_row["tenant"], erpnext_invoice_id),
+            ).fetchone()
+            if existing is None:
+                sale_lines = json.loads(str(sale["lines_json"]))
+                returned_by_line: dict[str, Decimal] = {}
+                submitted = connection.execute(
+                    """
+                    SELECT lines_json FROM pos_returns
+                    WHERE tenant = ? AND sale_id = ? AND state = 'submitted'
+                    """,
+                    (return_row["tenant"], return_row["sale_id"]),
+                ).fetchall()
+                for submitted_row in submitted:
+                    for line in json.loads(str(submitted_row[0])):
+                        line_id = str(line["line_id"])
+                        returned_by_line[line_id] = returned_by_line.get(
+                            line_id, Decimal("0")
+                        ) + Decimal(str(line["quantity"]))
+                snapshot: list[dict[str, str]] = []
+                for requested in stored_lines:
+                    line_id = str(requested["line_id"])
+                    index = _sale_line_index(str(return_row["sale_id"]), line_id)
+                    if index is None or index >= len(sale_lines):
+                        connection.rollback()
+                        raise POSStoreConflictError(
+                            "RETURN_LINE_NOT_FOUND",
+                            "Sale line not found",
+                            {"line_id": line_id},
+                        )
+                    source = sale_lines[index]
+                    requested_quantity = Decimal(str(requested["quantity"]))
+                    available = Decimal(str(source["quantity"])) - returned_by_line.get(
+                        line_id, Decimal("0")
+                    )
+                    if requested_quantity > available:
+                        connection.rollback()
+                        raise POSStoreConflictError(
+                            "RETURN_QUANTITY_EXCEEDED",
+                            "Return quantity exceeds available quantity",
+                            {
+                                "line_id": line_id,
+                                "available_to_return_quantity": _format_quantity(available),
+                            },
+                        )
+                    net_unit_price = _net_unit_price(source)
+                    snapshot.append(
+                        {
+                            "line_id": line_id,
+                            "item_id": str(source["product_id"]),
+                            "item_name": str(source["name"]),
+                            "quantity": _format_quantity(requested_quantity),
+                            "unit": str(source["unit"]),
+                            "unit_price": _format_money(net_unit_price),
+                            "line_total": _format_money(
+                                requested_quantity * net_unit_price
+                            ),
+                        }
+                    )
+                refund_total = _format_money(
+                    sum(
+                        (Decimal(line["line_total"]) for line in snapshot),
+                        Decimal("0.00"),
+                    )
+                )
+                if snapshot != stored_lines or refund_total != str(
+                    return_row["refund_total"]
+                ):
+                    connection.rollback()
+                    raise POSStoreConflictError(
+                        "IDEMPOTENCY_CONFLICT",
+                        "Stored return snapshot no longer matches the sale",
+                    )
+                return_row.update(
+                    {
+                        "state": "submitted",
+                        "return_receipt_number": erpnext_invoice_id,
+                        "erpnext_return_invoice_id": erpnext_invoice_id,
+                    }
+                )
+                try:
+                    connection.execute(
+                        """
+                        INSERT INTO pos_returns (
+                            id, tenant, sale_id, receipt_number, return_receipt_number,
+                            state, refund_method, reason, comment, register_id, shift_id,
+                            cashier_email, currency, refund_total, lines_json,
+                            erpnext_return_invoice_id, idempotency_key, created_by_email,
+                            created_at, cancelled_by, cancelled_at, cancel_reason,
+                            cancel_comment, updated_at
+                        ) VALUES (
+                            :id, :tenant, :sale_id, :receipt_number,
+                            :return_receipt_number, :state, :refund_method, :reason,
+                            :comment, :register_id, :shift_id, :cashier_email, :currency,
+                            :refund_total, :lines_json, :erpnext_return_invoice_id,
+                            :idempotency_key, :created_by_email, :created_at,
+                            NULL, NULL, NULL, NULL, :updated_at
+                        )
+                        """,
+                        return_row,
+                    )
+                except sqlite3.IntegrityError as exc:
+                    connection.rollback()
+                    raise POSStoreConflictError(
+                        "IDEMPOTENCY_CONFLICT", "Return is already materialized"
+                    ) from exc
+                result_id = str(return_row["id"])
+            else:
+                persisted = dict(existing)
+                result_id = str(persisted["id"])
+                if not (
+                    result_id == str(return_row["id"])
+                    and str(persisted["sale_id"]) == str(return_row["sale_id"])
+                    and str(persisted["shift_id"]) == str(return_row["shift_id"])
+                    and str(persisted["refund_total"])
+                    == str(return_row["refund_total"])
+                    and json.loads(str(persisted["lines_json"])) == stored_lines
+                ):
+                    connection.rollback()
+                    raise POSStoreConflictError(
+                        "IDEMPOTENCY_CONFLICT",
+                        "ERPNext return invoice is bound to another projection",
+                    )
+
+            cash_event = dict(payload["cash_event"])
+            self._append_cash_event(
+                connection,
+                event_id=str(cash_event["event_id"]),
+                tenant=str(return_row["tenant"]),
+                shift_id=str(return_row["shift_id"]),
+                source_type="return",
+                source_id=result_id,
+                effect_kind="return",
+                amount_delta=f"-{return_row['refund_total']}",
+                created_at=str(cash_event["created_at"]),
+            )
+            ledger_rows = connection.execute(
+                """
+                SELECT amount_delta FROM pos_shift_cash_events
+                WHERE tenant = ? AND shift_id = ? AND source_type = 'return'
+                """,
+                (return_row["tenant"], return_row["shift_id"]),
+            ).fetchall()
+            cash_returns_total = _format_money(
+                -sum((Decimal(str(row[0])) for row in ledger_rows), Decimal("0.00"))
+            )
+            if Decimal(cash_returns_total) < 0:
+                connection.rollback()
+                raise POSStoreConflictError(
+                    "IDEMPOTENCY_CONFLICT", "Cash return ledger total is invalid"
+                )
+            expected_cash = _money_subtract(
+                _money_add(shift_data["opening_cash"], shift_data["sales_total"]),
+                cash_returns_total,
+            )
+            updated = connection.execute(
+                """
+                UPDATE pos_shifts
+                SET cash_returns_total = ?, expected_cash = ?, updated_at = ?
+                WHERE tenant = ? AND id = ? AND status = 'open'
+                """,
+                (
+                    cash_returns_total,
+                    expected_cash,
+                    return_row["created_at"],
+                    return_row["tenant"],
+                    return_row["shift_id"],
+                ),
+            )
+            if updated.rowcount != 1:
+                connection.rollback()
+                raise POSStoreConflictError("SHIFT_CHANGED", "Shift changed")
+            self._complete_return_intent(
+                connection,
+                intent_id,
+                fencing_token,
+                erpnext_document_id=erpnext_invoice_id,
+                result_id=result_id,
+            )
+            connection.commit()
+        return self.get_return(str(return_row["tenant"]), result_id) or return_row
+
     @staticmethod
     def _owned_intent(
         connection: sqlite3.Connection,
@@ -1035,6 +1257,31 @@ class POSStore:
             connection.rollback()
             raise POSStoreConflictError(
                 "IDEMPOTENCY_CONFLICT", "Operation lease больше не принадлежит запросу"
+            )
+
+    @staticmethod
+    def _complete_return_intent(
+        connection: sqlite3.Connection,
+        intent_id: str,
+        fencing_token: int,
+        *,
+        erpnext_document_id: str,
+        result_id: str,
+    ) -> None:
+        cursor = connection.execute(
+            """
+            UPDATE pos_operation_intents
+            SET state = 'completed', erpnext_document_id = ?, result_id = ?, updated_at = ?
+            WHERE id = ? AND fencing_token = ?
+              AND state IN ('reserved', 'erp_pending', 'recovery_required')
+            """,
+            (erpnext_document_id, result_id, _now(), intent_id, fencing_token),
+        )
+        if cursor.rowcount != 1:
+            connection.rollback()
+            raise POSStoreConflictError(
+                "IDEMPOTENCY_CONFLICT",
+                "Operation lease no longer belongs to this request",
             )
 
     def create_shift(self, row: dict[str, Any]) -> dict[str, Any]:
@@ -1557,6 +1804,102 @@ class POSStore:
             )
         return self.get_return(tenant, return_id) or {}
 
+    def materialize_legacy_return(
+        self,
+        tenant: str,
+        return_id: str,
+        erpnext_invoice_id: str,
+        cash_event_id: str,
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM pos_returns WHERE tenant = ? AND id = ?",
+                (tenant, return_id),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                raise POSStoreConflictError("RETURN_NOT_FOUND", "Return not found")
+            return_row = dict(row)
+            if return_row["state"] == "pending_recovery":
+                connection.execute(
+                    """
+                    UPDATE pos_returns
+                    SET state = 'submitted', erpnext_return_invoice_id = ?,
+                        return_receipt_number = ?, updated_at = ?
+                    WHERE tenant = ? AND id = ? AND state = 'pending_recovery'
+                    """,
+                    (erpnext_invoice_id, erpnext_invoice_id, _now(), tenant, return_id),
+                )
+            elif not (
+                return_row["state"] == "submitted"
+                and str(return_row.get("erpnext_return_invoice_id"))
+                == erpnext_invoice_id
+            ):
+                connection.rollback()
+                raise POSStoreConflictError(
+                    "IDEMPOTENCY_CONFLICT",
+                    "Legacy return is bound to another ERPNext result",
+                )
+            shift = connection.execute(
+                "SELECT * FROM pos_shifts WHERE tenant = ? AND id = ?",
+                (tenant, return_row["shift_id"]),
+            ).fetchone()
+            if shift is None:
+                connection.rollback()
+                raise POSStoreConflictError("SHIFT_NOT_FOUND", "Shift not found")
+            shift_data = dict(shift)
+            if shift_data["status"] != "open":
+                connection.rollback()
+                raise POSStoreConflictError(
+                    "POS_OPENING_OUTDATED",
+                    "POS Opening Entry is outdated for cash refund",
+                )
+            self._append_cash_event(
+                connection,
+                event_id=cash_event_id,
+                tenant=tenant,
+                shift_id=str(return_row["shift_id"]),
+                source_type="return",
+                source_id=return_id,
+                effect_kind="return",
+                amount_delta=f"-{return_row['refund_total']}",
+                created_at=str(return_row["created_at"]),
+            )
+            ledger_rows = connection.execute(
+                """
+                SELECT amount_delta FROM pos_shift_cash_events
+                WHERE tenant = ? AND shift_id = ? AND source_type = 'return'
+                """,
+                (tenant, return_row["shift_id"]),
+            ).fetchall()
+            cash_returns_total = _format_money(
+                -sum((Decimal(str(item[0])) for item in ledger_rows), Decimal("0.00"))
+            )
+            expected_cash = _money_subtract(
+                _money_add(shift_data["opening_cash"], shift_data["sales_total"]),
+                cash_returns_total,
+            )
+            updated = connection.execute(
+                """
+                UPDATE pos_shifts
+                SET cash_returns_total = ?, expected_cash = ?, updated_at = ?
+                WHERE tenant = ? AND id = ? AND status = 'open'
+                """,
+                (
+                    cash_returns_total,
+                    expected_cash,
+                    return_row["created_at"],
+                    tenant,
+                    return_row["shift_id"],
+                ),
+            )
+            if updated.rowcount != 1:
+                connection.rollback()
+                raise POSStoreConflictError("SHIFT_CHANGED", "Shift changed")
+            connection.commit()
+        return self.get_return(tenant, return_id) or return_row
+
     def mark_return_cancelled(
         self,
         *,
@@ -1998,6 +2341,123 @@ class POSStore:
                 "CREATE INDEX IF NOT EXISTS pos_returns_created_at "
                 "ON pos_returns(tenant, created_at)"
             )
+            legacy_returns = connection.execute(
+                """
+                SELECT * FROM pos_returns
+                WHERE state IN ('submitted', 'cancel_pending', 'cancelled')
+                """
+            ).fetchall()
+            for legacy in legacy_returns:
+                legacy_row = dict(legacy)
+                existing_return_event = connection.execute(
+                    """
+                    SELECT * FROM pos_shift_cash_events
+                    WHERE tenant = ? AND source_type = 'return'
+                      AND source_id = ? AND effect_kind = 'return'
+                    """,
+                    (legacy_row["tenant"], legacy_row["id"]),
+                ).fetchone()
+                if existing_return_event is None:
+                    self._append_cash_event(
+                        connection,
+                        event_id=str(
+                            uuid5(
+                                NAMESPACE_URL,
+                                "myretail:return-cash:"
+                                f"{legacy_row['tenant']}:{legacy_row['id']}",
+                            )
+                        ),
+                        tenant=str(legacy_row["tenant"]),
+                        shift_id=str(legacy_row["shift_id"]),
+                        source_type="return",
+                        source_id=str(legacy_row["id"]),
+                        effect_kind="return",
+                        amount_delta=f"-{legacy_row['refund_total']}",
+                        created_at=str(legacy_row["created_at"]),
+                    )
+                elif not (
+                    str(existing_return_event["shift_id"])
+                    == str(legacy_row["shift_id"])
+                    and str(existing_return_event["amount_delta"])
+                    == _format_money(-Decimal(str(legacy_row["refund_total"])))
+                ):
+                    raise POSStoreMigrationError(
+                        "return cash event does not match the persisted return"
+                    )
+                if legacy_row["state"] == "cancelled":
+                    existing_cancel_event = connection.execute(
+                        """
+                        SELECT * FROM pos_shift_cash_events
+                        WHERE tenant = ? AND source_type = 'return'
+                          AND source_id = ? AND effect_kind = 'return_cancel'
+                        """,
+                        (legacy_row["tenant"], legacy_row["id"]),
+                    ).fetchone()
+                    if existing_cancel_event is None:
+                        self._append_cash_event(
+                            connection,
+                            event_id=str(
+                                uuid5(
+                                    NAMESPACE_URL,
+                                    "myretail:return-cancel-cash:"
+                                    f"{legacy_row['tenant']}:{legacy_row['id']}",
+                                )
+                            ),
+                            tenant=str(legacy_row["tenant"]),
+                            shift_id=str(legacy_row["shift_id"]),
+                            source_type="return",
+                            source_id=str(legacy_row["id"]),
+                            effect_kind="return_cancel",
+                            amount_delta=str(legacy_row["refund_total"]),
+                            created_at=str(
+                                legacy_row.get("cancelled_at")
+                                or legacy_row["updated_at"]
+                            ),
+                        )
+            open_shifts = connection.execute(
+                "SELECT * FROM pos_shifts WHERE status = 'open'"
+            ).fetchall()
+            for open_shift in open_shifts:
+                shift = dict(open_shift)
+                cash_rows = connection.execute(
+                    """
+                    SELECT amount_delta FROM pos_shift_cash_events
+                    WHERE tenant = ? AND shift_id = ? AND source_type = 'return'
+                    """,
+                    (shift["tenant"], shift["id"]),
+                ).fetchall()
+                cash_returns_total = _format_money(
+                    -sum(
+                        (Decimal(str(cash_row[0])) for cash_row in cash_rows),
+                        Decimal("0.00"),
+                    )
+                )
+                if Decimal(cash_returns_total) < 0:
+                    raise POSStoreMigrationError(
+                        "return cash ledger has a negative outstanding total"
+                    )
+                expected_cash = _money_subtract(
+                    _money_add(shift["opening_cash"], shift["sales_total"]),
+                    cash_returns_total,
+                )
+                if (
+                    str(shift["cash_returns_total"]) != cash_returns_total
+                    or str(shift["expected_cash"]) != expected_cash
+                ):
+                    connection.execute(
+                        """
+                        UPDATE pos_shifts
+                        SET cash_returns_total = ?, expected_cash = ?, updated_at = ?
+                        WHERE tenant = ? AND id = ? AND status = 'open'
+                        """,
+                        (
+                            cash_returns_total,
+                            expected_cash,
+                            _now(),
+                            shift["tenant"],
+                            shift["id"],
+                        ),
+                    )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._database_path, timeout=30)

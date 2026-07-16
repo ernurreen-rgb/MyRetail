@@ -373,6 +373,47 @@ class FlakyReturnERPNextClient(StubPOSErpnextClient):
         raise ERPNextAmbiguousCreateError("lost return response")
 
 
+class DelayedRecoveryReturnERPNextClient(StubPOSErpnextClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.created_key: str | None = None
+        self.recovery_attempts = 0
+
+    async def create_pos_sales_return(self, **kwargs: object) -> str:
+        _ = await super().create_pos_sales_return(**kwargs)
+        self.created_key = str(kwargs["idempotency_key"])
+        raise ERPNextAmbiguousCreateError("lost return response")
+
+    async def recover_pos_return(
+        self, tenant: str, operation: str, user_email: str, idempotency_key: str
+    ) -> str | None:
+        _ = tenant, operation, user_email
+        self.recovery_attempts += 1
+        if idempotency_key == self.created_key and self.recovery_attempts > 1:
+            return str(self.returns[-1]["invoice"])
+        return None
+
+
+class RecoveringReturnERPNextClient(StubPOSErpnextClient):
+    async def recover_pos_return(
+        self, tenant: str, operation: str, user_email: str, idempotency_key: str
+    ) -> str | None:
+        _ = tenant, operation, user_email, idempotency_key
+        return "RET-LEGACY-RECOVERED"
+
+
+class BlockingReturnERPNextClient(StubPOSErpnextClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.return_started = asyncio.Event()
+        self.release_return = asyncio.Event()
+
+    async def create_pos_sales_return(self, **kwargs: object) -> str:
+        self.return_started.set()
+        await self.release_return.wait()
+        return await super().create_pos_sales_return(**kwargs)
+
+
 class StaleOpeningReturnERPNextClient(StubPOSErpnextClient):
     def __init__(self) -> None:
         super().__init__()
@@ -2056,6 +2097,55 @@ async def test_repeated_partial_return_consumes_remaining_quantity(tmp_path: Pat
 
 
 @pytest.mark.anyio
+async def test_new_key_after_terminal_allows_same_partial_return_body(
+    tmp_path: Path,
+) -> None:
+    erpnext = StubPOSErpnextClient()
+    app = make_app(erpnext, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        shift = await open_shift(client, tmp_path)
+        sale = await create_sale(
+            client,
+            tmp_path,
+            shift_id=str(shift["id"]),
+            product_id="WEIGHT",
+        )
+        body = {
+            "sale_id": sale["id"],
+            "register_id": "POS-1",
+            "shift_id": shift["id"],
+            "refund_method": "cash",
+            "reason": "customer_request",
+            "lines": [
+                {"line_id": f"{sale['id']}:line:1", "quantity": "0.400"}
+            ],
+        }
+        first = await client.post(
+            "/pos/returns",
+            headers=auth_headers(tmp_path, key=str(uuid4())),
+            json=body,
+        )
+        second = await client.post(
+            "/pos/returns",
+            headers=auth_headers(tmp_path, key=str(uuid4())),
+            json=body,
+        )
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert second.json()["return_id"] != first.json()["return_id"]
+    assert len(erpnext.returns) == 2
+    with sqlite3.connect(tmp_path / "pos.sqlite3") as connection:
+        totals = connection.execute(
+            "SELECT cash_returns_total, expected_cash FROM pos_shifts WHERE id = ?",
+            (shift["id"],),
+        ).fetchone()
+    assert totals == ("64.00", "10016.00")
+
+
+@pytest.mark.anyio
 async def test_return_cancel_requires_admin_and_is_idempotent(tmp_path: Path) -> None:
     erpnext = StubPOSErpnextClient()
     app = make_app(erpnext, tmp_path)
@@ -2139,6 +2229,217 @@ async def test_ambiguous_return_is_pending_recovery_without_second_create(tmp_pa
     assert retry.status_code == 503
     assert retry.json()["error"]["code"] == "RETURN_RECOVERY_REQUIRED"
     assert len(erpnext.returns) == 1
+
+
+@pytest.mark.anyio
+async def test_return_lost_response_recovers_projection_and_cash_once(tmp_path: Path) -> None:
+    erpnext = DelayedRecoveryReturnERPNextClient()
+    app = make_app(erpnext, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        shift = await open_shift(client, tmp_path)
+        sale = await create_sale(client, tmp_path, shift_id=str(shift["id"]))
+        body = {
+            "sale_id": sale["id"],
+            "register_id": "POS-1",
+            "shift_id": shift["id"],
+            "refund_method": "cash",
+            "reason": "damaged",
+            "lines": [{"line_id": f"{sale['id']}:line:1", "quantity": "1.000"}],
+        }
+        key = str(uuid4())
+        first = await client.post(
+            "/pos/returns", headers=auth_headers(tmp_path, key=key), json=body
+        )
+        recovered = await client.post(
+            "/pos/returns", headers=auth_headers(tmp_path, key=key), json=body
+        )
+        replay = await client.post(
+            "/pos/returns", headers=auth_headers(tmp_path, key=key), json=body
+        )
+
+    assert first.status_code == 503
+    assert first.json()["error"]["code"] == "RETURN_RECOVERY_REQUIRED"
+    assert recovered.status_code == 201
+    assert replay.status_code == 201
+    assert replay.json()["return_id"] == recovered.json()["return_id"]
+    assert len(erpnext.returns) == 1
+    with sqlite3.connect(tmp_path / "pos.sqlite3") as connection:
+        return_count = connection.execute("SELECT COUNT(*) FROM pos_returns").fetchone()[0]
+        event_count = connection.execute(
+            "SELECT COUNT(*) FROM pos_shift_cash_events WHERE effect_kind = 'return'"
+        ).fetchone()[0]
+        intent = connection.execute(
+            "SELECT state, result_id FROM pos_operation_intents "
+            "WHERE operation = 'create_return'"
+        ).fetchone()
+        totals = connection.execute(
+            "SELECT cash_returns_total, expected_cash FROM pos_shifts WHERE id = ?",
+            (shift["id"],),
+        ).fetchone()
+    assert return_count == 1
+    assert event_count == 1
+    assert intent == ("completed", recovered.json()["return_id"])
+    assert totals == ("100.00", "10000.00")
+
+
+@pytest.mark.anyio
+async def test_legacy_pending_return_recovery_adds_cash_effect_once(
+    tmp_path: Path,
+) -> None:
+    erpnext = RecoveringReturnERPNextClient()
+    app = make_app(erpnext, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        shift = await open_shift(client, tmp_path)
+        sale = await create_sale(client, tmp_path, shift_id=str(shift["id"]))
+        line_id = f"{sale['id']}:line:1"
+        body = {
+            "sale_id": sale["id"],
+            "register_id": "POS-1",
+            "shift_id": shift["id"],
+            "refund_method": "cash",
+            "reason": "damaged",
+            "comment": None,
+            "lines": [{"line_id": line_id, "quantity": "1.000"}],
+        }
+        key = str(uuid4())
+        request_hash = _request_hash("create_return", body)
+        store = POSStore(tmp_path / "pos.sqlite3")
+        store.begin_idempotency(
+            tenant="myretail",
+            operation="create_return",
+            user_email="cashier@example.kz",
+            key=key,
+            request_hash=request_hash,
+            lease_seconds=-1,
+        )
+        now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        legacy_id = f"RETURN-{uuid4().hex[:12].upper()}"
+        store.create_pending_return(
+            row={
+                "id": legacy_id,
+                "tenant": "myretail",
+                "sale_id": sale["id"],
+                "receipt_number": sale["receipt_number"],
+                "return_receipt_number": "",
+                "state": "pending_recovery",
+                "refund_method": "cash",
+                "reason": "damaged",
+                "comment": None,
+                "register_id": "POS-1",
+                "shift_id": shift["id"],
+                "cashier_email": "cashier@example.kz",
+                "currency": "KZT",
+                "refund_total": "100.00",
+                "erpnext_return_invoice_id": None,
+                "idempotency_key": key,
+                "created_by_email": "cashier@example.kz",
+                "created_at": now,
+                "updated_at": now,
+            },
+            requested_lines=[{"line_id": line_id, "quantity": "1.000"}],
+        )
+        recovered = await client.post(
+            "/pos/returns", headers=auth_headers(tmp_path, key=key), json=body
+        )
+        replay = await client.post(
+            "/pos/returns", headers=auth_headers(tmp_path, key=key), json=body
+        )
+
+    assert recovered.status_code == 201, recovered.text
+    assert replay.status_code == 201
+    assert recovered.json()["return_id"] == legacy_id
+    assert replay.json()["return_id"] == legacy_id
+    assert erpnext.returns == []
+    with sqlite3.connect(tmp_path / "pos.sqlite3") as connection:
+        events = connection.execute(
+            "SELECT COUNT(*), MIN(amount_delta) FROM pos_shift_cash_events "
+            "WHERE source_id = ? AND effect_kind = 'return'",
+            (legacy_id,),
+        ).fetchone()
+        totals = connection.execute(
+            "SELECT cash_returns_total, expected_cash FROM pos_shifts WHERE id = ?",
+            (shift["id"],),
+        ).fetchone()
+    assert events == (1, "-100.00")
+    assert totals == ("100.00", "10000.00")
+
+
+@pytest.mark.anyio
+async def test_two_api_instances_join_return_with_different_keys(tmp_path: Path) -> None:
+    erpnext = BlockingReturnERPNextClient()
+    first_app = make_app(erpnext, tmp_path)
+    second_app = make_app(erpnext, tmp_path)
+    async with (
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=first_app), base_url="http://first"
+        ) as first_client,
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=second_app), base_url="http://second"
+        ) as second_client,
+    ):
+        shift = await open_shift(first_client, tmp_path)
+        sale = await create_sale(
+            first_client, tmp_path, shift_id=str(shift["id"])
+        )
+        body = {
+            "sale_id": sale["id"],
+            "register_id": "POS-1",
+            "shift_id": shift["id"],
+            "refund_method": "cash",
+            "reason": "damaged",
+            "lines": [{"line_id": f"{sale['id']}:line:1", "quantity": "1.000"}],
+        }
+        first_task = asyncio.create_task(
+            first_client.post(
+                "/pos/returns",
+                headers=auth_headers(tmp_path, key=str(uuid4())),
+                json=body,
+            )
+        )
+        await asyncio.wait_for(erpnext.return_started.wait(), timeout=2)
+        incompatible = await second_client.post(
+            "/pos/returns",
+            headers=auth_headers(tmp_path, key=str(uuid4())),
+            json={**body, "reason": "customer_request"},
+        )
+        second_task = asyncio.create_task(
+            second_client.post(
+                "/pos/returns",
+                headers=auth_headers(tmp_path, key=str(uuid4())),
+                json=body,
+            )
+        )
+        await asyncio.sleep(0.1)
+        erpnext.release_return.set()
+        first, second = await asyncio.gather(first_task, second_task)
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert incompatible.status_code == 409
+    assert incompatible.json()["error"]["code"] == "SHIFT_CHANGED"
+    assert second.json()["return_id"] == first.json()["return_id"]
+    assert len(erpnext.returns) == 1
+    with sqlite3.connect(tmp_path / "pos.sqlite3") as connection:
+        return_count = connection.execute("SELECT COUNT(*) FROM pos_returns").fetchone()[0]
+        event_count = connection.execute(
+            "SELECT COUNT(*) FROM pos_shift_cash_events WHERE effect_kind = 'return'"
+        ).fetchone()[0]
+        alias_count = connection.execute(
+            "SELECT COUNT(*) FROM pos_operation_intent_aliases "
+            "WHERE operation = 'create_return'"
+        ).fetchone()[0]
+        intent_count = connection.execute(
+            "SELECT COUNT(*) FROM pos_operation_intents "
+            "WHERE operation = 'create_return'"
+        ).fetchone()[0]
+    assert return_count == 1
+    assert event_count == 1
+    assert alias_count == 2
+    assert intent_count == 1
 
 
 @pytest.mark.anyio
@@ -2286,6 +2587,51 @@ async def test_stale_opening_return_is_terminal_and_not_retried(tmp_path: Path) 
     assert retry.json()["error"]["code"] == "POS_OPENING_OUTDATED"
     assert erpnext.return_attempts == 1
     assert history.json()["count"] == 0
+
+
+@pytest.mark.anyio
+async def test_closed_shift_management_return_fails_before_erp_call(
+    tmp_path: Path,
+) -> None:
+    erpnext = StubPOSErpnextClient()
+    app = make_app(erpnext, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        shift = await open_shift(client, tmp_path)
+        sale = await create_sale(client, tmp_path, shift_id=str(shift["id"]))
+        refreshed = await client.get(
+            "/pos/shifts/current?register_id=POS-1",
+            headers=auth_headers(tmp_path),
+        )
+        closed = await client.post(
+            f"/pos/shifts/{shift['id']}/close",
+            headers=auth_headers(tmp_path, key=str(uuid4())),
+            json={
+                "actual_cash": "10100.00",
+                "expected_updated_at": refreshed.json()["updated_at"],
+            },
+        )
+        body = {
+            "sale_id": sale["id"],
+            "register_id": "POS-1",
+            "shift_id": shift["id"],
+            "refund_method": "cash",
+            "reason": "other",
+            "lines": [
+                {"line_id": f"{sale['id']}:line:1", "quantity": "1.000"}
+            ],
+        }
+        returned = await client.post(
+            "/pos/returns",
+            headers=auth_headers(tmp_path, roles=["Owner"], key=str(uuid4())),
+            json=body,
+        )
+
+    assert closed.status_code == 200
+    assert returned.status_code == 409
+    assert returned.json()["error"]["code"] == "POS_OPENING_OUTDATED"
+    assert erpnext.returns == []
 
 
 @pytest.mark.anyio

@@ -139,11 +139,11 @@ jobs:
           MYRETAIL_STATE_MIGRATION_SSL_MODE: disable
         run: |
           myretail-state-migrate upgrade head
-          test "$(myretail-state-migrate current)" = "20260716_03 (head)"
+          test "$(myretail-state-migrate current)" = "20260716_04 (head)"
           myretail-state-migrate downgrade base
           test -z "$(myretail-state-migrate current)"
           myretail-state-migrate upgrade head
-          test "$(myretail-state-migrate current)" = "20260716_03 (head)"
+          test "$(myretail-state-migrate current)" = "20260716_04 (head)"
       - name: Run packaged PostgreSQL state preflight
         env:
           MYRETAIL_ENVIRONMENT: test
@@ -169,6 +169,7 @@ jobs:
               "myretail_api/migrations/versions/v20260716_01_state_foundation.py",
               "myretail_api/migrations/versions/v20260716_02_auth_rate_limit_grants.py",
               "myretail_api/migrations/versions/v20260716_03_return_integrity_foundation.py",
+              "myretail_api/migrations/versions/v20260716_04_return_cash_backfill.py",
               "myretail_api/state/preflight.py",
               "myretail_api/state/tls.py",
           }
