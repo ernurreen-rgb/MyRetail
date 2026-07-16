@@ -11,6 +11,7 @@ from myretail_api.config import (
 )
 from myretail_api.main import create_app
 from myretail_api.state.idempotency import SQLiteIdempotencyRepository
+from myretail_api.state.pos_coordination import SQLitePOSCoordinationRepository
 from myretail_api.state.schema import EXPECTED_STATE_SCHEMA_REVISION
 
 
@@ -133,6 +134,7 @@ async def test_sqlite_lifespan_does_not_create_postgresql_pool(tmp_path: Path) -
         isolated_settings(
             environment="test",
             stock_idempotency_db_path=tmp_path / "idempotency.sqlite3",
+            pos_db_path=tmp_path / "pos.sqlite3",
         )
     )
 
@@ -141,6 +143,10 @@ async def test_sqlite_lifespan_does_not_create_postgresql_pool(tmp_path: Path) -
         assert isinstance(
             app.state.shared_idempotency_repository,
             SQLiteIdempotencyRepository,
+        )
+        assert isinstance(
+            app.state.pos_coordination_repository,
+            SQLitePOSCoordinationRepository,
         )
 
 

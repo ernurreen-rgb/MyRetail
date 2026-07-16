@@ -116,14 +116,6 @@ class POSStore:
                     expired=True,
                     fencing_token=fencing_token,
                 )
-            connection.execute(
-                """
-                UPDATE pos_idempotency
-                SET lease_until = ?, updated_at = ?
-                WHERE tenant = ? AND operation = ? AND user_email = ? AND idempotency_key = ?
-                """,
-                (lease_until, now, tenant, operation, user_email, key),
-            )
             connection.commit()
             return POSIdempotencyBeginResult(
                 acquired=False,
@@ -471,6 +463,63 @@ class POSStore:
             }
         )
         return POSIntentBeginResult(acquired=True, intent=intent, recovery_only=True)
+
+    def claim_due_operation_intents(
+        self,
+        tenant: str,
+        *,
+        limit: int,
+        lease_seconds: int = 60,
+    ) -> list[dict[str, Any]]:
+        if limit < 1:
+            return []
+        now = _now()
+        current_time = time.time()
+        lease_until = _timestamp(current_time + lease_seconds)
+        claimed: list[dict[str, Any]] = []
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT * FROM pos_operation_intents
+                WHERE tenant = ? AND state = 'recovery_required'
+                  AND lease_until <= ?
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                (tenant, _timestamp(current_time), limit),
+            ).fetchall()
+            for row in rows:
+                intent = dict(row)
+                fencing_token = int(intent["fencing_token"]) + 1
+                cursor = connection.execute(
+                    """
+                    UPDATE pos_operation_intents
+                    SET fencing_token = ?, lease_until = ?, updated_at = ?
+                    WHERE tenant = ? AND id = ? AND fencing_token = ?
+                      AND state = 'recovery_required'
+                    """,
+                    (
+                        fencing_token,
+                        lease_until,
+                        now,
+                        tenant,
+                        intent["id"],
+                        intent["fencing_token"],
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    continue
+                intent.update(
+                    {
+                        "fencing_token": fencing_token,
+                        "lease_until": lease_until,
+                        "updated_at": now,
+                    }
+                )
+                claimed.append(intent)
+            connection.commit()
+        return claimed
 
     def get_operation_intent(self, intent_id: str) -> dict[str, Any] | None:
         with self._connect() as connection:
