@@ -4,7 +4,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from datetime import time as datetime_time
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -398,6 +398,106 @@ class POSStore:
             ).fetchone()
         return _dict(row)
 
+    def attach_operation_intent_alias(
+        self,
+        *,
+        tenant: str,
+        operation: str,
+        user_email: str,
+        key: str,
+        intent_id: str,
+        business_hash: str,
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            intent = connection.execute(
+                """
+                SELECT * FROM pos_operation_intents
+                WHERE id = ? AND tenant = ?
+                """,
+                (intent_id, tenant),
+            ).fetchone()
+            if intent is None or not (
+                str(intent["operation"]) == operation
+                and str(intent["user_email"]) == user_email
+                and str(intent["business_hash"]) == business_hash
+            ):
+                connection.rollback()
+                raise POSStoreConflictError(
+                    "IDEMPOTENCY_CONFLICT",
+                    "Operation alias does not match its canonical intent",
+                )
+            existing = connection.execute(
+                """
+                SELECT intent_id, business_hash
+                FROM pos_operation_intent_aliases
+                WHERE tenant = ? AND operation = ? AND user_email = ?
+                  AND idempotency_key = ?
+                """,
+                (tenant, operation, user_email, key),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO pos_operation_intent_aliases (
+                        tenant, operation, user_email, idempotency_key,
+                        intent_id, business_hash, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        tenant,
+                        operation,
+                        user_email,
+                        key,
+                        intent_id,
+                        business_hash,
+                        _now(),
+                    ),
+                )
+            elif not (
+                str(existing["intent_id"]) == intent_id
+                and str(existing["business_hash"]) == business_hash
+            ):
+                connection.rollback()
+                raise POSStoreConflictError(
+                    "IDEMPOTENCY_CONFLICT",
+                    "Idempotency alias is already bound to another operation",
+                )
+            connection.commit()
+        return dict(intent)
+
+    def find_operation_intent_by_alias(
+        self,
+        *,
+        tenant: str,
+        operation: str,
+        user_email: str,
+        key: str,
+        business_hash: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT intent.*, alias.business_hash AS alias_business_hash
+                FROM pos_operation_intent_aliases AS alias
+                JOIN pos_operation_intents AS intent ON intent.id = alias.intent_id
+                WHERE alias.tenant = ? AND alias.operation = ?
+                  AND alias.user_email = ? AND alias.idempotency_key = ?
+                  AND intent.tenant = alias.tenant
+                """,
+                (tenant, operation, user_email, key),
+            ).fetchone()
+        if row is None:
+            return None
+        if str(row["alias_business_hash"]) != business_hash:
+            raise POSStoreConflictError(
+                "IDEMPOTENCY_CONFLICT",
+                "Idempotency key reused with another body",
+            )
+        return {
+            key: value for key, value in dict(row).items() if key != "alias_business_hash"
+        }
+
     def claim_operation_intent(
         self, intent_id: str, *, lease_seconds: int = 60
     ) -> POSIntentBeginResult:
@@ -529,6 +629,122 @@ class POSStore:
             ).fetchone()
         return _dict(row)
 
+    def append_cash_event(
+        self,
+        *,
+        event_id: str,
+        tenant: str,
+        shift_id: str,
+        source_type: str,
+        source_id: str,
+        effect_kind: str,
+        amount_delta: str,
+        created_at: str,
+    ) -> tuple[bool, dict[str, Any]]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            created, event = self._append_cash_event(
+                connection,
+                event_id=event_id,
+                tenant=tenant,
+                shift_id=shift_id,
+                source_type=source_type,
+                source_id=source_id,
+                effect_kind=effect_kind,
+                amount_delta=amount_delta,
+                created_at=created_at,
+            )
+            connection.commit()
+        return created, event
+
+    def list_cash_events(self, *, tenant: str, shift_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM pos_shift_cash_events
+                WHERE tenant = ? AND shift_id = ?
+                ORDER BY created_at, event_id
+                """,
+                (tenant, shift_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    @staticmethod
+    def _append_cash_event(
+        connection: sqlite3.Connection,
+        *,
+        event_id: str,
+        tenant: str,
+        shift_id: str,
+        source_type: str,
+        source_id: str,
+        effect_kind: str,
+        amount_delta: str,
+        created_at: str,
+    ) -> tuple[bool, dict[str, Any]]:
+        normalized_amount = _validate_cash_event(
+            source_type=source_type,
+            effect_kind=effect_kind,
+            amount_delta=amount_delta,
+        )
+        shift = connection.execute(
+            "SELECT 1 FROM pos_shifts WHERE tenant = ? AND id = ?",
+            (tenant, shift_id),
+        ).fetchone()
+        if shift is None:
+            raise POSStoreConflictError("SHIFT_NOT_FOUND", "Shift not found")
+        existing = connection.execute(
+            """
+            SELECT * FROM pos_shift_cash_events
+            WHERE tenant = ? AND source_type = ? AND source_id = ?
+              AND effect_kind = ?
+            """,
+            (tenant, source_type, source_id, effect_kind),
+        ).fetchone()
+        expected = {
+            "event_id": event_id,
+            "tenant": tenant,
+            "shift_id": shift_id,
+            "source_type": source_type,
+            "source_id": source_id,
+            "effect_kind": effect_kind,
+            "amount_delta": normalized_amount,
+            "created_at": created_at,
+        }
+        if existing is not None:
+            persisted = dict(existing)
+            if persisted != expected:
+                raise POSStoreConflictError(
+                    "IDEMPOTENCY_CONFLICT",
+                    "Cash event identity is already bound to another effect",
+                )
+            return False, persisted
+        try:
+            connection.execute(
+                """
+                INSERT INTO pos_shift_cash_events (
+                    event_id, tenant, shift_id, source_type, source_id,
+                    effect_kind, amount_delta, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    tenant,
+                    shift_id,
+                    source_type,
+                    source_id,
+                    effect_kind,
+                    normalized_amount,
+                    created_at,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise POSStoreConflictError(
+                "IDEMPOTENCY_CONFLICT",
+                "Cash event identity is already bound to another effect",
+            ) from exc
+        return True, expected
+
     def mark_operation_erp_pending(self, intent_id: str, fencing_token: int) -> bool:
         with self._connect() as connection:
             cursor = connection.execute(
@@ -604,12 +820,13 @@ class POSStore:
                     INSERT INTO pos_shifts (
                         id, tenant, register_id, register_name, warehouse_id, warehouse_name,
                         cashier_email, cashier_full_name, status, opening_cash, sales_total,
-                        expected_cash, actual_cash, difference, erpnext_opening_id,
+                        cash_returns_total, expected_cash, actual_cash, difference,
+                        erpnext_opening_id,
                         erpnext_closing_id, opened_at, closed_at, updated_at
                     ) VALUES (
                         :id, :tenant, :register_id, :register_name, :warehouse_id,
                         :warehouse_name, :cashier_email, :cashier_full_name, 'open',
-                        :opening_cash, '0.00', :opening_cash, NULL, NULL,
+                        :opening_cash, '0.00', '0.00', :opening_cash, NULL, NULL,
                         :erpnext_opening_id, NULL, :opened_at, NULL, :updated_at
                     )
                     """,
@@ -732,7 +949,10 @@ class POSStore:
                         "IDEMPOTENCY_CONFLICT", "ERPNext invoice уже materialized"
                     ) from exc
                 sales_total = _money_add(shift_data["sales_total"], sale_row["grand_total"])
-                expected_cash = _money_add(shift_data["opening_cash"], sales_total)
+                expected_cash = _money_subtract(
+                    _money_add(shift_data["opening_cash"], sales_total),
+                    shift_data["cash_returns_total"],
+                )
                 connection.execute(
                     """
                     UPDATE pos_shifts
@@ -847,13 +1067,14 @@ class POSStore:
                 INSERT INTO pos_shifts (
                     id, tenant, register_id, register_name, warehouse_id, warehouse_name,
                     cashier_email, cashier_full_name, status, opening_cash, sales_total,
-                    expected_cash, actual_cash, difference, erpnext_opening_id,
+                    cash_returns_total, expected_cash, actual_cash, difference,
+                    erpnext_opening_id,
                     erpnext_closing_id, opened_at, closed_at, updated_at
                 )
                 VALUES (
                     :id, :tenant, :register_id, :register_name, :warehouse_id, :warehouse_name,
                     :cashier_email, :cashier_full_name, 'open', :opening_cash, '0.00',
-                    :opening_cash, NULL, NULL, :erpnext_opening_id, NULL,
+                    '0.00', :opening_cash, NULL, NULL, :erpnext_opening_id, NULL,
                     :opened_at, NULL, :updated_at
                 )
                 """,
@@ -1114,7 +1335,10 @@ class POSStore:
                 row,
             )
             sales_total = _money_add(shift_data["sales_total"], row["grand_total"])
-            expected_cash = _money_add(shift_data["opening_cash"], sales_total)
+            expected_cash = _money_subtract(
+                _money_add(shift_data["opening_cash"], sales_total),
+                shift_data["cash_returns_total"],
+            )
             connection.execute(
                 """
                 UPDATE pos_shifts
@@ -1565,6 +1789,28 @@ class POSStore:
             )
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS pos_operation_intent_aliases (
+                    tenant TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    user_email TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    intent_id TEXT NOT NULL,
+                    business_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (tenant, operation, user_email, idempotency_key),
+                    FOREIGN KEY (intent_id) REFERENCES pos_operation_intents(id)
+                        ON DELETE RESTRICT
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS pos_operation_intent_alias_target
+                ON pos_operation_intent_aliases(tenant, intent_id)
+                """
+            )
+            connection.execute(
+                """
                 CREATE UNIQUE INDEX IF NOT EXISTS pos_operation_active_scope
                 ON pos_operation_intents(tenant, scope_id)
                 WHERE state IN ('reserved', 'erp_pending', 'recovery_required', 'materialized')
@@ -1599,6 +1845,7 @@ class POSStore:
                     status TEXT NOT NULL,
                     opening_cash TEXT NOT NULL,
                     sales_total TEXT NOT NULL,
+                    cash_returns_total TEXT NOT NULL DEFAULT '0.00',
                     expected_cash TEXT NOT NULL,
                     actual_cash TEXT,
                     difference TEXT,
@@ -1610,6 +1857,11 @@ class POSStore:
                 )
                 """
             )
+            if "cash_returns_total" not in _table_columns(connection, "pos_shifts"):
+                connection.execute(
+                    "ALTER TABLE pos_shifts ADD COLUMN "
+                    "cash_returns_total TEXT NOT NULL DEFAULT '0.00'"
+                )
             connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS pos_open_shift_register "
                 "ON pos_shifts(tenant, register_id) WHERE status = 'open'"
@@ -1617,6 +1869,33 @@ class POSStore:
             connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS pos_open_shift_cashier "
                 "ON pos_shifts(tenant, cashier_email) WHERE status = 'open'"
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pos_shift_cash_events (
+                    event_id TEXT NOT NULL,
+                    tenant TEXT NOT NULL,
+                    shift_id TEXT NOT NULL,
+                    source_type TEXT NOT NULL CHECK (
+                        source_type IN ('shift', 'sale', 'return')
+                    ),
+                    source_id TEXT NOT NULL,
+                    effect_kind TEXT NOT NULL CHECK (
+                        effect_kind IN ('opening', 'sale', 'return', 'return_cancel')
+                    ),
+                    amount_delta TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (tenant, event_id),
+                    UNIQUE (tenant, source_type, source_id, effect_kind),
+                    FOREIGN KEY (shift_id) REFERENCES pos_shifts(id) ON DELETE RESTRICT
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS pos_shift_cash_events_shift_created
+                ON pos_shift_cash_events(tenant, shift_id, created_at, event_id)
+                """
             )
             connection.execute(
                 """
@@ -1801,3 +2080,35 @@ def _money_add(left: str, right: str) -> str:
     return (
         f"{(Decimal(left) + Decimal(right)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):.2f}"
     )
+
+
+def _money_subtract(left: str, right: str) -> str:
+    return _format_money(Decimal(left) - Decimal(right))
+
+
+def _validate_cash_event(
+    *,
+    source_type: str,
+    effect_kind: str,
+    amount_delta: str,
+) -> str:
+    allowed = {
+        ("shift", "opening"): 1,
+        ("sale", "sale"): 1,
+        ("return", "return"): -1,
+        ("return", "return_cancel"): 1,
+    }
+    direction = allowed.get((source_type, effect_kind))
+    try:
+        amount = Decimal(amount_delta)
+    except (InvalidOperation, ValueError) as exc:
+        raise POSStoreConflictError(
+            "IDEMPOTENCY_CONFLICT",
+            "Cash event amount is invalid",
+        ) from exc
+    if not amount.is_finite() or direction is None or amount * direction < 0:
+        raise POSStoreConflictError(
+            "IDEMPOTENCY_CONFLICT",
+            "Cash event shape is invalid",
+        )
+    return _format_money(amount)

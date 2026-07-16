@@ -30,11 +30,12 @@ Startup и PostgreSQL acceptance обязаны доказать:
 
 ### Schema, RLS и pre-auth exception
 
-- Alembic revision точно равна package constant `20260716_02`;
+- Alembic revision точно равна package constant `20260716_03`;
 - table inventory точно равен утверждённым tenant + pre-auth tables;
 - любая extra table блокирует startup до review и новой versioned migration;
 - каждая tenant table имеет ровно одну ожидаемую permissive policy для `myretail_api`,
   `ENABLE RLS` и `FORCE RLS`;
+- immutable intent aliases и cash events доступны app role только для `SELECT/INSERT`;
 - unset tenant context не видит строки; tenant A не видит tenant B;
 - только `auth_rate_limit_buckets` и `auth_rate_limit_meta` являются pre-auth исключением
   без RLS;
@@ -46,11 +47,11 @@ Startup и PostgreSQL acceptance обязаны доказать:
 В disposable database CI выполняет:
 
 1. clean `upgrade head`;
-2. `current == 20260716_02 (head)`;
+2. `current == 20260716_03 (head)`;
 3. `downgrade base`;
 4. отсутствие active revision;
 5. повторный `upgrade head` и сверку current;
-6. проверку обеих migration внутри собранного wheel.
+6. проверку всех package-owned migrations внутри собранного wheel.
 
 API startup никогда не запускает migration и fail closed работает на empty/unmigrated или
 revision-mismatched database.

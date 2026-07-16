@@ -4,9 +4,9 @@ import asyncio
 import json
 from collections.abc import Mapping
 from datetime import UTC, date, datetime, time, timedelta
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from functools import partial
-from typing import Any, TypeAlias
+from typing import Any, TypeAlias, cast
 from uuid import UUID, uuid4
 
 from sqlalchemy import text
@@ -24,7 +24,14 @@ from myretail_api.state.pos_coordination import (
     PostgresPOSCoordinationRepository,
     SQLitePOSCoordinationRepository,
 )
-from myretail_api.state.protocols import FencedLease, WorkflowIntent
+from myretail_api.state.protocols import (
+    CashEventEffectKind,
+    CashEventSourceType,
+    FencedLease,
+    POSCashEvent,
+    POSCashEventAppendResult,
+    WorkflowIntent,
+)
 
 SQLITE_POS_REPOSITORY_WORKER_LIMIT = 4
 
@@ -152,6 +159,44 @@ class SQLitePOSRepository:
             fencing_token,
             erpnext_invoice_id,
         )
+
+    async def append_cash_event(
+        self,
+        *,
+        event_id: UUID,
+        tenant_id: str,
+        shift_id: str,
+        source_type: CashEventSourceType,
+        source_id: str,
+        effect_kind: CashEventEffectKind,
+        amount_delta: str,
+        created_at: datetime,
+    ) -> POSCashEventAppendResult:
+        created, row = await self._run(
+            self._store.append_cash_event,
+            event_id=str(event_id),
+            tenant=tenant_id,
+            shift_id=shift_id,
+            source_type=source_type,
+            source_id=source_id,
+            effect_kind=effect_kind,
+            amount_delta=amount_delta,
+            created_at=_iso(created_at),
+        )
+        return POSCashEventAppendResult(created=created, event=_cash_event(row))
+
+    async def list_cash_events(
+        self,
+        *,
+        tenant_id: str,
+        shift_id: str,
+    ) -> list[POSCashEvent]:
+        rows = await self._run(
+            self._store.list_cash_events,
+            tenant=tenant_id,
+            shift_id=shift_id,
+        )
+        return [_cash_event(row) for row in rows]
 
     async def _run(self, method: Any, *args: object, **kwargs: object) -> Any:
         async with self._capacity:
@@ -334,6 +379,44 @@ class PostgresPOSRepository:
             tenant_id=tenant,
             operation=operation,
             principal_key=user_email,
+            business_hash=business_hash,
+        )
+        return _legacy_intent(intent) if intent is not None else None
+
+    async def attach_operation_intent_alias(
+        self,
+        *,
+        tenant: str,
+        operation: str,
+        user_email: str,
+        key: str,
+        intent_id: str,
+        business_hash: str,
+    ) -> dict[str, Any]:
+        intent = await self.coordination_repository.attach_alias(
+            tenant_id=tenant,
+            operation=operation,
+            principal_key=user_email,
+            idempotency_key=key,
+            intent_id=intent_id,
+            business_hash=business_hash,
+        )
+        return _legacy_intent(intent)
+
+    async def find_operation_intent_by_alias(
+        self,
+        *,
+        tenant: str,
+        operation: str,
+        user_email: str,
+        key: str,
+        business_hash: str,
+    ) -> dict[str, Any] | None:
+        intent = await self.coordination_repository.find_by_alias(
+            tenant_id=tenant,
+            operation=operation,
+            principal_key=user_email,
+            idempotency_key=key,
             business_hash=business_hash,
         )
         return _legacy_intent(intent) if intent is not None else None
@@ -987,6 +1070,135 @@ class PostgresPOSRepository:
                 .one()
             )
         return _legacy_sale(projected)
+
+    async def append_cash_event(
+        self,
+        *,
+        event_id: UUID,
+        tenant_id: str,
+        shift_id: str,
+        source_type: CashEventSourceType,
+        source_id: str,
+        effect_kind: CashEventEffectKind,
+        amount_delta: str,
+        created_at: datetime,
+    ) -> POSCashEventAppendResult:
+        normalized_amount = _cash_event_amount(
+            source_type=source_type,
+            effect_kind=effect_kind,
+            amount_delta=amount_delta,
+        )
+        expected = POSCashEvent(
+            event_id=event_id,
+            tenant_id=tenant_id,
+            shift_id=shift_id,
+            source_type=source_type,
+            source_id=source_id,
+            effect_kind=effect_kind,
+            amount_delta=normalized_amount,
+            created_at=_datetime(created_at),
+        )
+        try:
+            async with self._engine.begin() as connection:
+                await _set_tenant(connection, tenant_id)
+                shift_exists = (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT 1 FROM myretail_state.pos_shifts
+                            WHERE tenant_id = :tenant_id AND shift_id = :shift_id
+                            """
+                        ),
+                        {"tenant_id": tenant_id, "shift_id": shift_id},
+                    )
+                ).scalar_one_or_none()
+                if shift_exists is None:
+                    raise POSStoreConflictError("SHIFT_NOT_FOUND", "Shift not found")
+                inserted = (
+                    await connection.execute(
+                        text(
+                            """
+                            INSERT INTO myretail_state.pos_shift_cash_events (
+                                tenant_id, event_id, shift_id, source_type,
+                                source_id, effect_kind, amount_delta, created_at
+                            ) VALUES (
+                                :tenant_id, CAST(:event_id AS uuid), :shift_id,
+                                :source_type, :source_id, :effect_kind,
+                                :amount_delta, CAST(:created_at AS timestamptz)
+                            )
+                            ON CONFLICT (
+                                tenant_id, source_type, source_id, effect_kind
+                            ) DO NOTHING
+                            RETURNING *
+                            """
+                        ),
+                        {
+                            "tenant_id": tenant_id,
+                            "event_id": str(event_id),
+                            "shift_id": shift_id,
+                            "source_type": source_type,
+                            "source_id": source_id,
+                            "effect_kind": effect_kind,
+                            "amount_delta": normalized_amount,
+                            "created_at": _datetime(created_at),
+                        },
+                    )
+                ).mappings().one_or_none()
+                row = inserted
+                if row is None:
+                    row = (
+                        (
+                            await connection.execute(
+                                text(
+                                    """
+                                    SELECT *
+                                    FROM myretail_state.pos_shift_cash_events
+                                    WHERE tenant_id = :tenant_id
+                                      AND source_type = :source_type
+                                      AND source_id = :source_id
+                                      AND effect_kind = :effect_kind
+                                    """
+                                ),
+                                {
+                                    "tenant_id": tenant_id,
+                                    "source_type": source_type,
+                                    "source_id": source_id,
+                                    "effect_kind": effect_kind,
+                                },
+                            )
+                        )
+                        .mappings()
+                        .one()
+                    )
+                persisted = _cash_event(row)
+                if persisted != expected:
+                    raise POSStoreConflictError(
+                        "IDEMPOTENCY_CONFLICT",
+                        "Cash event identity is already bound to another effect",
+                    )
+        except IntegrityError as exc:
+            raise POSStoreConflictError(
+                "IDEMPOTENCY_CONFLICT",
+                "Cash event identity is already bound to another effect",
+            ) from exc
+        return POSCashEventAppendResult(created=inserted is not None, event=persisted)
+
+    async def list_cash_events(
+        self,
+        *,
+        tenant_id: str,
+        shift_id: str,
+    ) -> list[POSCashEvent]:
+        rows = await self._all(
+            tenant_id,
+            """
+            SELECT * FROM myretail_state.pos_shift_cash_events
+            WHERE tenant_id = :tenant_id AND shift_id = :shift_id
+            ORDER BY created_at, event_id
+            """,
+            {"tenant_id": tenant_id, "shift_id": shift_id},
+        )
+        return [_cash_event(row) for row in rows]
 
     async def get_sale(self, tenant: str, sale_id: str) -> dict[str, Any] | None:
         row = await self._one(
@@ -1711,6 +1923,19 @@ def _legacy_intent(intent: WorkflowIntent) -> dict[str, Any]:
     }
 
 
+def _cash_event(row: Mapping[str, Any]) -> POSCashEvent:
+    return POSCashEvent(
+        event_id=UUID(str(row["event_id"])),
+        tenant_id=str(row.get("tenant_id", row.get("tenant"))),
+        shift_id=str(row["shift_id"]),
+        source_type=cast(CashEventSourceType, str(row["source_type"])),
+        source_id=str(row["source_id"]),
+        effect_kind=cast(CashEventEffectKind, str(row["effect_kind"])),
+        amount_delta=_money(row["amount_delta"]),
+        created_at=_datetime(row["created_at"]),
+    )
+
+
 def _legacy_shift(row: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "id": str(row["shift_id"]),
@@ -1823,6 +2048,34 @@ def _json(value: object) -> str:
 
 def _money(value: object) -> str:
     return f"{Decimal(str(value)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):.2f}"
+
+
+def _cash_event_amount(
+    *,
+    source_type: CashEventSourceType,
+    effect_kind: CashEventEffectKind,
+    amount_delta: str,
+) -> str:
+    allowed = {
+        ("shift", "opening"): 1,
+        ("sale", "sale"): 1,
+        ("return", "return"): -1,
+        ("return", "return_cancel"): 1,
+    }
+    direction = allowed.get((source_type, effect_kind))
+    try:
+        amount = Decimal(amount_delta)
+    except (InvalidOperation, ValueError) as exc:
+        raise POSStoreConflictError(
+            "IDEMPOTENCY_CONFLICT",
+            "Cash event amount is invalid",
+        ) from exc
+    if not amount.is_finite() or direction is None or amount * direction < 0:
+        raise POSStoreConflictError(
+            "IDEMPOTENCY_CONFLICT",
+            "Cash event shape is invalid",
+        )
+    return _money(amount)
 
 
 def _quantity(value: Decimal) -> str:

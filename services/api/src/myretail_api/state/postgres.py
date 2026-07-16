@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_en
 
 from myretail_api.config import InvalidStateFoundationSettingsError, Settings
 from myretail_api.state.schema import (
+    APPEND_ONLY_TENANT_STATE_TABLES,
     EXPECTED_STATE_SCHEMA_REVISION,
     PREAUTH_STATE_TABLES,
     STATE_APP_ROLE,
@@ -334,11 +335,12 @@ async def _verify_tenant_table_grants(connection: AsyncConnection) -> None:
     if set(grants) != set(TENANT_STATE_TABLES):
         raise StateStartupError("PostgreSQL state tenant table grants are invalid")
     for grant in grants.values():
+        append_only = grant["relname"] in APPEND_ONLY_TENANT_STATE_TABLES
         if (
-            not all(
-                grant[name]
-                for name in ("can_select", "can_insert", "can_update", "can_delete")
-            )
+            not grant["can_select"]
+            or not grant["can_insert"]
+            or bool(grant["can_update"]) != (not append_only)
+            or bool(grant["can_delete"]) != (not append_only)
             or grant["has_extra_privileges"]
         ):
             raise StateStartupError("PostgreSQL state tenant table grants are invalid")

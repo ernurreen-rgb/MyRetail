@@ -15,6 +15,7 @@ from myretail_api.config import Settings
 from myretail_api.main import create_app
 from myretail_api.state.postgres import PostgresStateRuntime, StateStartupError
 from myretail_api.state.schema import (
+    APPEND_ONLY_TENANT_STATE_TABLES,
     EXPECTED_STATE_SCHEMA_REVISION,
     PREAUTH_STATE_TABLES,
     STATE_APP_ROLE,
@@ -223,6 +224,36 @@ async def test_roles_ownership_rls_and_revision_match_contract() -> None:
         )
         assert {str(row["relname"]) for row in tenant_rls} == set(TENANT_STATE_TABLES)
         assert all(row["relrowsecurity"] and row["relforcerowsecurity"] for row in tenant_rls)
+
+        for table_name in APPEND_ONLY_TENANT_STATE_TABLES:
+            privileges = {
+                privilege: bool(
+                    await connection.fetchval(
+                        "SELECT has_table_privilege($1, $2, $3)",
+                        STATE_APP_ROLE,
+                        f"{STATE_SCHEMA}.{table_name}",
+                        privilege,
+                    )
+                )
+                for privilege in (
+                    "SELECT",
+                    "INSERT",
+                    "UPDATE",
+                    "DELETE",
+                    "TRUNCATE",
+                    "REFERENCES",
+                    "TRIGGER",
+                )
+            }
+            assert privileges == {
+                "SELECT": True,
+                "INSERT": True,
+                "UPDATE": False,
+                "DELETE": False,
+                "TRUNCATE": False,
+                "REFERENCES": False,
+                "TRIGGER": False,
+            }
 
         preauth_rls = await connection.fetch(
             """
@@ -470,6 +501,23 @@ async def test_startup_fails_closed_on_elevated_tenant_table_grant() -> None:
         async with admin_connection() as connection:
             await connection.execute(
                 f"REVOKE TRUNCATE ON {STATE_SCHEMA}.pos_sales FROM {STATE_APP_ROLE}"
+            )
+
+
+@pytest.mark.anyio
+async def test_startup_fails_closed_on_mutable_append_only_table_grant() -> None:
+    table_name = APPEND_ONLY_TENANT_STATE_TABLES[0]
+    async with admin_connection() as connection:
+        await connection.execute(
+            f"GRANT UPDATE ON {STATE_SCHEMA}.{table_name} TO {STATE_APP_ROLE}"
+        )
+    try:
+        with pytest.raises(StateStartupError, match="tenant table grants"):
+            await PostgresStateRuntime.start(postgres_settings())
+    finally:
+        async with admin_connection() as connection:
+            await connection.execute(
+                f"REVOKE UPDATE ON {STATE_SCHEMA}.{table_name} FROM {STATE_APP_ROLE}"
             )
 
 
