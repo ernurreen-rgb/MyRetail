@@ -68,3 +68,13 @@ Tenant context задаётся только transaction-local через `set_c
 
 CI использует disposable PostgreSQL container с host `trust` только внутри изолированного runner;
 это не production authentication model.
+
+## Phase 6A.6 acceptance
+
+Текущий package-owned head — `20260716_02`. Startup дополнительно проверяет отсутствие
+role memberships у `myretail_api`, точный owner schema/tables, точный table inventory и
+отсутствие elevated table grants. CI выполняет полный `upgrade → downgrade base → upgrade`
+round-trip и автоматическую сверку утверждённого OpenAPI fingerprint.
+
+Полная матрица evidence и граница Phase 6B описаны в
+`docs/security/postgresql-foundation-acceptance.md`. Production остаётся fail closed.

@@ -87,6 +87,8 @@ jobs:
       - name: Scan Python code
         run: python -m bandit -r services/api/src services/api/scripts
       - run: python -m ruff check services/api
+      - name: Verify approved OpenAPI contract fingerprint
+        run: python -m pytest services/api/tests/test_openapi_contract.py
       - run: python -m pytest services/api/tests
 
   postgresql-foundation:
@@ -134,6 +136,10 @@ jobs:
         env:
           MYRETAIL_STATE_MIGRATION_DATABASE_URL: postgresql+asyncpg://myretail_state_migrator@127.0.0.1:5432/myretail_state_test
         run: |
+          myretail-state-migrate upgrade head
+          test "$(myretail-state-migrate current)" = "20260716_02 (head)"
+          myretail-state-migrate downgrade base
+          test -z "$(myretail-state-migrate current)"
           myretail-state-migrate upgrade head
           test "$(myretail-state-migrate current)" = "20260716_02 (head)"
       - name: Verify migrations ship inside the wheel
