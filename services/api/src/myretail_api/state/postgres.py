@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import ssl
-from pathlib import Path
 from uuid import uuid4
 
 from sqlalchemy import text
@@ -16,6 +14,11 @@ from myretail_api.state.schema import (
     STATE_OWNER_ROLE,
     STATE_SCHEMA,
     TENANT_STATE_TABLES,
+)
+from myretail_api.state.tls import (
+    PostgresSSLArgument,
+    PostgresTLSSettingsError,
+    build_postgres_ssl_argument,
 )
 
 
@@ -94,27 +97,14 @@ def create_postgres_state_engine(settings: Settings) -> AsyncEngine:
     )
 
 
-def _ssl_argument(settings: Settings) -> bool | ssl.SSLContext:
-    mode = settings.state_postgres_ssl_mode
-    if mode == "disable":
-        return False
-
-    root_cert = settings.state_postgres_ssl_root_cert_path
-    if root_cert is not None and not root_cert.is_file():
-        raise InvalidStateFoundationSettingsError(
-            "PostgreSQL state TLS root certificate file is unavailable"
+def _ssl_argument(settings: Settings) -> PostgresSSLArgument:
+    try:
+        return build_postgres_ssl_argument(
+            settings.state_postgres_ssl_mode,
+            settings.state_postgres_ssl_root_cert_path,
         )
-    context = ssl.create_default_context(cafile=_cert_path(root_cert))
-    if mode == "require":
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
-    elif mode == "verify-ca":
-        context.check_hostname = False
-    return context
-
-
-def _cert_path(path: Path | None) -> str | None:
-    return str(path) if path is not None else None
+    except PostgresTLSSettingsError as exc:
+        raise InvalidStateFoundationSettingsError(str(exc)) from None
 
 
 async def _verify_connection_contract(connection: AsyncConnection) -> None:

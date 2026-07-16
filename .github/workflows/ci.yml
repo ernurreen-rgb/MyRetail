@@ -134,7 +134,9 @@ jobs:
           < services/api/tests/postgresql/bootstrap_roles.sql
       - name: Apply package-owned migration and verify current head
         env:
+          MYRETAIL_ENVIRONMENT: test
           MYRETAIL_STATE_MIGRATION_DATABASE_URL: postgresql+asyncpg://myretail_state_migrator@127.0.0.1:5432/myretail_state_test
+          MYRETAIL_STATE_MIGRATION_SSL_MODE: disable
         run: |
           myretail-state-migrate upgrade head
           test "$(myretail-state-migrate current)" = "20260716_02 (head)"
@@ -142,6 +144,14 @@ jobs:
           test -z "$(myretail-state-migrate current)"
           myretail-state-migrate upgrade head
           test "$(myretail-state-migrate current)" = "20260716_02 (head)"
+      - name: Run packaged PostgreSQL state preflight
+        env:
+          MYRETAIL_ENVIRONMENT: test
+          MYRETAIL_STATE_BACKEND: postgresql
+          MYRETAIL_STATE_DATABASE_URL: postgresql+asyncpg://myretail_api@127.0.0.1:5432/myretail_state_test
+          MYRETAIL_STATE_POSTGRES_SSL_MODE: disable
+          MYRETAIL_AUTH_RATE_LIMIT_SECRET: ci-only-rate-limit-secret-at-least-32-bytes
+        run: myretail-state-preflight
       - name: Verify migrations ship inside the wheel
         run: |
           python -m pip wheel --no-deps --no-build-isolation services/api --wheel-dir dist
@@ -154,13 +164,28 @@ jobs:
               files = set(archive.namelist())
           required = {
               "myretail_api/migrations/env.py",
+              "myretail_api/migrations/settings.py",
               "myretail_api/migrations/script.py.mako",
               "myretail_api/migrations/versions/v20260716_01_state_foundation.py",
               "myretail_api/migrations/versions/v20260716_02_auth_rate_limit_grants.py",
+              "myretail_api/state/preflight.py",
+              "myretail_api/state/tls.py",
           }
           missing = required - files
           if missing:
-              raise SystemExit(f"Migration artifact is incomplete: {sorted(missing)}")
+              raise SystemExit(f"API wheel artifact is incomplete: {sorted(missing)}")
+          entrypoint_files = [
+              name for name in files if name.endswith(".dist-info/entry_points.txt")
+          ]
+          if len(entrypoint_files) != 1:
+              raise SystemExit("API wheel entrypoint metadata is invalid")
+          with ZipFile(wheel) as archive:
+              entrypoints = archive.read(entrypoint_files[0]).decode("utf-8")
+          expected_entrypoint = (
+              "myretail-state-preflight = myretail_api.state.preflight:main"
+          )
+          if expected_entrypoint not in entrypoints:
+              raise SystemExit("Preflight entrypoint is missing from the API wheel")
           PY
       - name: Run PostgreSQL foundation acceptance
         env:
