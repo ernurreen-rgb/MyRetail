@@ -36,6 +36,7 @@ export const BFF_NO_STORE_HEADERS = [
 
 const nextConfig: NextConfig = {
   allowedDevOrigins: ["127.0.0.1"],
+  output: "standalone",
   async headers() {
     return [
       {

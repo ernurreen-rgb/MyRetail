@@ -1,0 +1,39 @@
+\set ON_ERROR_STOP on
+\getenv app_password MYRETAIL_STATE_APP_PASSWORD
+\getenv migration_password MYRETAIL_STATE_MIGRATION_PASSWORD
+
+BEGIN;
+
+SELECT 'CREATE ROLE myretail_state_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS'
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'myretail_state_owner')
+\gexec
+
+SELECT 'CREATE ROLE myretail_state_migrator LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS'
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'myretail_state_migrator')
+\gexec
+
+SELECT 'CREATE ROLE myretail_api LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS'
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'myretail_api')
+\gexec
+
+ALTER ROLE myretail_state_owner
+  WITH NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
+ALTER ROLE myretail_state_migrator
+  WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
+ALTER ROLE myretail_api
+  WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
+
+SELECT format('ALTER ROLE myretail_state_migrator PASSWORD %L', :'migration_password')
+\gexec
+SELECT format('ALTER ROLE myretail_api PASSWORD %L', :'app_password')
+\gexec
+
+GRANT myretail_state_owner TO myretail_state_migrator;
+REVOKE ALL ON DATABASE myretail_state FROM PUBLIC;
+GRANT CONNECT ON DATABASE myretail_state TO myretail_state_owner;
+GRANT CONNECT ON DATABASE myretail_state TO myretail_state_migrator;
+GRANT CONNECT ON DATABASE myretail_state TO myretail_api;
+GRANT CREATE ON DATABASE myretail_state TO myretail_state_owner;
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+
+COMMIT;

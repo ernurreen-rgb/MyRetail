@@ -54,6 +54,54 @@ jobs:
       - run: npm run test
       - run: npm run build
 
+  infrastructure:
+    runs-on: ubuntu-latest
+    env:
+      TERRAFORM_VERSION: 1.15.8
+      TERRAFORM_LINUX_AMD64_SHA256: d25ce7b6902013ad905db3d2eab0be4cd905887fe88b81a6171b8d5503c31f3d
+      ACTIONLINT_VERSION: 1.7.9
+      ACTIONLINT_LINUX_AMD64_SHA256: 233b280d05e100837f4af1433c7b40a5dcb306e3aa68fb4f17f8a7f45a7df7b4
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install checksum-pinned Terraform
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
+          archive_path="${RUNNER_TEMP}/${archive}"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/${archive}" \
+            --output "${archive_path}"
+          printf '%s  %s\n' "${TERRAFORM_LINUX_AMD64_SHA256}" "${archive_path}" \
+            | sha256sum --check --strict
+          unzip -q "${archive_path}" -d "${RUNNER_TEMP}/terraform"
+          echo "${RUNNER_TEMP}/terraform" >> "${GITHUB_PATH}"
+      - name: Validate Terraform formatting and provider schemas
+        shell: bash
+        run: |
+          set -euo pipefail
+          terraform fmt -recursive -check infra/aws
+          for root in infra/aws/bootstrap infra/aws/production; do
+            terraform -chdir="${root}" init -backend=false -input=false -lockfile=readonly
+            terraform -chdir="${root}" validate -no-color
+          done
+          terraform -chdir=infra/aws/production test -no-color
+      - name: Validate GitHub Actions workflows
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          archive_path="${RUNNER_TEMP}/${archive}"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${archive}" \
+            --output "${archive_path}"
+          printf '%s  %s\n' "${ACTIONLINT_LINUX_AMD64_SHA256}" "${archive_path}" \
+            | sha256sum --check --strict
+          tar --extract --gzip --file "${archive_path}" --directory "${RUNNER_TEMP}" actionlint
+          "${RUNNER_TEMP}/actionlint" .github/workflows/*.yml
+      - name: Validate database bootstrap shell
+        run: shellcheck infra/aws/database-bootstrap/bootstrap.sh
+
   api:
     runs-on: ubuntu-latest
     steps:
@@ -176,6 +224,7 @@ jobs:
               "myretail_api/migrations/versions/v20260716_03_return_integrity_foundation.py",
               "myretail_api/migrations/versions/v20260716_04_return_cash_backfill.py",
               "myretail_api/migrations/versions/v20260716_05_session_revocation.py",
+              "myretail_api/state/monitor.py",
               "myretail_api/state/preflight.py",
               "myretail_api/state/tls.py",
           }
@@ -194,6 +243,11 @@ jobs:
           )
           if expected_entrypoint not in entrypoints:
               raise SystemExit("Preflight entrypoint is missing from the API wheel")
+          expected_monitor_entrypoint = (
+              "myretail-state-monitor = myretail_api.state.monitor:main"
+          )
+          if expected_monitor_entrypoint not in entrypoints:
+              raise SystemExit("Monitor entrypoint is missing from the API wheel")
           PY
       - name: Run PostgreSQL foundation acceptance
         env:
@@ -214,7 +268,7 @@ jobs:
 
   production-artifact:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -224,3 +278,35 @@ jobs:
         run: >-
           python services/api/scripts/production_state_drill.py
           --prefix myretail-phase6b2-ci-${{ github.run_id }}
+      - name: Build and smoke-test standalone web image
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="myretail-web-ci:${GITHUB_RUN_ID}"
+          container="myretail-web-ci-${GITHUB_RUN_ID}"
+          docker build --file apps/web/Dockerfile --tag "${image}" .
+          trap 'docker rm --force "${container}" >/dev/null 2>&1 || true' EXIT
+          docker run --detach --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+            --name "${container}" \
+            --publish 127.0.0.1::3000 \
+            --env MYRETAIL_API_URL=http://127.0.0.1:8000 \
+            --env MYRETAIL_WEB_ORIGIN=https://myretail.example.com \
+            "${image}"
+          port="$(docker port "${container}" 3000/tcp | awk -F: '{print $NF}')"
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error "http://127.0.0.1:${port}/api/health"; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs "${container}"
+          exit 1
+      - name: Build database role-bootstrap image
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="myretail-database-bootstrap-ci:${GITHUB_RUN_ID}"
+          docker build --file infra/aws/database-bootstrap/Dockerfile --tag "${image}" .
+          test "$(docker image inspect --format '{{.Config.User}}' "${image}")" = "999:999"
+          test "$(docker image inspect --format '{{json .Config.Entrypoint}}' "${image}")" \
+            = '["myretail-database-bootstrap"]'

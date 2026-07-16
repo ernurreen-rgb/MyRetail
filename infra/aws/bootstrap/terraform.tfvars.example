@@ -1,0 +1,4 @@
+aws_region        = "eu-central-1"
+state_bucket_name = "replace-with-a-globally-unique-myretail-production-state-bucket"
+github_repository = "ernurreen-rgb/MyRetail"
+github_environment = "production"

@@ -79,6 +79,7 @@ class Settings(BaseSettings):
     state_pool_acquire_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
     state_statement_timeout_ms: int = Field(default=5_000, ge=100, le=120_000)
     state_lock_timeout_ms: int = Field(default=2_000, ge=100, le=60_000)
+    state_recovery_max_age_seconds: int = Field(default=900, ge=60, le=86_400)
     state_postgres_ssl_mode: Literal[
         "disable", "require", "verify-ca", "verify-full"
     ] = "require"

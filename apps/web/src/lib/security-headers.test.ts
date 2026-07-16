@@ -6,6 +6,10 @@ import nextConfig, {
 } from "../../next.config";
 
 describe("web response security headers", () => {
+  it("emits a minimal standalone production server artifact", () => {
+    expect(nextConfig.output).toBe("standalone");
+  });
+
   it("applies browser hardening globally and no-store to BFF routes", async () => {
     expect(nextConfig.headers).toBeTypeOf("function");
 

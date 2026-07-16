@@ -29,5 +29,18 @@ build/
 *.log
 services/api/.data/
 
+# Terraform local state, caches and private inputs
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+*.tfplan
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
 # Codex working files
 tmp/

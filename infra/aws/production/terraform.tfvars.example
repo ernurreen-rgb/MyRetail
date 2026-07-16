@@ -1,0 +1,28 @@
+aws_region        = "eu-central-1"
+availability_zones = ["eu-central-1a", "eu-central-1b", "eu-central-1c"]
+
+tenant_id            = "00000000-0000-4000-8000-000000000001"
+tenant_slug          = "replace-with-tenant-slug"
+tenant_route_version = 1
+
+web_domain_name = "app.example.com"
+route53_zone_id = "ZREPLACE"
+certificate_arn = "arn:aws:acm:eu-central-1:111122223333:certificate/00000000-0000-4000-8000-000000000001"
+
+erpnext_base_url = "https://erp.example.com"
+erpnext_company  = "Replace with dedicated company"
+erpnext_api_user = "myretail-api@example.com"
+erpnext_pos_user = "myretail-pos@example.com"
+
+api_image                = "111122223333.dkr.ecr.eu-central-1.amazonaws.com/myretail-production/api@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+database_bootstrap_image = "111122223333.dkr.ecr.eu-central-1.amazonaws.com/myretail-production/database-bootstrap@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+migration_image          = "111122223333.dkr.ecr.eu-central-1.amazonaws.com/myretail-production/migration@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+web_image                = "111122223333.dkr.ecr.eu-central-1.amazonaws.com/myretail-production/web@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+
+alarm_email = null
+
+# Enable only after runtime secrets exist and migration/preflight pass.
+monitoring_enabled = false
+
+# Keep false until migration, restore drill, alarm delivery, rotation and smoke evidence pass.
+traffic_enabled = false

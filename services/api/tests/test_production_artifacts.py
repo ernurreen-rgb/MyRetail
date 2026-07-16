@@ -37,6 +37,14 @@ def test_docker_build_context_is_an_explicit_secret_safe_allowlist() -> None:
     assert lines == {
         "**",
         "!.dockerignore",
+        "!package.json",
+        "!package-lock.json",
+        "!apps/",
+        "!apps/web/",
+        "!apps/web/**",
+        "apps/web/.next/",
+        "apps/web/node_modules/",
+        "apps/web/tsconfig.tsbuildinfo",
         "!services/",
         "!services/api/",
         "!services/api/Dockerfile",
@@ -48,6 +56,10 @@ def test_docker_build_context_is_an_explicit_secret_safe_allowlist() -> None:
         "!services/api/src/**",
         "services/api/src/**/__pycache__/",
         "services/api/src/**/*.py[cod]",
+        "!infra/",
+        "!infra/aws/",
+        "!infra/aws/database-bootstrap/",
+        "!infra/aws/database-bootstrap/**",
         "**/.env",
         "**/.env.*",
         "**/cookies.json",
@@ -83,6 +95,11 @@ def test_dockerfile_pins_build_frontend_and_base_and_separates_targets() -> None
     assert "--require-hashes -r /tmp/requirements.lock" in dockerfile
     assert "--require-hashes -r /tmp/requirements-migrations.lock" in dockerfile
     assert "--no-proxy-headers" in dockerfile
+    assert (
+        "--checksum=sha256:"
+        "e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3"
+        in dockerfile
+    )
     assert dockerfile.count(
         "editables hatchling pathspec pluggy trove-classifiers wheel setuptools pip"
     ) == 2
