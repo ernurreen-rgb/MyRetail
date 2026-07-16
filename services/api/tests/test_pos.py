@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -334,14 +335,26 @@ class BlockingCommittedSaleERPNextClient(StubPOSErpnextClient):
 class BlockingCommittedCloseERPNextClient(StubPOSErpnextClient):
     def __init__(self) -> None:
         super().__init__()
+        self.close_calls: list[dict[str, object]] = []
+        self.created_key: str | None = None
         self.closing_created = asyncio.Event()
         self.release_response = asyncio.Event()
 
     async def create_pos_closing(self, **kwargs: object) -> str:
+        self.close_calls.append(dict(kwargs))
         closing = await super().create_pos_closing(**kwargs)
+        self.created_key = str(kwargs["idempotency_key"])
         self.closing_created.set()
         await self.release_response.wait()
         return closing
+
+    async def recover_pos_closing(
+        self, tenant: str, operation: str, user_email: str, idempotency_key: str
+    ) -> str | None:
+        _ = tenant, operation, user_email
+        if self.closings and idempotency_key == self.created_key:
+            return self.closings[-1]
+        return None
 
 
 class RecoveringSaleERPNextClient(StubPOSErpnextClient):
@@ -1155,6 +1168,107 @@ async def test_lost_closing_response_retry_materializes_local_shift(tmp_path: Pa
             (shift["id"],),
         ).fetchone()[0]
     assert closing_id == "CLOSE-1"
+
+
+@pytest.mark.anyio
+async def test_committed_close_recovers_from_projection_drift_with_frozen_snapshot(
+    tmp_path: Path,
+) -> None:
+    erpnext = BlockingCommittedCloseERPNextClient()
+    app = make_app(erpnext, tmp_path)
+    key = str(uuid4())
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        shift = await open_shift(client, tmp_path)
+        await create_sale(client, tmp_path, shift_id=str(shift["id"]))
+        current = await client.get(
+            "/pos/shifts/current?register_id=POS-1",
+            headers=auth_headers(tmp_path),
+        )
+        body = {
+            "actual_cash": "10000.00",
+            "expected_updated_at": current.json()["updated_at"],
+        }
+        close_task = asyncio.create_task(
+            client.post(
+                f"/pos/shifts/{shift['id']}/close",
+                headers=auth_headers(tmp_path, key=key),
+                json=body,
+            )
+        )
+        await asyncio.wait_for(erpnext.closing_created.wait(), timeout=2)
+        with sqlite3.connect(tmp_path / "pos.sqlite3") as connection:
+            payload_json = connection.execute(
+                "SELECT payload_json FROM pos_operation_intents WHERE operation = 'close_shift'"
+            ).fetchone()[0]
+            connection.execute(
+                "UPDATE pos_shifts SET sales_total = '999.00' WHERE id = ?",
+                (shift["id"],),
+            )
+            connection.commit()
+        erpnext.release_response.set()
+        first = await asyncio.wait_for(close_task, timeout=2)
+
+        with sqlite3.connect(tmp_path / "pos.sqlite3") as connection:
+            pending = connection.execute(
+                "SELECT status FROM pos_shifts WHERE id = ?", (shift["id"],)
+            ).fetchone()[0]
+            intent_state = connection.execute(
+                "SELECT state FROM pos_operation_intents WHERE operation = 'close_shift'"
+            ).fetchone()[0]
+            connection.execute(
+                "UPDATE pos_shifts SET sales_total = '100.00' WHERE id = ?",
+                (shift["id"],),
+            )
+            connection.commit()
+        recovered = await client.post(
+            f"/pos/shifts/{shift['id']}/close",
+            headers=auth_headers(tmp_path, key=key),
+            json=body,
+        )
+
+    payload = json.loads(payload_json)
+    frozen_shift = erpnext.close_calls[0]["shift"]
+    assert isinstance(frozen_shift, Shift)
+    assert payload["cash_snapshot"] == {
+        "opening_cash": "10000.00",
+        "sales_total": "100.00",
+        "cash_returns_total": "0.00",
+        "expected_cash": "10100.00",
+    }
+    assert payload["shift_snapshot"]["expected_cash"] == "10100.00"
+    assert frozen_shift.sales_total == "100.00"
+    assert frozen_shift.expected_cash == "10100.00"
+    assert erpnext.close_calls[0]["difference"] == "-100.00"
+    assert first.status_code == 503
+    assert first.json()["error"]["code"] == "ERPNEXT_RECOVERY_PENDING"
+    assert pending == "open"
+    assert intent_state == "recovery_required"
+    assert recovered.status_code == 200
+    assert recovered.json()["status"] == "closed"
+    assert erpnext.closings == ["CLOSE-1"]
+    assert len(erpnext.close_calls) == 1
+    with sqlite3.connect(tmp_path / "pos.sqlite3") as connection:
+        final_shift = connection.execute(
+            "SELECT status, sales_total, cash_returns_total, expected_cash, "
+            "actual_cash, difference, erpnext_closing_id FROM pos_shifts WHERE id = ?",
+            (shift["id"],),
+        ).fetchone()
+        final_intent = connection.execute(
+            "SELECT state, erpnext_document_id, result_id FROM pos_operation_intents "
+            "WHERE operation = 'close_shift'"
+        ).fetchone()
+    assert final_shift == (
+        "closed",
+        "100.00",
+        "0.00",
+        "10100.00",
+        "10000.00",
+        "-100.00",
+        "CLOSE-1",
+    )
+    assert final_intent == ("completed", "CLOSE-1", shift["id"])
 
 
 @pytest.mark.anyio
@@ -2682,6 +2796,124 @@ async def test_two_api_instances_join_return_with_different_keys(tmp_path: Path)
     assert event_count == 1
     assert alias_count == 2
     assert intent_count == 1
+
+
+@pytest.mark.anyio
+async def test_return_and_close_race_blocks_close_before_erp_side_effect(
+    tmp_path: Path,
+) -> None:
+    erpnext = BlockingReturnERPNextClient()
+    return_app = make_app(erpnext, tmp_path)
+    close_app = make_app(erpnext, tmp_path)
+    async with (
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=return_app), base_url="http://return"
+        ) as return_client,
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=close_app), base_url="http://close"
+        ) as close_client,
+    ):
+        shift = await open_shift(return_client, tmp_path)
+        sale = await create_sale(return_client, tmp_path, shift_id=str(shift["id"]))
+        current = await return_client.get(
+            "/pos/shifts/current?register_id=POS-1",
+            headers=auth_headers(tmp_path),
+        )
+        return_task = asyncio.create_task(
+            return_client.post(
+                "/pos/returns",
+                headers=auth_headers(tmp_path, key=str(uuid4())),
+                json={
+                    "sale_id": sale["id"],
+                    "register_id": "POS-1",
+                    "shift_id": shift["id"],
+                    "refund_method": "cash",
+                    "reason": "damaged",
+                    "lines": [
+                        {
+                            "line_id": f"{sale['id']}:line:1",
+                            "quantity": "1.000",
+                        }
+                    ],
+                },
+            )
+        )
+        await asyncio.wait_for(erpnext.return_started.wait(), timeout=2)
+        close = await close_client.post(
+            f"/pos/shifts/{shift['id']}/close",
+            headers=auth_headers(tmp_path, key=str(uuid4())),
+            json={
+                "actual_cash": "10100.00",
+                "expected_updated_at": current.json()["updated_at"],
+            },
+        )
+        erpnext.release_return.set()
+        created_return = await asyncio.wait_for(return_task, timeout=2)
+
+    assert created_return.status_code == 201
+    assert close.status_code == 409
+    assert close.json()["error"]["code"] == "SHIFT_CHANGED"
+    assert erpnext.closings == []
+    assert len(erpnext.returns) == 1
+
+
+@pytest.mark.anyio
+async def test_close_and_return_race_blocks_return_before_erp_side_effect(
+    tmp_path: Path,
+) -> None:
+    erpnext = BlockingCommittedCloseERPNextClient()
+    close_app = make_app(erpnext, tmp_path)
+    return_app = make_app(erpnext, tmp_path)
+    async with (
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=close_app), base_url="http://close"
+        ) as close_client,
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=return_app), base_url="http://return"
+        ) as return_client,
+    ):
+        shift = await open_shift(close_client, tmp_path)
+        sale = await create_sale(close_client, tmp_path, shift_id=str(shift["id"]))
+        current = await close_client.get(
+            "/pos/shifts/current?register_id=POS-1",
+            headers=auth_headers(tmp_path),
+        )
+        close_task = asyncio.create_task(
+            close_client.post(
+                f"/pos/shifts/{shift['id']}/close",
+                headers=auth_headers(tmp_path, key=str(uuid4())),
+                json={
+                    "actual_cash": "10100.00",
+                    "expected_updated_at": current.json()["updated_at"],
+                },
+            )
+        )
+        await asyncio.wait_for(erpnext.closing_created.wait(), timeout=2)
+        created_return = await return_client.post(
+            "/pos/returns",
+            headers=auth_headers(tmp_path, key=str(uuid4())),
+            json={
+                "sale_id": sale["id"],
+                "register_id": "POS-1",
+                "shift_id": shift["id"],
+                "refund_method": "cash",
+                "reason": "damaged",
+                "lines": [
+                    {
+                        "line_id": f"{sale['id']}:line:1",
+                        "quantity": "1.000",
+                    }
+                ],
+            },
+        )
+        erpnext.release_response.set()
+        close = await asyncio.wait_for(close_task, timeout=2)
+
+    assert close.status_code == 200
+    assert created_return.status_code == 409
+    assert created_return.json()["error"]["code"] == "SHIFT_CHANGED"
+    assert erpnext.closings == ["CLOSE-1"]
+    assert erpnext.returns == []
 
 
 @pytest.mark.anyio

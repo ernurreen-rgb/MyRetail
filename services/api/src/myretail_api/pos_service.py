@@ -2,11 +2,12 @@ import asyncio
 import hashlib
 import json
 from datetime import UTC, date, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from fastapi.encoders import jsonable_encoder
+from pydantic import ValidationError
 
 from myretail_api.clients.erpnext import (
     ERPNextAmbiguousCreateError,
@@ -544,6 +545,18 @@ class POSService:
         difference = format_money(
             parse_money(request.actual_cash) - parse_money(shift.expected_cash)
         )
+        cash_returns_amount = (
+            parse_money(shift.opening_cash)
+            + parse_money(shift.sales_total)
+            - parse_money(shift.expected_cash)
+        )
+        if cash_returns_amount < 0:
+            raise POSApiError(
+                503,
+                "ERPNEXT_RECOVERY_PENDING",
+                "Кассовый snapshot смены требует проверки",
+            )
+        cash_returns_total = format_money(cash_returns_amount)
         expected_updated_at = shift.updated_at.astimezone(UTC).isoformat().replace("+00:00", "Z")
         closed_at = _now()
         claim = await self._begin_durable_intent(
@@ -563,24 +576,53 @@ class POSService:
                     "actual_cash": request.actual_cash,
                     "difference": difference,
                     "closed_at": closed_at,
-                }
+                },
+                "shift_snapshot": shift.model_dump(mode="json", by_alias=True),
+                "cash_snapshot": {
+                    "opening_cash": shift.opening_cash,
+                    "sales_total": shift.sales_total,
+                    "cash_returns_total": cash_returns_total,
+                    "expected_cash": shift.expected_cash,
+                },
             },
             expected_shift_updated_at=expected_updated_at,
             require_no_held_receipts=True,
         )
         if claim.recovery_only:
             return await self._recover_close_shift_intent(context, claim.intent)
-        intent_id = str(claim.intent["id"])
-        fencing_token = int(claim.intent["fencing_token"])
+        return await self._execute_close_shift_intent(context, claim.intent)
+
+    async def _execute_close_shift_intent(
+        self,
+        context: TenantContext,
+        intent: dict[str, Any],
+    ) -> Shift:
+        intent_id = str(intent["id"])
+        fencing_token = int(intent["fencing_token"])
+        try:
+            close_data, frozen_shift = _frozen_close_intent(intent)
+            if str(close_data.get("tenant")) != context.tenant:
+                raise POSApiError(
+                    503,
+                    "ERPNEXT_RECOVERY_PENDING",
+                    "Frozen close snapshot не принадлежит текущему tenant",
+                )
+        except POSApiError:
+            await self._mark_intent_recovery_required(
+                context.tenant,
+                intent_id,
+                fencing_token,
+            )
+            raise
         await self._mark_intent_erp_pending(context.tenant, intent_id, fencing_token)
         try:
             closing_id = await self._call_erp(
                 self._erpnext.create_pos_closing(
                     tenant=context.tenant,
-                    shift=shift,
-                    actual_cash=request.actual_cash,
-                    difference=difference,
-                    idempotency_key=str(claim.intent["external_key"]),
+                    shift=frozen_shift,
+                    actual_cash=str(close_data["actual_cash"]),
+                    difference=str(close_data["difference"]),
+                    idempotency_key=str(intent["external_key"]),
                 )
             )
         except ERPNextAmbiguousCreateError:
@@ -589,7 +631,10 @@ class POSService:
                 intent_id,
                 fencing_token,
             )
-            return await self._recover_close_shift_intent(context, claim.intent)
+            return await self._recover_close_shift_intent(
+                context,
+                {**intent, "state": "recovery_required"},
+            )
         except POSApiError:
             await self._store.fail_operation_intent(
                 context.tenant,
@@ -597,6 +642,20 @@ class POSService:
                 fencing_token,
             )
             raise
+        return await self._materialize_close_shift_intent(
+            context,
+            intent,
+            closing_id,
+        )
+
+    async def _materialize_close_shift_intent(
+        self,
+        context: TenantContext,
+        intent: dict[str, Any],
+        closing_id: str,
+    ) -> Shift:
+        intent_id = str(intent["id"])
+        fencing_token = int(intent["fencing_token"])
         try:
             row = await self._store.materialize_close_shift_intent(
                 context.tenant,
@@ -605,7 +664,17 @@ class POSService:
                 closing_id,
             )
         except POSStoreConflictError as exc:
-            raise POSApiError(409, exc.code, exc.message, exc.fields) from exc
+            await self._mark_intent_recovery_required(
+                context.tenant,
+                intent_id,
+                fencing_token,
+            )
+            raise POSApiError(
+                503,
+                "ERPNEXT_RECOVERY_PENDING",
+                "ERPNext Closing подтверждён, локальная смена ожидает recovery",
+                {"shift_id": str(_durable_intent_payload(intent)["close"]["shift_id"])},
+            ) from exc
         return self._to_shift(row)
 
     async def _create_held_once(
@@ -2153,14 +2222,14 @@ class POSService:
         payload = _durable_intent_payload(intent)
         close_data = dict(payload["close"])
         if intent["state"] == "materialized":
-            row = await self._store.get_shift(
-                context.tenant, str(intent["result_id"])
-            )
+            row = await self._store.get_shift(context.tenant, str(intent["result_id"]))
             if row is not None:
                 return self._to_shift(row)
             raise POSApiError(
                 503, "ERPNEXT_RECOVERY_PENDING", "Закрытая смена требует восстановления"
             )
+        if intent["state"] == "reserved":
+            return await self._execute_close_shift_intent(context, intent)
         closing_id = await self._call_erp(
             self._erpnext.recover_pos_closing(
                 context.tenant,
@@ -2179,13 +2248,11 @@ class POSService:
                 "ERPNEXT_RECOVERY_PENDING",
                 "Закрытие смены имеет неопределённый результат; выполняется recovery",
             )
-        try:
-            row = await self._store.materialize_close_shift_intent(
-                context.tenant, str(intent["id"]), fencing_token, closing_id
-            )
-        except POSStoreConflictError as exc:
-            raise POSApiError(409, exc.code, exc.message, exc.fields) from exc
-        return self._to_shift(row)
+        return await self._materialize_close_shift_intent(
+            context,
+            intent,
+            closing_id,
+        )
 
     async def _recover_sale(
         self, context: TenantContext, request: SaleCreateRequest, legacy_key: str
@@ -2503,7 +2570,6 @@ class POSService:
         )
 
 
-
 def _durable_intent_payload(intent: dict[str, Any]) -> dict[str, Any]:
     payload = json.loads(str(intent["payload_json"]))
     if not isinstance(payload, dict):
@@ -2511,6 +2577,61 @@ def _durable_intent_payload(intent: dict[str, Any]) -> dict[str, Any]:
             503, "ERPNEXT_RECOVERY_PENDING", "Durable operation payload is invalid"
         )
     return payload
+
+
+def _frozen_close_intent(intent: dict[str, Any]) -> tuple[dict[str, Any], Shift]:
+    payload = _durable_intent_payload(intent)
+    try:
+        close = dict(payload["close"])
+        cash = dict(payload["cash_snapshot"])
+        shift = Shift.model_validate(payload["shift_snapshot"])
+        opening_cash = format_money(parse_money(cash["opening_cash"]))
+        sales_total = format_money(parse_money(cash["sales_total"]))
+        cash_returns_total = format_money(parse_money(cash["cash_returns_total"]))
+        expected_cash = format_money(parse_money(cash["expected_cash"]))
+        actual_cash = format_money(parse_money(close["actual_cash"]))
+        raw_difference = close["difference"]
+        if not isinstance(raw_difference, str):
+            raise ValueError("Close difference must be a decimal string")
+        difference_value = Decimal(raw_difference)
+        if not difference_value.is_finite() or difference_value.as_tuple().exponent < -2:
+            raise ValueError("Close difference must have at most two decimal places")
+        difference = format_money(difference_value)
+        expected_updated_at = _parse_dt(str(close["expected_updated_at"]))
+        _parse_dt(str(close["closed_at"]))
+    except (InvalidOperation, KeyError, TypeError, ValueError, ValidationError) as exc:
+        raise POSApiError(
+            503,
+            "ERPNEXT_RECOVERY_PENDING",
+            "Frozen close snapshot отсутствует или повреждён",
+        ) from exc
+
+    derived_returns_total = format_money(
+        parse_money(opening_cash) + parse_money(sales_total) - parse_money(expected_cash)
+    )
+    derived_difference = format_money(parse_money(actual_cash) - parse_money(expected_cash))
+    if not (
+        shift.status == "open"
+        and shift.id == str(close.get("shift_id"))
+        and shift.cashier.email == str(close.get("cashier_email"))
+        and shift.updated_at.astimezone(UTC) == expected_updated_at.astimezone(UTC)
+        and shift.opening_cash == opening_cash
+        and shift.sales_total == sales_total
+        and shift.expected_cash == expected_cash
+        and shift.actual_cash is None
+        and shift.difference is None
+        and shift.closed_at is None
+        and cash_returns_total == derived_returns_total
+        and parse_money(cash_returns_total) >= 0
+        and difference == derived_difference
+    ):
+        raise POSApiError(
+            503,
+            "ERPNEXT_RECOVERY_PENDING",
+            "Frozen close snapshot не прошёл проверку целостности",
+            {"shift_id": str(close.get("shift_id") or "")},
+        )
+    return close, shift
 
 
 def _request_hash(operation: str, payload: dict[str, object]) -> str:

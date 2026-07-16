@@ -882,6 +882,7 @@ class PostgresPOSRepository:
             )
             if current is None:
                 raise POSStoreConflictError("SHIFT_NOT_FOUND", "Shift not found")
+            _assert_close_cash_snapshot(intent["payload"], close, current)
             if current["status"] == "open":
                 if _iso(current["updated_at"]) != str(close["expected_updated_at"]):
                     raise POSStoreConflictError("SHIFT_CHANGED", "Shift changed")
@@ -2876,6 +2877,80 @@ def _json(value: object) -> str:
 
 def _money(value: object) -> str:
     return f"{Decimal(str(value)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):.2f}"
+
+
+def _assert_close_cash_snapshot(
+    payload: object,
+    close: dict[str, Any],
+    current: Mapping[str, Any],
+) -> None:
+    payload_object = _object(payload)
+    raw_snapshot = payload_object.get("cash_snapshot")
+    if raw_snapshot is None:
+        # Compatibility for active close intents created before frozen snapshots.
+        return
+    if not isinstance(raw_snapshot, Mapping):
+        raise POSStoreConflictError("IDEMPOTENCY_CONFLICT", "Frozen close cash snapshot is invalid")
+    try:
+        snapshot = {
+            key: _strict_money(raw_snapshot[key])
+            for key in (
+                "opening_cash",
+                "sales_total",
+                "cash_returns_total",
+                "expected_cash",
+            )
+        }
+        actual_cash = _strict_money(close["actual_cash"])
+        difference = _strict_money(close["difference"], allow_negative=True)
+        derived_expected = _money(
+            Decimal(snapshot["opening_cash"])
+            + Decimal(snapshot["sales_total"])
+            - Decimal(snapshot["cash_returns_total"])
+        )
+        derived_difference = _money(Decimal(actual_cash) - Decimal(snapshot["expected_cash"]))
+    except (InvalidOperation, KeyError, TypeError, ValueError) as exc:
+        raise POSStoreConflictError(
+            "IDEMPOTENCY_CONFLICT", "Frozen close cash snapshot is invalid"
+        ) from exc
+    if (
+        Decimal(snapshot["cash_returns_total"]) < 0
+        or derived_expected != snapshot["expected_cash"]
+        or derived_difference != difference
+    ):
+        raise POSStoreConflictError(
+            "IDEMPOTENCY_CONFLICT", "Frozen close cash snapshot is inconsistent"
+        )
+    try:
+        current_amounts = {
+            key: Decimal(str(current[key]))
+            for key in (
+                "opening_cash",
+                "sales_total",
+                "cash_returns_total",
+                "expected_cash",
+            )
+        }
+    except (InvalidOperation, KeyError, TypeError, ValueError) as exc:
+        raise POSStoreConflictError("SHIFT_CHANGED", "Shift changed") from exc
+    if any(
+        not amount.is_finite() or amount != Decimal(snapshot[key])
+        for key, amount in current_amounts.items()
+    ):
+        raise POSStoreConflictError("SHIFT_CHANGED", "Shift changed")
+
+
+def _strict_money(value: object, *, allow_negative: bool = False) -> str:
+    if not isinstance(value, str):
+        raise ValueError("Money value must be a decimal string")
+    amount = Decimal(value)
+    if (
+        not amount.is_finite()
+        or amount.as_tuple().exponent < -2
+        or (amount < 0 and not allow_negative)
+    ):
+        raise ValueError("Money value is invalid")
+    return _money(amount)
 
 
 def _cash_event_amount(
