@@ -10,6 +10,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from myretail_api.config import (
     Settings,
     get_settings,
+    validate_auth_rate_limit_settings,
     validate_production_state_storage,
     validate_state_foundation_settings,
 )
@@ -17,6 +18,7 @@ from myretail_api.http_security import (
     ApiSecurityHeadersMiddleware,
     apply_api_security_headers,
 )
+from myretail_api.rate_limit import build_sqlite_login_rate_limiter
 from myretail_api.routers.auth import router as auth_router
 from myretail_api.routers.health import router as health_router
 from myretail_api.routers.pos import router as pos_router
@@ -30,6 +32,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     effective_settings = settings or get_settings()
     validate_production_state_storage(effective_settings)
     validate_state_foundation_settings(effective_settings)
+    validate_auth_rate_limit_settings(effective_settings)
     app = FastAPI(
         title="MyRetail API",
         version="0.1.0",
@@ -37,6 +40,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=build_state_lifespan(effective_settings),
     )
     app.state.settings = effective_settings
+    if effective_settings.state_backend == "sqlite":
+        app.state.login_rate_limiter = build_sqlite_login_rate_limiter(effective_settings)
     app.dependency_overrides[get_settings] = _settings_provider(effective_settings)
     app.add_middleware(ApiSecurityHeadersMiddleware)
     app.add_exception_handler(Exception, internal_server_error_handler)

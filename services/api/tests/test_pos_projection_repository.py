@@ -129,6 +129,7 @@ def postgres_settings(*, tenant: str, tmp_path: Path) -> Settings:
         environment="test",
         tenant_slug=tenant,
         state_backend="postgresql",
+        auth_rate_limit_secret=SecretStr("test-rate-limit-secret-32-bytes-minimum"),
         state_database_url=SecretStr(APP_DATABASE_URL),
         state_pool_min_size=1,
         state_pool_max_size=2,

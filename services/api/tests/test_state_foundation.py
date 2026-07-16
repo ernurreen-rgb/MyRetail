@@ -4,6 +4,7 @@ import pytest
 from pydantic import SecretStr
 
 from myretail_api.config import (
+    InvalidAuthRateLimitSettingsError,
     InvalidStateFoundationSettingsError,
     Settings,
     UnsafeProductionStateError,
@@ -103,6 +104,54 @@ def test_postgresql_pool_minimum_cannot_exceed_maximum() -> None:
         create_app(settings)
 
 
+def test_postgresql_auth_rate_limit_requires_dedicated_secret() -> None:
+    settings = isolated_settings(
+        environment="test",
+        state_backend="postgresql",
+        state_database_url=SecretStr(
+            "postgresql+asyncpg://myretail_api@localhost/state"
+        ),
+        auth_secret=SecretStr("same-secret-value-that-is-at-least-32-bytes"),
+    )
+
+    with pytest.raises(
+        InvalidAuthRateLimitSettingsError,
+        match="dedicated secret",
+    ):
+        create_app(settings)
+
+    settings.auth_rate_limit_secret = SecretStr(
+        "same-secret-value-that-is-at-least-32-bytes"
+    )
+    with pytest.raises(
+        InvalidAuthRateLimitSettingsError,
+        match="must use distinct secrets",
+    ):
+        create_app(settings)
+
+
+@pytest.mark.parametrize(
+    ("mode", "cidrs", "message"),
+    [
+        ("trusted_proxy", [], "requires a non-empty CIDR"),
+        ("direct", ["10.0.0.0/8"], "require explicit trusted_proxy"),
+        ("trusted_proxy", ["not-a-network"], "invalid network"),
+    ],
+)
+def test_client_ip_proxy_policy_fails_closed_on_ambiguous_config(
+    mode: str,
+    cidrs: list[str],
+    message: str,
+) -> None:
+    settings = isolated_settings(
+        environment="test",
+        auth_client_ip_mode=mode,
+        auth_trusted_proxy_cidrs=cidrs,
+    )
+    with pytest.raises(InvalidAuthRateLimitSettingsError, match=message):
+        create_app(settings)
+
+
 def test_production_postgresql_switch_remains_fail_closed_in_phase_6a() -> None:
     settings = isolated_settings(
         environment="production",
@@ -157,7 +206,7 @@ async def test_sqlite_lifespan_does_not_create_postgresql_pool(tmp_path: Path) -
 
 
 def test_expected_revision_is_package_owned_not_environment_overridable() -> None:
-    assert EXPECTED_STATE_SCHEMA_REVISION == "20260716_01"
+    assert EXPECTED_STATE_SCHEMA_REVISION == "20260716_02"
     assert "state_expected_schema_revision" not in Settings.model_fields
 
 

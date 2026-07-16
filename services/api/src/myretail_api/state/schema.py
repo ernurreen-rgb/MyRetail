@@ -2,7 +2,7 @@ STATE_SCHEMA = "myretail_state"
 STATE_APP_ROLE = "myretail_api"
 STATE_MIGRATOR_ROLE = "myretail_state_migrator"
 STATE_OWNER_ROLE = "myretail_state_owner"
-EXPECTED_STATE_SCHEMA_REVISION = "20260716_01"
+EXPECTED_STATE_SCHEMA_REVISION = "20260716_02"
 
 TENANT_STATE_TABLES = (
     "rls_canary",
