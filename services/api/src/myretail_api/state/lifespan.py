@@ -4,6 +4,11 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from fastapi import FastAPI
 
 from myretail_api.config import Settings
+from myretail_api.idempotency import IdempotencyStore
+from myretail_api.state.idempotency import (
+    PostgresIdempotencyRepository,
+    SQLiteIdempotencyRepository,
+)
 from myretail_api.state.postgres import PostgresStateRuntime
 
 
@@ -15,7 +20,13 @@ def build_state_lifespan(
         runtime: PostgresStateRuntime | None = None
         if settings.state_backend == "postgresql":
             runtime = await PostgresStateRuntime.start(settings)
+            idempotency_repository = PostgresIdempotencyRepository(runtime.engine)
+        else:
+            idempotency_repository = SQLiteIdempotencyRepository(
+                IdempotencyStore(settings.stock_idempotency_db_path)
+            )
         app.state.postgres_state_runtime = runtime
+        app.state.shared_idempotency_repository = idempotency_repository
         try:
             yield
         finally:

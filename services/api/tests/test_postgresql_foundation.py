@@ -46,6 +46,11 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.fixture
+def anyio_backend() -> str:
+    return "asyncio"
+
+
 def postgres_settings(database_url: str = APP_DATABASE_URL) -> Settings:
     return Settings(
         _env_file=None,

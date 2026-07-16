@@ -29,7 +29,6 @@ from myretail_api.idempotency import (
     IdempotencyBeginResult,
     IdempotencyConflictError,
     IdempotencyRecord,
-    IdempotencyStore,
 )
 from myretail_api.models.auth import TenantContext
 from myretail_api.models.purchases import (
@@ -47,6 +46,7 @@ from myretail_api.models.purchases import (
     SupplierStatusFilter,
     SupplierUpdate,
 )
+from myretail_api.state.protocols import IdempotencyRepository
 
 suppliers_router = APIRouter(prefix="/suppliers", tags=["suppliers"])
 purchases_router = APIRouter(prefix="/purchases", tags=["purchases"])
@@ -108,7 +108,7 @@ async def create_supplier(
     supplier: SupplierCreate,
     client: Annotated[ERPNextClient, Depends(get_erpnext_client)],
     tenant_context: Annotated[TenantContext, Depends(require_purchases_access)],
-    store: Annotated[IdempotencyStore, Depends(get_purchases_idempotency_store)],
+    store: Annotated[IdempotencyRepository, Depends(get_purchases_idempotency_store)],
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> JSONResponse:
     key = _require_idempotency_key(idempotency_key)
@@ -202,7 +202,7 @@ async def create_purchase(
     purchase: PurchaseCreate,
     client: Annotated[ERPNextClient, Depends(get_erpnext_client)],
     tenant_context: Annotated[TenantContext, Depends(require_purchases_access)],
-    store: Annotated[IdempotencyStore, Depends(get_purchases_idempotency_store)],
+    store: Annotated[IdempotencyRepository, Depends(get_purchases_idempotency_store)],
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> JSONResponse:
     key = _require_idempotency_key(idempotency_key)
@@ -248,7 +248,7 @@ async def submit_purchase(
     request: PurchaseSubmitRequest,
     client: Annotated[ERPNextClient, Depends(get_erpnext_client)],
     tenant_context: Annotated[TenantContext, Depends(require_purchases_access)],
-    store: Annotated[IdempotencyStore, Depends(get_purchases_idempotency_store)],
+    store: Annotated[IdempotencyRepository, Depends(get_purchases_idempotency_store)],
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> JSONResponse:
     key = _require_idempotency_key(idempotency_key)
@@ -276,7 +276,7 @@ async def cancel_purchase(
     request: PurchaseCancelRequest,
     client: Annotated[ERPNextClient, Depends(get_erpnext_client)],
     tenant_context: Annotated[TenantContext, Depends(require_purchases_access)],
-    store: Annotated[IdempotencyStore, Depends(get_purchases_idempotency_store)],
+    store: Annotated[IdempotencyRepository, Depends(get_purchases_idempotency_store)],
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> JSONResponse:
     key = _require_idempotency_key(idempotency_key)
@@ -379,7 +379,7 @@ def _require_idempotency_key(idempotency_key: str | None) -> str:
 
 
 async def _idempotent_response(
-    store: IdempotencyStore,
+    store: IdempotencyRepository,
     *,
     tenant: str,
     key: str,
@@ -388,7 +388,12 @@ async def _idempotent_response(
     execute: Callable[[], Awaitable[T]],
     recover: Callable[[], Awaitable[T | None]] | None = None,
 ) -> JSONResponse:
-    begin = _begin_idempotency(store, tenant=tenant, key=key, request_hash=request_hash)
+    begin = await _begin_idempotency(
+        store,
+        tenant=tenant,
+        key=key,
+        request_hash=request_hash,
+    )
     if begin.record is not None:
         return JSONResponse(
             status_code=begin.record.status_code,
@@ -415,7 +420,12 @@ async def _idempotent_response(
         )
         if record is not None:
             return JSONResponse(status_code=record.status_code, content=record.response_body)
-        begin = _begin_idempotency(store, tenant=tenant, key=key, request_hash=request_hash)
+        begin = await _begin_idempotency(
+            store,
+            tenant=tenant,
+            key=key,
+            request_hash=request_hash,
+        )
         if begin.record is not None:
             return JSONResponse(
                 status_code=begin.record.status_code,
@@ -441,7 +451,7 @@ async def _idempotent_response(
     try:
         result = await _call_erpnext(execute())
     except ERPNextAmbiguousCreateError:
-        _mark_recovery_required(
+        await _mark_recovery_required(
             store,
             tenant,
             key,
@@ -462,7 +472,7 @@ async def _idempotent_response(
                 poll_seconds=CREATE_RECOVERY_POLL_SECONDS,
             )
         except Exception:
-            _mark_recovery_required(
+            await _mark_recovery_required(
                 store,
                 tenant,
                 key,
@@ -473,7 +483,7 @@ async def _idempotent_response(
             raise
         if recovered_response is not None:
             return recovered_response
-        return _pending_idempotency_response(
+        return await _pending_idempotency_response(
             store=store,
             tenant=tenant,
             key=key,
@@ -482,7 +492,7 @@ async def _idempotent_response(
         )
     except Exception as exc:
         if recover is not None and isinstance(exc, HTTPException) and exc.status_code >= 500:
-            _mark_recovery_required(
+            await _mark_recovery_required(
                 store,
                 tenant,
                 key,
@@ -501,7 +511,7 @@ async def _idempotent_response(
                     recover=recover,
                 )
             except Exception as recovery_exc:
-                _mark_recovery_required(
+                await _mark_recovery_required(
                     store,
                     tenant,
                     key,
@@ -512,7 +522,7 @@ async def _idempotent_response(
                 raise exc from recovery_exc
             if recovered_response is not None:
                 return recovered_response
-            _mark_recovery_required(
+            await _mark_recovery_required(
                 store,
                 tenant,
                 key,
@@ -521,7 +531,7 @@ async def _idempotent_response(
                 lease_seconds=0,
             )
             raise
-        store.release(
+        await store.release(
             tenant=tenant,
             key=key,
             request_hash=request_hash,
@@ -530,7 +540,7 @@ async def _idempotent_response(
         raise
 
     response_body = jsonable_encoder(result)
-    _complete_idempotency(
+    await _complete_idempotency(
         store,
         tenant=tenant,
         key=key,
@@ -544,7 +554,7 @@ async def _idempotent_response(
 
 async def _recover_idempotent_response(
     *,
-    store: IdempotencyStore,
+    store: IdempotencyRepository,
     tenant: str,
     key: str,
     request_hash: str,
@@ -558,7 +568,7 @@ async def _recover_idempotent_response(
     if result is None:
         return None
     response_body = jsonable_encoder(result)
-    _complete_idempotency(
+    await _complete_idempotency(
         store,
         tenant=tenant,
         key=key,
@@ -572,7 +582,7 @@ async def _recover_idempotent_response(
 
 async def _wait_or_recover_idempotency(
     *,
-    store: IdempotencyStore,
+    store: IdempotencyRepository,
     tenant: str,
     key: str,
     request_hash: str,
@@ -585,8 +595,7 @@ async def _wait_or_recover_idempotency(
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     while asyncio.get_running_loop().time() < deadline:
         try:
-            record = await asyncio.to_thread(
-                store.get_completed,
+            record = await store.get_completed(
                 tenant=tenant,
                 key=key,
                 request_hash=request_hash,
@@ -615,15 +624,15 @@ async def _wait_or_recover_idempotency(
     return None
 
 
-def _pending_idempotency_response(
+async def _pending_idempotency_response(
     *,
-    store: IdempotencyStore,
+    store: IdempotencyRepository,
     tenant: str,
     key: str,
     request_hash: str,
     fencing_token: int,
 ) -> JSONResponse:
-    _mark_recovery_required(
+    await _mark_recovery_required(
         store,
         tenant,
         key,
@@ -639,7 +648,7 @@ def _pending_idempotency_response(
 
 async def _recover_or_pending_response(
     *,
-    store: IdempotencyStore,
+    store: IdempotencyRepository,
     tenant: str,
     key: str,
     request_hash: str,
@@ -659,7 +668,7 @@ async def _recover_or_pending_response(
                 recover=recover,
             )
         except Exception:
-            _mark_recovery_required(
+            await _mark_recovery_required(
                 store,
                 tenant,
                 key,
@@ -670,7 +679,7 @@ async def _recover_or_pending_response(
             raise
         if response is not None:
             return response
-    return _pending_idempotency_response(
+    return await _pending_idempotency_response(
         store=store,
         tenant=tenant,
         key=key,
@@ -679,8 +688,8 @@ async def _recover_or_pending_response(
     )
 
 
-def _complete_idempotency(
-    store: IdempotencyStore,
+async def _complete_idempotency(
+    store: IdempotencyRepository,
     *,
     tenant: str,
     key: str,
@@ -689,7 +698,7 @@ def _complete_idempotency(
     status_code: int,
     response_body: dict[str, object],
 ) -> None:
-    if store.complete(
+    if await store.complete(
         tenant=tenant,
         key=key,
         request_hash=request_hash,
@@ -705,8 +714,8 @@ def _complete_idempotency(
     )
 
 
-def _mark_recovery_required(
-    store: IdempotencyStore,
+async def _mark_recovery_required(
+    store: IdempotencyRepository,
     tenant: str,
     key: str,
     request_hash: str,
@@ -714,7 +723,7 @@ def _mark_recovery_required(
     *,
     lease_seconds: float,
 ) -> None:
-    if store.mark_recovery_required(
+    if await store.mark_recovery_required(
         tenant=tenant,
         key=key,
         request_hash=request_hash,
@@ -729,15 +738,15 @@ def _mark_recovery_required(
     )
 
 
-def _begin_idempotency(
-    store: IdempotencyStore,
+async def _begin_idempotency(
+    store: IdempotencyRepository,
     *,
     tenant: str,
     key: str,
     request_hash: str,
 ) -> IdempotencyBeginResult:
     try:
-        return store.begin(tenant=tenant, key=key, request_hash=request_hash)
+        return await store.begin(tenant=tenant, key=key, request_hash=request_hash)
     except IdempotencyConflictError as exc:
         raise _api_error(
             status.HTTP_409_CONFLICT,
@@ -747,15 +756,14 @@ def _begin_idempotency(
 
 
 async def _wait_idempotency(
-    store: IdempotencyStore,
+    store: IdempotencyRepository,
     *,
     tenant: str,
     key: str,
     request_hash: str,
 ) -> IdempotencyRecord | None:
     try:
-        return await asyncio.to_thread(
-            store.wait_for_completed,
+        return await store.wait_for_completed(
             tenant=tenant,
             key=key,
             request_hash=request_hash,

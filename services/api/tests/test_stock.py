@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sqlite3
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -37,6 +38,9 @@ from myretail_api.models.stock import (
 )
 from myretail_api.routers import stock as stock_router_module
 from myretail_api.security import create_access_token
+from myretail_api.state.idempotency import SQLiteIdempotencyRepository
+
+POSTGRES_APP_DATABASE_URL = os.environ.get("MYRETAIL_TEST_POSTGRES_APP_URL", "")
 
 
 class StubStockERPNextClient:
@@ -536,11 +540,31 @@ def auth_headers(
 
 def make_app(erpnext_client: object, tmp_path: Path) -> object:
     settings = make_test_settings(tmp_path)
-    store = StockIdempotencyStore(settings.stock_idempotency_db_path)
+    store = SQLiteIdempotencyRepository(
+        StockIdempotencyStore(settings.stock_idempotency_db_path)
+    )
     app = create_app()
     app.dependency_overrides[get_erpnext_client] = lambda: erpnext_client
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_stock_idempotency_store] = lambda: store
+    return app
+
+
+def make_postgres_app(
+    erpnext_client: object,
+    tmp_path: Path,
+    *,
+    tenant: str,
+) -> object:
+    settings = make_test_settings(tmp_path)
+    settings.tenant_slug = tenant
+    settings.state_backend = "postgresql"
+    settings.state_database_url = SecretStr(POSTGRES_APP_DATABASE_URL)
+    settings.state_pool_min_size = 1
+    settings.state_pool_max_size = 2
+    settings.state_postgres_ssl_mode = "disable"
+    app = create_app(settings)
+    app.dependency_overrides[get_erpnext_client] = lambda: erpnext_client
     return app
 
 
@@ -775,6 +799,87 @@ async def test_concurrent_stock_cancel_different_keys_share_one_reversal(
             second_client.post(
                 f"/stock/movements/{movement_id}/cancel",
                 headers=auth_headers(tmp_path, idempotency_key=str(uuid4())),
+                json={"reason": "Wrong receipt"},
+            )
+        )
+        await asyncio.sleep(0.05)
+        erpnext_client.release.set()
+        first_response, second_response = await asyncio.gather(
+            first_cancel,
+            second_cancel,
+        )
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert (
+        first_response.json()["reversal"]["id"]
+        == second_response.json()["reversal"]["id"]
+    )
+    assert erpnext_client.cancel_calls == 1
+    assert len(erpnext_client.movements) == 2
+    assert erpnext_client.balances[("SKU-001", "Stores - MR")] == Decimal("10.000")
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(
+    not POSTGRES_APP_DATABASE_URL,
+    reason="PostgreSQL test URL is not configured",
+)
+async def test_postgresql_two_api_pools_cancel_with_one_reversal(tmp_path: Path) -> None:
+    erpnext_client = BlockingCancelStockClient()
+    tenant = f"stock-route-{uuid4()}"
+    first_app = make_postgres_app(erpnext_client, tmp_path, tenant=tenant)
+    second_app = make_postgres_app(erpnext_client, tmp_path, tenant=tenant)
+
+    async with (
+        first_app.router.lifespan_context(first_app),
+        second_app.router.lifespan_context(second_app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=first_app),
+            base_url="http://first-postgresql-api",
+        ) as first_client,
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=second_app),
+            base_url="http://second-postgresql-api",
+        ) as second_client,
+    ):
+        created = await first_client.post(
+            "/stock/movements",
+            headers=auth_headers(
+                tmp_path,
+                tenant=tenant,
+                header_tenant=tenant,
+                idempotency_key=str(uuid4()),
+            ),
+            json={
+                "type": "receipt",
+                "warehouse_id": "Stores - MR",
+                "lines": [{"product_id": "SKU-001", "quantity": "2.000"}],
+            },
+        )
+        movement_id = created.json()["id"]
+        first_cancel = asyncio.create_task(
+            first_client.post(
+                f"/stock/movements/{movement_id}/cancel",
+                headers=auth_headers(
+                    tmp_path,
+                    tenant=tenant,
+                    header_tenant=tenant,
+                    idempotency_key=str(uuid4()),
+                ),
+                json={"reason": "Wrong receipt"},
+            )
+        )
+        await asyncio.wait_for(erpnext_client.started.wait(), timeout=2)
+        second_cancel = asyncio.create_task(
+            second_client.post(
+                f"/stock/movements/{movement_id}/cancel",
+                headers=auth_headers(
+                    tmp_path,
+                    tenant=tenant,
+                    header_tenant=tenant,
+                    idempotency_key=str(uuid4()),
+                ),
                 json={"reason": "Wrong receipt"},
             )
         )
