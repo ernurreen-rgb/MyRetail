@@ -87,6 +87,11 @@ jobs:
       - name: Scan Python code
         run: python -m bandit -r services/api/src services/api/scripts
       - run: python -m ruff check services/api
+      - name: Validate blocked Phase 6B.3 evidence template
+        run: >-
+          python services/api/scripts/validate_production_evidence.py
+          --mode template
+          docs/security/production-evidence.example.json
       - name: Verify approved OpenAPI contract fingerprint
         run: python -m pytest services/api/tests/test_openapi_contract.py
       - run: python -m pytest services/api/tests

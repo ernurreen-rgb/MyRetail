@@ -89,6 +89,10 @@ command builds both container targets and cleans all disposable Docker resources
 .\.venv\Scripts\python.exe services/api/scripts/production_state_drill.py
 ```
 
+Real managed-environment cutover evidence is a separate Phase 6B.3 gate documented in
+`docs/security/postgresql-production-cutover-evidence.md`. The committed manifest is only a blocked
+template; production approval requires the default validator mode and authoritative provider links.
+
 ## Validate
 
 ```powershell
