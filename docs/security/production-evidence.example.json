@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "release": {
+    "commit_sha": "0000000000000000000000000000000000000000",
+    "api_image_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "migration_image_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "migration_revision": "20260716_05",
+    "evidence_url": "https://release.example.invalid/artifacts"
+  },
+  "managed_postgresql": {
+    "provider": "provider-name",
+    "project_id": "project-id",
+    "cluster_id": "primary-cluster-id",
+    "region": "region-id",
+    "tls_mode": "verify-full",
+    "encryption_at_rest": true,
+    "high_availability": true,
+    "roles_preprovisioned": true,
+    "evidence_url": "https://database.example.invalid/cluster"
+  },
+  "secret_manager": {
+    "provider": "secret-manager-name",
+    "reference": "projects/example/secrets/myretail-state/versions/1",
+    "last_rotated_at": "2026-07-16T12:00:00Z",
+    "rotation_tested": true,
+    "evidence_url": "https://secrets.example.invalid/rotation"
+  },
+  "backup": {
+    "policy_id": "backup-policy-id",
+    "schedule": "provider-managed-daily",
+    "retention_days": 14,
+    "pitr_enabled": true,
+    "pitr_window_hours": 168,
+    "latest_success_at": "2026-07-16T12:05:00Z",
+    "evidence_url": "https://backup.example.invalid/policy",
+    "restore": {
+      "restore_point": "immutable-restore-point-id",
+      "target_cluster_id": "isolated-restore-cluster-id",
+      "completed_at": "2026-07-16T12:30:00Z",
+      "schema_revision": "20260716_05",
+      "table_inventory_match": true,
+      "reconciliation_passed": true,
+      "evidence_url": "https://backup.example.invalid/restore"
+    }
+  },
+  "monitoring": {
+    "dashboard_url": "https://monitoring.example.invalid/dashboard",
+    "alerts": [
+      {"kind": "database_unavailable", "enabled": true, "tested_at": "2026-07-16T12:35:00Z", "evidence_url": "https://monitoring.example.invalid/database-unavailable"},
+      {"kind": "pool_saturation", "enabled": true, "tested_at": "2026-07-16T12:35:00Z", "evidence_url": "https://monitoring.example.invalid/pool-saturation"},
+      {"kind": "statement_timeout", "enabled": true, "tested_at": "2026-07-16T12:35:00Z", "evidence_url": "https://monitoring.example.invalid/statement-timeout"},
+      {"kind": "lock_timeout", "enabled": true, "tested_at": "2026-07-16T12:35:00Z", "evidence_url": "https://monitoring.example.invalid/lock-timeout"},
+      {"kind": "migration_mismatch", "enabled": true, "tested_at": "2026-07-16T12:35:00Z", "evidence_url": "https://monitoring.example.invalid/migration-mismatch"},
+      {"kind": "backup_failure", "enabled": true, "tested_at": "2026-07-16T12:35:00Z", "evidence_url": "https://monitoring.example.invalid/backup-failure"},
+      {"kind": "replication_lag", "enabled": true, "tested_at": "2026-07-16T12:35:00Z", "evidence_url": "https://monitoring.example.invalid/replication-lag"},
+      {"kind": "recovery_age", "enabled": true, "tested_at": "2026-07-16T12:35:00Z", "evidence_url": "https://monitoring.example.invalid/recovery-age"}
+    ]
+  },
+  "smoke": {
+    "completed_at": "2026-07-16T13:00:00Z",
+    "api_replicas": 2,
+    "erpnext_environment": "production-like",
+    "scenarios": [
+      {"kind": "session_logout_revoke", "passed": true, "evidence_url": "https://qa.example.invalid/session-revocation"},
+      {"kind": "stock_purchase_exact_once", "passed": true, "evidence_url": "https://qa.example.invalid/stock-purchase"},
+      {"kind": "pos_lifecycle", "passed": true, "evidence_url": "https://qa.example.invalid/pos-lifecycle"},
+      {"kind": "restart_recovery", "passed": true, "evidence_url": "https://qa.example.invalid/restart-recovery"}
+    ],
+    "reconciliation_passed": true,
+    "evidence_url": "https://qa.example.invalid/report"
+  },
+  "cutover": {
+    "window_start": "2026-07-17T01:00:00Z",
+    "window_end": "2026-07-17T02:00:00Z",
+    "change_owner": "ernurreen-rgb",
+    "database_owner": "ernurreen-rgb",
+    "rollback_owner": "ernurreen-rgb",
+    "rollback_before_first_write_documented": true,
+    "forward_fix_after_first_write_documented": true,
+    "dual_write": false,
+    "sqlite_fallback": false,
+    "traffic_decision": "blocked",
+    "evidence_url": "https://change.example.invalid/decision"
+  },
+  "provenance": {
+    "captured_at": "2026-07-16T13:05:00Z",
+    "captured_by": "ernurreen-rgb",
+    "notion_report_url": "https://app.notion.com/phase-6b3-example"
+  }
+}
