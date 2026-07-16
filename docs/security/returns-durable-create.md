@@ -57,6 +57,10 @@ Phase 7B закрывает durable create/recovery и exact-once create cash ef
 компенсирующий `return_cancel` cash event и полная сериализация cancel с create/sale/close
 остаются в Phase 7C/7D. До их merge MR-SEC-019…021 нельзя считать полностью закрытыми.
 
+Статус на 16.07.2026: durable cancel и compensating cash effect реализованы в Phase 7C;
+актуальные гарантии и оставшаяся граница описаны в
+[`returns-durable-cancel.md`](returns-durable-cancel.md).
+
 ## Обязательная проверка
 
 - SQLite и PostgreSQL two-pool concurrent create с разными keys: один ERP return, одна
