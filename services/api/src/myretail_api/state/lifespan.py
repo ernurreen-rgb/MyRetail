@@ -20,6 +20,10 @@ from myretail_api.state.pos_repository import (
 )
 from myretail_api.state.postgres import PostgresStateRuntime
 from myretail_api.state.rate_limit import PostgresLoginRateLimitRepository
+from myretail_api.state.sessions import (
+    PostgresSessionRepository,
+    SQLiteSessionRepository,
+)
 
 
 def build_state_lifespan(
@@ -43,6 +47,7 @@ def build_state_lifespan(
                 settings,
                 rate_limit_repository,
             )
+            session_repository = PostgresSessionRepository(runtime.engine)
         else:
             idempotency_repository = SQLiteIdempotencyRepository(
                 IdempotencyStore(settings.stock_idempotency_db_path)
@@ -53,6 +58,11 @@ def build_state_lifespan(
             login_rate_limiter = getattr(app.state, "login_rate_limiter", None)
             if login_rate_limiter is None:
                 login_rate_limiter = build_sqlite_login_rate_limiter(settings)
+            session_repository = getattr(app.state, "session_repository", None)
+            if session_repository is None:
+                session_repository = SQLiteSessionRepository(
+                    settings.auth_session_db_path
+                )
         app.state.postgres_state_runtime = runtime
         app.state.shared_idempotency_repository = idempotency_repository
         app.state.pos_state_repository = pos_repository
@@ -60,6 +70,7 @@ def build_state_lifespan(
             pos_repository.coordination_repository
         )
         app.state.login_rate_limiter = login_rate_limiter
+        app.state.session_repository = session_repository
         try:
             yield
         finally:

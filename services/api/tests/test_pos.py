@@ -35,6 +35,7 @@ from myretail_api.pos_service import _request_hash
 from myretail_api.pos_store import POSStore, POSStoreMigrationError
 from myretail_api.security import create_access_token
 from myretail_api.state.pos_repository import SQLitePOSRepository
+from myretail_api.state.sessions import SQLiteSessionRepository
 from myretail_api.tenancy import build_isolated_tenant_route
 
 
@@ -524,6 +525,7 @@ def make_settings(
         erpnext_api_key=SecretStr("test-key"),
         erpnext_api_secret=SecretStr("test-secret"),
         pos_db_path=tmp_path / "pos.sqlite3",
+        auth_session_db_path=tmp_path / "auth-sessions.sqlite3",
         stock_idempotency_db_path=tmp_path / "idempotency.sqlite3",
         pos_cashier_assignments=assignments,
     )
@@ -537,9 +539,16 @@ def auth_headers(
     key: str | None = None,
 ) -> dict[str, str]:
     settings = make_settings(tmp_path)
+    session = SQLiteSessionRepository(settings.auth_session_db_path).issue_session_sync(
+        tenant_id=settings.tenant_slug,
+        email=email,
+        route_version=settings.tenant_route_version,
+        ttl_seconds=settings.auth_token_ttl_seconds,
+    )
     token, _ = create_access_token(
         route=build_isolated_tenant_route(settings),
         user=AuthenticatedUser(email=email, full_name="Кассир", roles=roles or ["Cashier"]),
+        session=session,
     )
     headers = {"Authorization": f"Bearer {token}", "X-MyRetail-Tenant": "myretail"}
     if key:

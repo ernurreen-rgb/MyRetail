@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 from pathlib import Path
+from tempfile import gettempdir
 from uuid import UUID
 
 import httpx
@@ -19,6 +20,7 @@ from myretail_api.security import (
     create_access_token,
     parse_access_token,
 )
+from myretail_api.state.sessions import SQLiteSessionRepository
 from myretail_api.tenancy import (
     InvalidTenantRouteSettingsError,
     IsolatedTenantRoute,
@@ -45,6 +47,9 @@ def make_test_settings(**overrides: object) -> Settings:
         "erpnext_api_key": SecretStr("erp-key-a"),
         "erpnext_api_secret": SecretStr("erp-secret-a"),
         "erpnext_pos_credentials_map": {"POS-A": "sid:do-not-log"},
+        "auth_session_db_path": (
+            Path(gettempdir()) / "myretail-test-tenant-auth-sessions.sqlite3"
+        ),
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)
@@ -75,6 +80,23 @@ def production_values() -> dict[str, object]:
         ),
         "state_postgres_ssl_mode": "verify-full",
     }
+
+
+def issue_access_token(
+    settings: Settings,
+    user: AuthenticatedUser,
+) -> tuple[str, int]:
+    session = SQLiteSessionRepository(settings.auth_session_db_path).issue_session_sync(
+        tenant_id=settings.tenant_slug,
+        email=user.email,
+        route_version=settings.tenant_route_version,
+        ttl_seconds=settings.auth_token_ttl_seconds,
+    )
+    return create_access_token(
+        route=build_isolated_tenant_route(settings),
+        user=user,
+        session=session,
+    )
 
 
 def production_settings(**overrides: object) -> Settings:
@@ -272,10 +294,7 @@ def test_shared_tenancy_mode_is_not_a_valid_configuration() -> None:
 def test_access_token_is_bound_to_fixed_tenant_route() -> None:
     settings = make_test_settings()
     route = build_isolated_tenant_route(settings)
-    token, _ = create_access_token(
-        route=route,
-        user=_owner(),
-    )
+    token, _ = issue_access_token(settings, _owner())
     payload = _decode_payload(token)
 
     assert payload["iss"] == route.auth_issuer
@@ -303,10 +322,7 @@ def test_access_token_from_another_route_is_rejected(
     message: str,
 ) -> None:
     settings = make_test_settings()
-    token, _ = create_access_token(
-        route=build_isolated_tenant_route(settings),
-        user=_owner(),
-    )
+    token, _ = issue_access_token(settings, _owner())
     other_settings = make_test_settings(**route_overrides)
 
     with pytest.raises(TokenValidationError, match=message):
@@ -316,11 +332,25 @@ def test_access_token_from_another_route_is_rejected(
         )
 
 
-@pytest.mark.parametrize("claim", ["iss", "aud", "tenant_id", "route_version"])
-def test_legacy_token_without_route_claim_is_rejected(claim: str) -> None:
+@pytest.mark.parametrize(
+    "claim",
+    [
+        "iss",
+        "aud",
+        "tenant_id",
+        "route_version",
+        "sub",
+        "jti",
+        "principal_id",
+        "auth_epoch",
+        "iat",
+        "exp",
+    ],
+)
+def test_legacy_token_without_required_claim_is_rejected(claim: str) -> None:
     settings = make_test_settings()
     route = build_isolated_tenant_route(settings)
-    token, _ = create_access_token(route=route, user=_owner())
+    token, _ = issue_access_token(settings, _owner())
     payload = _decode_payload(token)
     payload.pop(claim)
     legacy_token = _sign_payload(token, payload, settings)
@@ -332,7 +362,7 @@ def test_legacy_token_without_route_claim_is_rejected(claim: str) -> None:
 def test_boolean_route_version_claim_is_rejected() -> None:
     settings = make_test_settings()
     route = build_isolated_tenant_route(settings)
-    token, _ = create_access_token(route=route, user=_owner())
+    token, _ = issue_access_token(settings, _owner())
     payload = _decode_payload(token)
     payload["route_version"] = True
 
@@ -362,7 +392,7 @@ async def test_ssrf_style_request_data_cannot_change_fixed_erpnext_origin() -> N
         transport=httpx.MockTransport(handler),
     )
     app.dependency_overrides[get_erpnext_client] = lambda: fixed_client
-    token, _ = create_access_token(route=route, user=_owner())
+    token, _ = issue_access_token(settings, _owner())
     headers = {
         "Authorization": f"Bearer {token}",
         "X-MyRetail-Tenant": "tenant-a",

@@ -7,7 +7,8 @@ foundation-контракт рядом с кодом; controlled production enab
 ## Граница этапа
 
 - PostgreSQL foundation доступна для development/test и CI.
-- Public HTTP API не меняется.
+- Foundation сам по себе не меняет public HTTP API; additive session endpoints Phase 8B
+  описаны отдельно в `session-revocation.md`.
 - Текущие SQLite adapters продолжают обслуживать local dev/test requests.
 - Production SQLite запрещён. PostgreSQL startup разрешён только с явным controlled latch и
   полным startup contract; latch сам по себе не разрешает production traffic и не заменяет
@@ -80,7 +81,7 @@ CI использует disposable PostgreSQL container с host `trust` толь
 
 ## Phase 6A.6 acceptance
 
-Текущий package-owned head — `20260716_04`. Startup дополнительно проверяет отсутствие
+Текущий package-owned head — `20260716_05`. Startup дополнительно проверяет отсутствие
 role memberships у `myretail_api`, точный owner schema/tables, точный table inventory и
 отсутствие elevated table grants. Immutable `workflow_intent_aliases` и
 `pos_shift_cash_events` имеют только `SELECT/INSERT`; остальные tenant tables сохраняют

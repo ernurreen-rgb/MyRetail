@@ -22,9 +22,12 @@ from myretail_api.pos_store import POSStoreConflictError
 from myretail_api.security import create_access_token
 from myretail_api.state.pos_repository import PostgresPOSRepository
 from myretail_api.state.postgres import PostgresStateRuntime
+from myretail_api.state.protocols import AuthSession
+from myretail_api.state.sessions import PostgresSessionRepository
 from myretail_api.tenancy import build_isolated_tenant_route
 
 APP_DATABASE_URL = os.environ.get("MYRETAIL_TEST_POSTGRES_APP_URL", "")
+_SESSION_BY_TENANT: dict[str, AuthSession] = {}
 
 
 @pytest.fixture
@@ -186,6 +189,7 @@ def headers(
     key: str | None = None,
     roles: list[str] | None = None,
 ) -> dict[str, str]:
+    session = _SESSION_BY_TENANT[settings.tenant_slug]
     token, _ = create_access_token(
         route=build_isolated_tenant_route(settings),
         user=AuthenticatedUser(
@@ -193,6 +197,7 @@ def headers(
             full_name="Cashier",
             roles=roles or ["Cashier"],
         ),
+        session=session,
     )
     result = {
         "Authorization": f"Bearer {token}",
@@ -227,6 +232,17 @@ async def test_postgresql_request_path_is_shared_and_exact_once_across_two_pools
         assert (
             first_app.state.pos_state_repository._engine
             is not second_app.state.pos_state_repository._engine
+        )
+        assert isinstance(
+            first_app.state.session_repository, PostgresSessionRepository
+        )
+        _SESSION_BY_TENANT[settings.tenant_slug] = (
+            await first_app.state.session_repository.issue_session(
+                tenant_id=settings.tenant_slug,
+                email="cashier@example.test",
+                route_version=settings.tenant_route_version,
+                ttl_seconds=settings.auth_token_ttl_seconds,
+            )
         )
         async with (
             httpx.AsyncClient(

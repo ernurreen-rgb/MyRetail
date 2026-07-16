@@ -26,6 +26,7 @@ from myretail_api.routers.products import router as products_router
 from myretail_api.routers.purchases import purchases_router, suppliers_router
 from myretail_api.routers.stock import router as stock_router
 from myretail_api.state.lifespan import build_state_lifespan
+from myretail_api.state.sessions import SQLiteSessionRepository
 from myretail_api.tenancy import build_isolated_tenant_route
 
 
@@ -45,6 +46,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.tenant_route_snapshot = tenant_route
     if effective_settings.state_backend == "sqlite":
         app.state.login_rate_limiter = build_sqlite_login_rate_limiter(effective_settings)
+        app.state.session_repository = SQLiteSessionRepository(
+            effective_settings.auth_session_db_path
+        )
     app.dependency_overrides[get_settings] = _settings_provider(effective_settings)
     app.add_middleware(ApiSecurityHeadersMiddleware)
     app.add_exception_handler(Exception, internal_server_error_handler)

@@ -22,6 +22,13 @@ IntentState: TypeAlias = Literal[
     "completed",
     "failed",
 ]
+SessionRevocationReason: TypeAlias = Literal[
+    "logout",
+    "admin_revoke",
+    "role_change",
+    "route_change",
+    "security_incident",
+]
 
 
 @dataclass(frozen=True)
@@ -85,6 +92,19 @@ class RateLimitDecision:
     allowed: bool
     retry_after_seconds: int = 0
     reservation_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class AuthSession:
+    tenant_id: str
+    session_id: UUID
+    principal_id: UUID
+    normalized_email: str
+    auth_epoch: int
+    route_version: int
+    issued_at: datetime
+    expires_at: datetime
+    revoked_at: datetime | None = None
 
 
 class IdempotencyRepository(Protocol):
@@ -357,6 +377,43 @@ class LoginRateLimitRepository(Protocol):
         reservation_at: datetime,
     ) -> None: ...
 
+
+class SessionRepository(Protocol):
+    async def issue_session(
+        self,
+        *,
+        tenant_id: str,
+        email: str,
+        route_version: int,
+        ttl_seconds: int,
+    ) -> AuthSession: ...
+
+    async def validate_session(
+        self,
+        *,
+        tenant_id: str,
+        session_id: UUID,
+        principal_id: UUID,
+        auth_epoch: int,
+        route_version: int,
+    ) -> AuthSession | None: ...
+
+    async def revoke_session(
+        self,
+        *,
+        tenant_id: str,
+        session_id: UUID,
+        reason: SessionRevocationReason,
+        revoked_by_principal_id: UUID | None = None,
+    ) -> None: ...
+
+    async def revoke_principal_sessions(
+        self,
+        *,
+        tenant_id: str,
+        email: str,
+        revoked_by_principal_id: UUID,
+    ) -> None: ...
 
 class StateHealthRepository(Protocol):
     async def verify(self) -> None: ...

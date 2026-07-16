@@ -335,6 +335,104 @@ describe("POST /api/auth/logout", () => {
     expect(setCookie).toContain("Max-Age=0");
   });
 
+  it("revokes the backend session before clearing authenticated cookies", async () => {
+    process.env.MYRETAIL_API_URL = "http://api.test";
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await logout(
+      new Request(LOGOUT_URL, {
+        method: "POST",
+        headers: {
+          Cookie:
+            "myretail_access_token=signed-token; myretail_tenant=myretail",
+          Origin: "http://localhost:3000",
+          "Sec-Fetch-Site": "same-origin",
+        },
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("set-cookie")).toContain("Max-Age=0");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://api.test/auth/logout",
+      expect.objectContaining({
+        method: "POST",
+        headers: {
+          Authorization: "Bearer signed-token",
+          "X-MyRetail-Tenant": "myretail",
+        },
+        signal: expect.any(AbortSignal),
+      }),
+    );
+  });
+
+  it("clears cookies when the backend reports an already invalid session", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(Response.json({ detail: "invalid" }, { status: 401 })),
+    );
+
+    const response = await logout(
+      new Request(LOGOUT_URL, {
+        method: "POST",
+        headers: {
+          Cookie:
+            "myretail_access_token=signed-token; myretail_tenant=myretail",
+          Origin: "http://localhost:3000",
+          "Sec-Fetch-Site": "same-origin",
+        },
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("set-cookie")).toContain("Max-Age=0");
+  });
+
+  it("retains cookies when backend revocation is unavailable", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(Response.json({ detail: "unavailable" }, { status: 503 })),
+    );
+
+    const response = await logout(
+      new Request(LOGOUT_URL, {
+        method: "POST",
+        headers: {
+          Cookie:
+            "myretail_access_token=signed-token; myretail_tenant=myretail",
+          Origin: "http://localhost:3000",
+          "Sec-Fetch-Site": "same-origin",
+        },
+      }),
+    );
+
+    expect(response.status).toBe(503);
+    expect(response.headers.get("set-cookie")).toBeNull();
+  });
+
+  it("retains cookies when backend revocation times out", async () => {
+    const timeoutError = Object.assign(new Error("timed out"), {
+      name: "TimeoutError",
+    });
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(timeoutError));
+
+    const response = await logout(
+      new Request(LOGOUT_URL, {
+        method: "POST",
+        headers: {
+          Cookie:
+            "myretail_access_token=signed-token; myretail_tenant=myretail",
+          Origin: "http://localhost:3000",
+          "Sec-Fetch-Site": "same-origin",
+        },
+      }),
+    );
+
+    expect(response.status).toBe(503);
+    expect(response.headers.get("set-cookie")).toBeNull();
+  });
+
   it("keeps the browser host when localhost is used as a development alias", async () => {
     process.env.MYRETAIL_WEB_ORIGIN = "http://127.0.0.1:3000";
 
