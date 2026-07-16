@@ -26,16 +26,33 @@ class FencedLease:
 
 @dataclass(frozen=True)
 class WorkflowIntent:
-    intent_id: UUID
+    intent_id: str
     tenant_id: str
     operation: str
     scope_key: str
+    principal_key: str
+    business_hash: str
     external_marker: str
     state: IntentState
     payload: JsonObject
     lease: FencedLease | None = None
     erp_document_id: str | None = None
     result_id: str | None = None
+
+
+@dataclass(frozen=True)
+class WorkflowIntentClaim:
+    acquired: bool
+    intent: WorkflowIntent
+    recovery_only: bool = False
+
+
+@dataclass(frozen=True)
+class POSIdempotencyClaim:
+    acquired: bool
+    record: IdempotencyRecord | None = None
+    expired: bool = False
+    fencing_token: int = 0
 
 
 @dataclass(frozen=True)
@@ -104,6 +121,53 @@ class IdempotencyRepository(Protocol):
     ) -> bool: ...
 
 
+class POSIdempotencyRepository(Protocol):
+    async def begin(
+        self,
+        *,
+        tenant_id: str,
+        operation: str,
+        principal_key: str,
+        idempotency_key: str,
+        request_hash: str,
+        lease_seconds: float = 60.0,
+    ) -> POSIdempotencyClaim: ...
+
+    async def get_completed(
+        self,
+        *,
+        tenant_id: str,
+        operation: str,
+        principal_key: str,
+        idempotency_key: str,
+        request_hash: str,
+    ) -> IdempotencyRecord | None: ...
+
+    async def complete(
+        self,
+        *,
+        tenant_id: str,
+        operation: str,
+        principal_key: str,
+        idempotency_key: str,
+        request_hash: str,
+        fencing_token: int,
+        status_code: int,
+        response_body: dict[str, object],
+    ) -> bool: ...
+
+    async def release(
+        self,
+        *,
+        tenant_id: str,
+        operation: str,
+        principal_key: str,
+        idempotency_key: str,
+        request_hash: str,
+        fencing_token: int,
+    ) -> bool: ...
+
+
 class WorkflowIntentRepository(Protocol):
     async def reserve(
         self,
@@ -115,27 +179,66 @@ class WorkflowIntentRepository(Protocol):
         business_hash: str,
         external_marker: str,
         payload: JsonObject,
-        lease_owner: UUID,
-    ) -> WorkflowIntent: ...
+        expected_shift_updated_at: str | None = None,
+        require_no_held_receipts: bool = False,
+        lease_seconds: float = 60.0,
+    ) -> WorkflowIntentClaim: ...
+
+    async def find_active(
+        self,
+        *,
+        tenant_id: str,
+        operation: str,
+        principal_key: str,
+        business_hash: str,
+    ) -> WorkflowIntent | None: ...
+
+    async def claim(
+        self,
+        *,
+        tenant_id: str,
+        intent_id: str,
+        lease_seconds: float = 60.0,
+    ) -> WorkflowIntentClaim: ...
 
     async def claim_due(
         self,
         *,
         tenant_id: str,
-        lease_owner: UUID,
         limit: int,
+        lease_seconds: float = 60.0,
     ) -> Sequence[WorkflowIntent]: ...
 
-    async def transition(
+    async def get(
         self,
         *,
         tenant_id: str,
-        intent_id: UUID,
+        intent_id: str,
+    ) -> WorkflowIntent | None: ...
+
+    async def mark_erp_pending(
+        self,
+        *,
+        tenant_id: str,
+        intent_id: str,
         lease: FencedLease,
-        expected_states: frozenset[IntentState],
-        target_state: IntentState,
-        erp_document_id: str | None = None,
-        result_id: str | None = None,
+    ) -> bool: ...
+
+    async def mark_recovery_required(
+        self,
+        *,
+        tenant_id: str,
+        intent_id: str,
+        lease: FencedLease,
+        last_error_code: str | None = None,
+    ) -> bool: ...
+
+    async def fail(
+        self,
+        *,
+        tenant_id: str,
+        intent_id: str,
+        lease: FencedLease,
         last_error_code: str | None = None,
     ) -> bool: ...
 
