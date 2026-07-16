@@ -12,6 +12,8 @@ from myretail_api.state.schema import (
     EXPECTED_STATE_SCHEMA_REVISION,
     PREAUTH_STATE_TABLES,
     STATE_APP_ROLE,
+    STATE_MIGRATOR_ROLE,
+    STATE_OWNER_ROLE,
     STATE_SCHEMA,
     TENANT_STATE_TABLES,
 )
@@ -146,6 +148,32 @@ async def _verify_connection_contract(connection: AsyncConnection) -> None:
     ):
         raise StateStartupError("PostgreSQL state application role is overprivileged")
 
+    memberships = (
+        await connection.execute(
+            text(
+                """
+                SELECT granted.rolname
+                FROM pg_auth_members AS membership
+                JOIN pg_roles AS member ON member.oid = membership.member
+                JOIN pg_roles AS granted ON granted.oid = membership.roleid
+                WHERE member.rolname = current_user
+                ORDER BY granted.rolname
+                """
+            )
+        )
+    ).scalars().all()
+    if memberships:
+        raise StateStartupError("PostgreSQL state application role membership is invalid")
+    for privileged_role in (STATE_OWNER_ROLE, STATE_MIGRATOR_ROLE):
+        can_assume_role = (
+            await connection.execute(
+                text("SELECT pg_has_role(current_user, :role_name, 'MEMBER')"),
+                {"role_name": privileged_role},
+            )
+        ).scalar_one()
+        if can_assume_role:
+            raise StateStartupError("PostgreSQL state application role membership is invalid")
+
     read_only = (await connection.execute(text("SHOW transaction_read_only"))).scalar_one()
     if str(read_only).lower() != "off":
         raise StateStartupError("PostgreSQL state connection is read-only")
@@ -162,6 +190,12 @@ async def _verify_connection_contract(connection: AsyncConnection) -> None:
             SELECT has_schema_privilege(current_user, :schema_name, 'USAGE') AS has_usage,
                    has_schema_privilege(current_user, :schema_name, 'CREATE') AS has_create,
                    (
+                       SELECT owner_role.rolname
+                       FROM pg_namespace AS namespace
+                       JOIN pg_roles AS owner_role ON owner_role.oid = namespace.nspowner
+                       WHERE namespace.nspname = :schema_name
+                   ) AS schema_owner,
+                   (
                        SELECT count(*)
                        FROM pg_tables
                        WHERE schemaname = :schema_name AND tableowner = current_user
@@ -171,26 +205,46 @@ async def _verify_connection_contract(connection: AsyncConnection) -> None:
         {"schema_name": STATE_SCHEMA},
     )
     privileges = privilege_result.mappings().one()
-    if not privileges["has_usage"] or privileges["has_create"] or privileges["owned_tables"]:
+    if (
+        not privileges["has_usage"]
+        or privileges["has_create"]
+        or privileges["owned_tables"]
+        or privileges["schema_owner"] != STATE_OWNER_ROLE
+    ):
         raise StateStartupError("PostgreSQL state application grants are invalid")
 
     rls_result = await connection.execute(
         text(
             """
-            SELECT c.relname, c.relrowsecurity, c.relforcerowsecurity
+            SELECT c.relname,
+                   c.relkind::text AS relkind,
+                   c.relrowsecurity,
+                   c.relforcerowsecurity,
+                   owner_role.rolname AS table_owner
             FROM pg_class AS c
             JOIN pg_namespace AS n ON n.oid = c.relnamespace
-            WHERE n.nspname = :schema_name AND c.relkind = 'r'
+            JOIN pg_roles AS owner_role ON owner_role.oid = c.relowner
+            WHERE n.nspname = :schema_name
+              AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
             """
         ),
         {"schema_name": STATE_SCHEMA},
     )
+    tables = {row["relname"]: row for row in rls_result.mappings()}
+    expected_tables = set((*TENANT_STATE_TABLES, *PREAUTH_STATE_TABLES))
+    if set(tables) != expected_tables:
+        raise StateStartupError("PostgreSQL state table inventory is invalid")
+    if any(row["relkind"] != "r" for row in tables.values()):
+        raise StateStartupError("PostgreSQL state table inventory is invalid")
+    if any(row["table_owner"] != STATE_OWNER_ROLE for row in tables.values()):
+        raise StateStartupError("PostgreSQL state table ownership is invalid")
+
     rls_tables = {
         row["relname"]
-        for row in rls_result.mappings()
+        for row in tables.values()
         if row["relrowsecurity"] and row["relforcerowsecurity"]
     }
-    if not set(TENANT_STATE_TABLES).issubset(rls_tables):
+    if rls_tables != set(TENANT_STATE_TABLES):
         raise StateStartupError("PostgreSQL state tenant RLS contract is invalid")
 
     policy_result = await connection.execute(
@@ -244,6 +298,60 @@ async def _verify_connection_contract(connection: AsyncConnection) -> None:
             or policy["check_expression"] != expected_expression
         ):
             raise StateStartupError("PostgreSQL state tenant policy contract is invalid")
+
+    await _verify_tenant_table_grants(connection)
+
+
+async def _verify_tenant_table_grants(connection: AsyncConnection) -> None:
+    result = await connection.execute(
+        text(
+            """
+            SELECT c.relname,
+                   has_table_privilege(
+                       current_user, quote_ident(n.nspname) || '.' || quote_ident(c.relname),
+                       'SELECT'
+                   ) AS can_select,
+                   has_table_privilege(
+                       current_user, quote_ident(n.nspname) || '.' || quote_ident(c.relname),
+                       'INSERT'
+                   ) AS can_insert,
+                   has_table_privilege(
+                       current_user, quote_ident(n.nspname) || '.' || quote_ident(c.relname),
+                       'UPDATE'
+                   ) AS can_update,
+                   has_table_privilege(
+                       current_user, quote_ident(n.nspname) || '.' || quote_ident(c.relname),
+                       'DELETE'
+                   ) AS can_delete,
+                   has_table_privilege(
+                       current_user, quote_ident(n.nspname) || '.' || quote_ident(c.relname),
+                       'TRUNCATE, REFERENCES, TRIGGER'
+                   ) AS has_extra_privileges
+            FROM pg_class AS c
+            JOIN pg_namespace AS n ON n.oid = c.relnamespace
+            WHERE n.nspname = :schema_name
+              AND c.relname = ANY(CAST(:table_names AS text[]))
+              AND c.relkind = 'r'
+            ORDER BY c.relname
+            """
+        ),
+        {
+            "schema_name": STATE_SCHEMA,
+            "table_names": list(TENANT_STATE_TABLES),
+        },
+    )
+    grants = {row["relname"]: row for row in result.mappings()}
+    if set(grants) != set(TENANT_STATE_TABLES):
+        raise StateStartupError("PostgreSQL state tenant table grants are invalid")
+    for grant in grants.values():
+        if (
+            not all(
+                grant[name]
+                for name in ("can_select", "can_insert", "can_update", "can_delete")
+            )
+            or grant["has_extra_privileges"]
+        ):
+            raise StateStartupError("PostgreSQL state tenant table grants are invalid")
 
 
 async def _verify_rls_canary(connection: AsyncConnection) -> None:

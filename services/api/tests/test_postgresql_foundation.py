@@ -180,11 +180,31 @@ async def test_roles_ownership_rls_and_revision_match_contract() -> None:
             assert not role["rolreplication"]
             assert not role["rolbypassrls"]
 
-        owners = await connection.fetch(
-            "SELECT DISTINCT tableowner FROM pg_tables WHERE schemaname = $1",
+        memberships = await connection.fetch(
+            """
+            SELECT member_role.rolname AS member_name,
+                   granted_role.rolname AS granted_name
+            FROM pg_auth_members AS membership
+            JOIN pg_roles AS member_role ON member_role.oid = membership.member
+            JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+            WHERE member_role.rolname = ANY($1::text[])
+            ORDER BY member_role.rolname, granted_role.rolname
+            """,
+            [STATE_MIGRATOR_ROLE, STATE_APP_ROLE],
+        )
+        assert [
+            (str(row["member_name"]), str(row["granted_name"]))
+            for row in memberships
+        ] == [(STATE_MIGRATOR_ROLE, STATE_OWNER_ROLE)]
+
+        state_tables = await connection.fetch(
+            "SELECT tablename, tableowner FROM pg_tables WHERE schemaname = $1",
             STATE_SCHEMA,
         )
-        assert {str(owner["tableowner"]) for owner in owners} == {STATE_OWNER_ROLE}
+        assert {str(row["tablename"]) for row in state_tables} == set(
+            (*TENANT_STATE_TABLES, *PREAUTH_STATE_TABLES)
+        )
+        assert {str(row["tableowner"]) for row in state_tables} == {STATE_OWNER_ROLE}
         assert not await connection.fetchval(
             "SELECT has_schema_privilege($1, $2, 'CREATE')",
             STATE_APP_ROLE,
@@ -330,7 +350,7 @@ async def test_startup_fails_closed_when_rls_canary_cannot_write() -> None:
             f"REVOKE INSERT ON {STATE_SCHEMA}.rls_canary FROM {STATE_APP_ROLE}"
         )
     try:
-        with pytest.raises(StateStartupError, match="state storage is unavailable"):
+        with pytest.raises(StateStartupError, match="tenant table grants"):
             await PostgresStateRuntime.start(postgres_settings())
     finally:
         async with admin_connection() as connection:
@@ -372,6 +392,84 @@ async def test_startup_fails_closed_on_extra_permissive_tenant_policy() -> None:
         async with admin_connection() as connection:
             await connection.execute(
                 f"DROP POLICY pos_sales_unsafe_allow_all ON {STATE_SCHEMA}.pos_sales"
+            )
+
+
+@pytest.mark.anyio
+async def test_startup_fails_closed_when_app_role_can_assume_owner() -> None:
+    async with admin_connection() as connection:
+        await connection.execute(f"GRANT {STATE_OWNER_ROLE} TO {STATE_APP_ROLE}")
+    try:
+        with pytest.raises(StateStartupError, match="role membership"):
+            await PostgresStateRuntime.start(postgres_settings())
+    finally:
+        async with admin_connection() as connection:
+            await connection.execute(f"REVOKE {STATE_OWNER_ROLE} FROM {STATE_APP_ROLE}")
+
+
+@pytest.mark.anyio
+async def test_startup_fails_closed_on_unexpected_unprotected_state_table() -> None:
+    async with admin_connection() as connection:
+        await connection.execute(
+            f"CREATE TABLE {STATE_SCHEMA}.unexpected_state (record_id bigint PRIMARY KEY)"
+        )
+        await connection.execute(
+            f"ALTER TABLE {STATE_SCHEMA}.unexpected_state OWNER TO {STATE_OWNER_ROLE}"
+        )
+    try:
+        with pytest.raises(StateStartupError, match="table inventory"):
+            await PostgresStateRuntime.start(postgres_settings())
+    finally:
+        async with admin_connection() as connection:
+            await connection.execute(f"DROP TABLE {STATE_SCHEMA}.unexpected_state")
+
+
+@pytest.mark.anyio
+async def test_startup_fails_closed_on_unexpected_state_view() -> None:
+    async with admin_connection() as connection:
+        await connection.execute(
+            f"CREATE VIEW {STATE_SCHEMA}.unexpected_view AS SELECT 1 AS value"
+        )
+        await connection.execute(
+            f"ALTER VIEW {STATE_SCHEMA}.unexpected_view OWNER TO {STATE_OWNER_ROLE}"
+        )
+    try:
+        with pytest.raises(StateStartupError, match="table inventory"):
+            await PostgresStateRuntime.start(postgres_settings())
+    finally:
+        async with admin_connection() as connection:
+            await connection.execute(f"DROP VIEW {STATE_SCHEMA}.unexpected_view")
+
+
+@pytest.mark.anyio
+async def test_startup_fails_closed_on_state_table_owner_drift() -> None:
+    async with admin_connection() as connection:
+        await connection.execute(
+            f"ALTER TABLE {STATE_SCHEMA}.rls_canary OWNER TO postgres"
+        )
+    try:
+        with pytest.raises(StateStartupError, match="table ownership"):
+            await PostgresStateRuntime.start(postgres_settings())
+    finally:
+        async with admin_connection() as connection:
+            await connection.execute(
+                f"ALTER TABLE {STATE_SCHEMA}.rls_canary OWNER TO {STATE_OWNER_ROLE}"
+            )
+
+
+@pytest.mark.anyio
+async def test_startup_fails_closed_on_elevated_tenant_table_grant() -> None:
+    async with admin_connection() as connection:
+        await connection.execute(
+            f"GRANT TRUNCATE ON {STATE_SCHEMA}.pos_sales TO {STATE_APP_ROLE}"
+        )
+    try:
+        with pytest.raises(StateStartupError, match="tenant table grants"):
+            await PostgresStateRuntime.start(postgres_settings())
+    finally:
+        async with admin_connection() as connection:
+            await connection.execute(
+                f"REVOKE TRUNCATE ON {STATE_SCHEMA}.pos_sales FROM {STATE_APP_ROLE}"
             )
 
 
