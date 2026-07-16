@@ -18,6 +18,7 @@ dependencies = [
 
 [project.scripts]
 myretail-state-migrate = "myretail_api.migrations.cli:main"
+myretail-state-monitor = "myretail_api.state.monitor:main"
 myretail-state-preflight = "myretail_api.state.preflight:main"
 
 [project.optional-dependencies]

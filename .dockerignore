@@ -1,5 +1,13 @@
 **
 !.dockerignore
+!package.json
+!package-lock.json
+!apps/
+!apps/web/
+!apps/web/**
+apps/web/.next/
+apps/web/node_modules/
+apps/web/tsconfig.tsbuildinfo
 !services/
 !services/api/
 !services/api/Dockerfile
@@ -11,6 +19,10 @@
 !services/api/src/**
 services/api/src/**/__pycache__/
 services/api/src/**/*.py[cod]
+!infra/
+!infra/aws/
+!infra/aws/database-bootstrap/
+!infra/aws/database-bootstrap/**
 **/.env
 **/.env.*
 **/cookies.json

@@ -1,0 +1,6 @@
+bucket       = "replace-with-bootstrap-state-bucket"
+key          = "myretail/production/terraform.tfstate"
+region       = "eu-central-1"
+encrypt      = true
+kms_key_id   = "replace-with-bootstrap-kms-key-arn"
+use_lockfile = true

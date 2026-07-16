@@ -66,6 +66,9 @@ credential-bearing URL, database DSN, token, password и private key откло�
 
 ## Текущая граница
 
-На 16.07.2026 в доступном workspace/GitHub отсутствуют production environment, cloud/IaC context,
-repository secrets/variables, deployments и подключение к managed PostgreSQL provider. Поэтому
-внешний evidence manifest пока не может быть правдиво заполнен, а traffic остаётся закрытым.
+На 16.07.2026 provider baseline выбран: AWS, RDS PostgreSQL Multi-AZ и ECS/Fargate. В репозитории
+есть fail-closed Terraform, GitHub OIDC workflow, immutable image publishing, Secrets Manager role
+bootstrap, migration/preflight/monitor tasks и восемь обязательных классов alert. Однако AWS account,
+production environment variables/secrets, DNS/ACM и отдельный production-like ERPNext site ещё не
+предоставлены, поэтому ни один live provider evidence не существует. Внешний manifest пока нельзя
+правдиво заполнить, а `traffic_enabled` остаётся `false`.

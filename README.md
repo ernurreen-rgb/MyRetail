@@ -93,6 +93,10 @@ Real managed-environment cutover evidence is a separate Phase 6B.3 gate document
 `docs/security/postgresql-production-cutover-evidence.md`. The committed manifest is only a blocked
 template; production approval requires the default validator mode and authoritative provider links.
 
+The fail-closed AWS production baseline and protected OIDC workflows are documented in
+`infra/aws/README.md`. They provision no running tasks until the external restore, rotation, alert,
+smoke and approval evidence gates are satisfied.
+
 ## Validate
 
 ```powershell
