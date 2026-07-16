@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
@@ -15,7 +16,7 @@ from myretail_api.config import Settings
 from myretail_api.dependencies import get_erpnext_client
 from myretail_api.main import create_app
 from myretail_api.models.auth import AuthenticatedUser
-from myretail_api.models.pos import POSProduct, Register
+from myretail_api.models.pos import POSProduct, Register, Shift
 from myretail_api.models.stock import WarehouseRef
 from myretail_api.pos_store import POSStoreConflictError
 from myretail_api.security import create_access_token
@@ -54,6 +55,14 @@ class ProjectionERPNextStub:
         self.returns: list[str] = []
         self.cancelled_returns: set[str] = set()
         self.cancel_attempts = 0
+        self.close_calls: list[dict[str, object]] = []
+        self.closing_by_key: dict[str, str] = {}
+        self.block_close = False
+        self.close_started = asyncio.Event()
+        self.release_close = asyncio.Event()
+        self.block_return = False
+        self.return_started = asyncio.Event()
+        self.release_return = asyncio.Event()
         self._sale_lock = asyncio.Lock()
         self._return_lock = asyncio.Lock()
         self._cancel_lock = asyncio.Lock()
@@ -83,14 +92,20 @@ class ProjectionERPNextStub:
         return None
 
     async def create_pos_closing(self, **kwargs: object) -> str:
-        _ = kwargs
+        self.close_calls.append(dict(kwargs))
         closing = f"CLOSE-{len(self.closings) + 1}"
         self.closings.append(closing)
+        self.closing_by_key[str(kwargs["idempotency_key"])] = closing
+        if self.block_close:
+            self.close_started.set()
+            await self.release_close.wait()
         return closing
 
-    async def recover_pos_closing(self, *args: object) -> None:
-        _ = args
-        return None
+    async def recover_pos_closing(
+        self, tenant: str, operation: str, user_email: str, idempotency_key: str
+    ) -> str | None:
+        _ = tenant, operation, user_email
+        return self.closing_by_key.get(idempotency_key)
 
     async def create_pos_sales_invoice(self, **kwargs: object) -> str:
         _ = kwargs
@@ -107,6 +122,9 @@ class ProjectionERPNextStub:
     async def create_pos_sales_return(self, **kwargs: object) -> str:
         _ = kwargs
         async with self._return_lock:
+            if self.block_return:
+                self.return_started.set()
+                await self.release_return.wait()
             await asyncio.sleep(0.05)
             invoice = f"RET-{len(self.returns) + 1}"
             self.returns.append(invoice)
@@ -341,22 +359,44 @@ async def test_postgresql_request_path_is_shared_and_exact_once_across_two_pools
                     }
                 ],
             }
-            returned, return_replay = await asyncio.gather(
+            erpnext.block_return = True
+            returned_task = asyncio.create_task(
                 first.post(
                     "/pos/returns",
                     headers=headers(settings, key=str(uuid4())),
                     json=return_body,
-                ),
+                )
+            )
+            await asyncio.wait_for(erpnext.return_started.wait(), timeout=2)
+            close_during_return = await second.post(
+                f"/pos/shifts/{shift['id']}/close",
+                headers=headers(settings, key=str(uuid4())),
+                json={
+                    "actual_cash": "10200.00",
+                    "expected_updated_at": current.json()["updated_at"],
+                },
+            )
+            return_replay_task = asyncio.create_task(
                 second.post(
                     "/pos/returns",
                     headers=headers(settings, key=str(uuid4())),
                     json=return_body,
-                ),
+                )
             )
+            await asyncio.sleep(0.05)
+            erpnext.release_return.set()
+            returned, return_replay = await asyncio.gather(
+                returned_task,
+                return_replay_task,
+            )
+            erpnext.block_return = False
             assert returned.status_code == 201, returned.text
             assert return_replay.status_code == 201, return_replay.text
+            assert close_during_return.status_code == 409, close_during_return.text
+            assert close_during_return.json()["error"]["code"] == "SHIFT_CHANGED"
             assert return_replay.json()["return_id"] == returned.json()["return_id"]
             assert erpnext.returns == ["RET-1"]
+            assert erpnext.closings == []
             after_return = await second.get(
                 "/pos/shifts/current",
                 params={"register_id": "POS-1"},
@@ -428,9 +468,70 @@ async def test_postgresql_request_path_is_shared_and_exact_once_across_two_pools
                 params={"register_id": "POS-1"},
                 headers=headers(settings),
             )
-            closed = await second.post(
-                f"/pos/shifts/{shift['id']}/close",
+            erpnext.block_close = True
+            close_key = str(uuid4())
+            close_task = asyncio.create_task(
+                second.post(
+                    f"/pos/shifts/{shift['id']}/close",
+                    headers=headers(settings, key=close_key),
+                    json={
+                        "actual_cash": "10200.00",
+                        "expected_updated_at": refreshed.json()["updated_at"],
+                    },
+                )
+            )
+            await asyncio.wait_for(erpnext.close_started.wait(), timeout=2)
+            return_during_close = await first.post(
+                "/pos/returns",
                 headers=headers(settings, key=str(uuid4())),
+                json={
+                    "sale_id": second_sale.json()["id"],
+                    "register_id": "POS-1",
+                    "shift_id": shift["id"],
+                    "refund_method": "cash",
+                    "reason": "damaged",
+                    "lines": [
+                        {
+                            "line_id": f"{second_sale.json()['id']}:line:1",
+                            "quantity": "1.000",
+                        }
+                    ],
+                },
+            )
+            assert return_during_close.status_code == 409, return_during_close.text
+            assert return_during_close.json()["error"]["code"] == "SHIFT_CHANGED"
+            assert erpnext.returns == ["RET-1"]
+            async with first_app.state.pos_state_repository._engine.begin() as connection:
+                await connection.execute(
+                    text("SELECT set_config('myretail.tenant_id', :tenant, true)"),
+                    {"tenant": settings.tenant_slug},
+                )
+                await connection.execute(
+                    text(
+                        "UPDATE myretail_state.pos_shifts SET sales_total = 999 "
+                        "WHERE tenant_id = :tenant AND shift_id = :shift_id"
+                    ),
+                    {"tenant": settings.tenant_slug, "shift_id": shift["id"]},
+                )
+            erpnext.release_close.set()
+            drifted_close = await asyncio.wait_for(close_task, timeout=2)
+            assert drifted_close.status_code == 503, drifted_close.text
+            assert drifted_close.json()["error"]["code"] == "ERPNEXT_RECOVERY_PENDING"
+            async with first_app.state.pos_state_repository._engine.begin() as connection:
+                await connection.execute(
+                    text("SELECT set_config('myretail.tenant_id', :tenant, true)"),
+                    {"tenant": settings.tenant_slug},
+                )
+                await connection.execute(
+                    text(
+                        "UPDATE myretail_state.pos_shifts SET sales_total = 200 "
+                        "WHERE tenant_id = :tenant AND shift_id = :shift_id"
+                    ),
+                    {"tenant": settings.tenant_slug, "shift_id": shift["id"]},
+                )
+            closed = await first.post(
+                f"/pos/shifts/{shift['id']}/close",
+                headers=headers(settings, key=close_key),
                 json={
                     "actual_cash": "10200.00",
                     "expected_updated_at": refreshed.json()["updated_at"],
@@ -439,6 +540,11 @@ async def test_postgresql_request_path_is_shared_and_exact_once_across_two_pools
             assert closed.status_code == 200, closed.text
             assert closed.json()["status"] == "closed"
             assert erpnext.closings == ["CLOSE-1"]
+            assert len(erpnext.close_calls) == 1
+            frozen_shift = erpnext.close_calls[0]["shift"]
+            assert isinstance(frozen_shift, Shift)
+            assert frozen_shift.sales_total == "200.00"
+            assert frozen_shift.expected_cash == "10200.00"
 
 
 @pytest.mark.anyio
@@ -503,6 +609,100 @@ async def test_postgresql_projection_materialization_rejects_stale_owner_atomica
         assert projected["id"] == shift_id
         assert projected["erpnext_opening_id"] == "OPEN-1"
         assert await first.get_shift(f"other-{tenant}", shift_id) is None
+
+        close_claim = await first.begin_operation_intent(
+            tenant=tenant,
+            operation="close_shift",
+            scope_id=f"shift:{shift_id}",
+            user_email="cashier@example.test",
+            business_hash=f"close-{uuid4()}",
+            payload={
+                "close": {
+                    "tenant": tenant,
+                    "shift_id": shift_id,
+                    "cashier_email": "cashier@example.test",
+                    "expected_updated_at": "2026-07-16T12:00:00Z",
+                    "actual_cash": "10000.00",
+                    "difference": "0.00",
+                    "closed_at": "2026-07-16T12:01:00Z",
+                },
+                "shift_snapshot": {
+                    "id": shift_id,
+                    "register": {"id": "POS-1", "name": "Main register"},
+                    "warehouse": {"id": "WH-1", "name": "Main warehouse"},
+                    "cashier": {
+                        "email": "cashier@example.test",
+                        "full_name": "Cashier",
+                    },
+                    "status": "open",
+                    "opening_cash": "10000.00",
+                    "sales_total": "0.00",
+                    "expected_cash": "10000.00",
+                    "actual_cash": None,
+                    "difference": None,
+                    "opened_at": "2026-07-16T12:00:00Z",
+                    "closed_at": None,
+                    "updated_at": "2026-07-16T12:00:00Z",
+                },
+                "cash_snapshot": {
+                    "opening_cash": "10000.00",
+                    "sales_total": "0.00",
+                    "cash_returns_total": "0.00",
+                    "expected_cash": "10000.00",
+                },
+            },
+            expected_shift_updated_at="2026-07-16T12:00:00Z",
+            require_no_held_receipts=True,
+            lease_seconds=0.01,
+        )
+        close_stale_token = int(close_claim.intent["fencing_token"])
+        assert await first.mark_operation_erp_pending(
+            tenant,
+            str(close_claim.intent["id"]),
+            close_stale_token,
+        )
+        await asyncio.sleep(0.05)
+        close_takeover = await second.claim_operation_intent(
+            tenant,
+            str(close_claim.intent["id"]),
+        )
+        assert close_takeover.acquired
+        assert close_takeover.recovery_only
+        assert int(close_takeover.intent["fencing_token"]) > close_stale_token
+        with pytest.raises(POSStoreConflictError, match="lease"):
+            await first.materialize_close_shift_intent(
+                tenant,
+                str(close_claim.intent["id"]),
+                close_stale_token,
+                "CLOSE-STALE",
+            )
+        still_open = await first.get_shift(tenant, shift_id)
+        assert still_open is not None
+        assert still_open["status"] == "open"
+
+        closed = await second.materialize_close_shift_intent(
+            tenant,
+            str(close_takeover.intent["id"]),
+            int(close_takeover.intent["fencing_token"]),
+            "CLOSE-1",
+        )
+        assert closed["status"] == "closed"
+        assert closed["erpnext_closing_id"] == "CLOSE-1"
+        assert closed["sales_total"] == "0.00"
+        assert closed["expected_cash"] == "10000.00"
+        async with second_runtime.engine.begin() as connection:
+            await connection.execute(
+                text("SELECT set_config('myretail.tenant_id', :tenant, true)"),
+                {"tenant": tenant},
+            )
+            cash_returns_total = await connection.scalar(
+                text(
+                    "SELECT cash_returns_total FROM myretail_state.pos_shifts "
+                    "WHERE tenant_id = :tenant AND shift_id = :shift_id"
+                ),
+                {"tenant": tenant, "shift_id": shift_id},
+            )
+        assert cash_returns_total == Decimal("0")
     finally:
         await first_runtime.close()
         await second_runtime.close()
