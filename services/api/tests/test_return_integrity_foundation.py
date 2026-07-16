@@ -115,6 +115,23 @@ async def assert_cash_event_contract(
         )
     assert invalid_sign.value.code == "IDEMPOTENCY_CONFLICT"
 
+    collision_id = uuid4()
+    collision_arguments = {
+        **arguments,
+        "event_id": collision_id,
+        "source_id": f"RETURN-{uuid4()}",
+    }
+    collision_owner = await first.append_cash_event(**collision_arguments)
+    assert collision_owner.created
+    with pytest.raises(POSStoreConflictError) as event_id_collision:
+        await second.append_cash_event(
+            **{
+                **collision_arguments,
+                "source_id": f"RETURN-{uuid4()}",
+            }
+        )
+    assert event_id_collision.value.code == "IDEMPOTENCY_CONFLICT"
+
 
 @pytest.mark.anyio
 async def test_sqlite_cash_event_is_append_only_and_exact_once(tmp_path: Path) -> None:

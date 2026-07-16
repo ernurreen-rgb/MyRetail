@@ -1126,9 +1126,7 @@ class PostgresPOSRepository:
                                 :source_type, :source_id, :effect_kind,
                                 :amount_delta, CAST(:created_at AS timestamptz)
                             )
-                            ON CONFLICT (
-                                tenant_id, source_type, source_id, effect_kind
-                            ) DO NOTHING
+                            ON CONFLICT DO NOTHING
                             RETURNING *
                             """
                         ),
@@ -1147,29 +1145,30 @@ class PostgresPOSRepository:
                 row = inserted
                 if row is None:
                     row = (
-                        (
-                            await connection.execute(
-                                text(
-                                    """
-                                    SELECT *
-                                    FROM myretail_state.pos_shift_cash_events
-                                    WHERE tenant_id = :tenant_id
-                                      AND source_type = :source_type
-                                      AND source_id = :source_id
-                                      AND effect_kind = :effect_kind
-                                    """
-                                ),
-                                {
-                                    "tenant_id": tenant_id,
-                                    "source_type": source_type,
-                                    "source_id": source_id,
-                                    "effect_kind": effect_kind,
-                                },
-                            )
+                        await connection.execute(
+                            text(
+                                """
+                                SELECT *
+                                FROM myretail_state.pos_shift_cash_events
+                                WHERE tenant_id = :tenant_id
+                                  AND source_type = :source_type
+                                  AND source_id = :source_id
+                                  AND effect_kind = :effect_kind
+                                """
+                            ),
+                            {
+                                "tenant_id": tenant_id,
+                                "source_type": source_type,
+                                "source_id": source_id,
+                                "effect_kind": effect_kind,
+                            },
                         )
-                        .mappings()
-                        .one()
-                    )
+                    ).mappings().one_or_none()
+                    if row is None:
+                        raise POSStoreConflictError(
+                            "IDEMPOTENCY_CONFLICT",
+                            "Cash event identity is already bound to another effect",
+                        )
                 persisted = _cash_event(row)
                 if persisted != expected:
                     raise POSStoreConflictError(
