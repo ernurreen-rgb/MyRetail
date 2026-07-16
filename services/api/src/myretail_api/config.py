@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     stock_idempotency_db_path: Path = API_ROOT / "tmp" / "stock_idempotency.sqlite3"
     pos_db_path: Path = API_ROOT / "tmp" / "pos.sqlite3"
     state_backend: Literal["sqlite", "postgresql"] = "sqlite"
+    state_production_enablement: Literal["disabled", "controlled"] = "disabled"
     state_database_url: SecretStr | None = None
     state_pool_min_size: int = Field(default=2, ge=1, le=100)
     state_pool_max_size: int = Field(default=10, ge=1, le=100)
@@ -85,11 +86,15 @@ def get_settings() -> Settings:
 def validate_production_state_storage(settings: Settings) -> None:
     if settings.environment != "production":
         return
-    raise UnsafeProductionStateError(
-        "Production requires shared transactional POS and idempotency state storage; "
-        "PostgreSQL enablement remains disabled until the controlled Phase 6B cutover, "
-        "and the current local SQLite adapters are disabled in production"
-    )
+    if settings.state_backend != "postgresql":
+        raise UnsafeProductionStateError(
+            "Production requires shared transactional POS and idempotency state storage; "
+            "local SQLite adapters are disabled in production"
+        )
+    if settings.state_production_enablement != "controlled":
+        raise UnsafeProductionStateError(
+            "Production PostgreSQL state storage requires explicit controlled enablement"
+        )
 
 
 def validate_state_foundation_settings(settings: Settings) -> None:

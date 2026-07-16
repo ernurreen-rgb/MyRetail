@@ -30,6 +30,7 @@ def test_sqlite_foundation_remains_the_default_for_local_workflows() -> None:
     settings = isolated_settings(environment="test")
 
     assert settings.state_backend == "sqlite"
+    assert settings.state_production_enablement == "disabled"
     assert settings.state_database_url is None
     create_app(settings)
 
@@ -152,17 +153,60 @@ def test_client_ip_proxy_policy_fails_closed_on_ambiguous_config(
         create_app(settings)
 
 
-def test_production_postgresql_switch_remains_fail_closed_in_phase_6a() -> None:
-    settings = isolated_settings(
-        environment="production",
-        state_backend="postgresql",
-        state_database_url=SecretStr(
+def production_postgresql_settings(**overrides: object) -> Settings:
+    values: dict[str, object] = {
+        "environment": "production",
+        "state_backend": "postgresql",
+        "state_database_url": SecretStr(
             "postgresql+asyncpg://myretail_api@db.internal/state"
         ),
-        state_postgres_ssl_mode="verify-full",
+        "state_postgres_ssl_mode": "verify-full",
+        "auth_rate_limit_secret": SecretStr(
+            "production-rate-limit-secret-at-least-32-bytes"
+        ),
+    }
+    values.update(overrides)
+    return isolated_settings(**values)
+
+
+def test_production_postgresql_requires_explicit_controlled_enablement() -> None:
+    settings = production_postgresql_settings()
+
+    with pytest.raises(UnsafeProductionStateError, match="controlled enablement"):
+        create_app(settings)
+
+
+def test_production_postgresql_controlled_enablement_accepts_safe_config() -> None:
+    settings = production_postgresql_settings(
+        state_production_enablement="controlled"
     )
 
-    with pytest.raises(UnsafeProductionStateError, match="Phase 6B cutover"):
+    app = create_app(settings)
+
+    assert app.state.settings is settings
+
+
+def test_production_postgresql_controlled_enablement_still_requires_verify_full() -> None:
+    settings = production_postgresql_settings(
+        state_production_enablement="controlled",
+        state_postgres_ssl_mode="require",
+    )
+
+    with pytest.raises(
+        InvalidStateFoundationSettingsError,
+        match="requires verify-full TLS",
+    ):
+        create_app(settings)
+
+
+def test_production_controlled_enablement_never_allows_sqlite() -> None:
+    settings = isolated_settings(
+        environment="production",
+        state_backend="sqlite",
+        state_production_enablement="controlled",
+    )
+
+    with pytest.raises(UnsafeProductionStateError, match="SQLite adapters are disabled"):
         create_app(settings)
 
 

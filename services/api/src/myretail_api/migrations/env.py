@@ -1,23 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-import os
 
 from alembic import context
 from sqlalchemy import Connection, text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
+from myretail_api.migrations.settings import load_migration_settings
 from myretail_api.state.schema import STATE_MIGRATOR_ROLE, STATE_OWNER_ROLE
-
-
-def _migration_database_url() -> str:
-    database_url = os.environ.get("MYRETAIL_STATE_MIGRATION_DATABASE_URL", "").strip()
-    if not database_url:
-        raise RuntimeError("Migration database URL is required")
-    if not database_url.lower().startswith("postgresql+asyncpg://"):
-        raise RuntimeError("Migration database URL must use the asyncpg driver")
-    return database_url
 
 
 def _run_migrations(connection: Connection) -> None:
@@ -35,11 +26,13 @@ def _run_migrations(connection: Connection) -> None:
 
 
 async def _run_online() -> None:
+    settings = load_migration_settings()
     engine = create_async_engine(
-        _migration_database_url(),
+        settings.database_url,
         echo=False,
         hide_parameters=True,
         poolclass=NullPool,
+        connect_args={"ssl": settings.ssl_argument()},
     )
     try:
         async with engine.connect() as connection:
