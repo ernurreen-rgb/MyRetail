@@ -42,6 +42,7 @@ from myretail_api.models.stock import AuditUser, Warehouse, WarehouseRef
 from myretail_api.routers import purchases as purchases_router_module
 from myretail_api.security import create_access_token
 from myretail_api.state.idempotency import SQLiteIdempotencyRepository
+from myretail_api.state.sessions import SQLiteSessionRepository
 from myretail_api.tenancy import build_isolated_tenant_route
 
 
@@ -597,6 +598,7 @@ def make_test_settings(tmp_path: Path) -> Settings:
         erpnext_api_key=SecretStr("test-key"),
         erpnext_api_secret=SecretStr("test-secret"),
         stock_idempotency_db_path=tmp_path / "idempotency.sqlite3",
+        auth_session_db_path=tmp_path / "auth-sessions.sqlite3",
     )
 
 
@@ -610,6 +612,14 @@ def auth_headers(
 ) -> dict[str, str]:
     token_settings = make_test_settings(tmp_path)
     token_settings.tenant_slug = tenant
+    session = SQLiteSessionRepository(
+        token_settings.auth_session_db_path
+    ).issue_session_sync(
+        tenant_id=tenant,
+        email="damir@example.com",
+        route_version=token_settings.tenant_route_version,
+        ttl_seconds=token_settings.auth_token_ttl_seconds,
+    )
     token, _ = create_access_token(
         route=build_isolated_tenant_route(token_settings),
         user=AuthenticatedUser(
@@ -617,6 +627,7 @@ def auth_headers(
             full_name="Damir",
             roles=roles or ["Owner"],
         ),
+        session=session,
     )
     headers = {
         "Authorization": f"Bearer {token}",
@@ -796,8 +807,9 @@ async def test_purchases_cashier_and_wrong_tenant_are_forbidden(tmp_path: Path) 
         )
 
     assert cashier_response.status_code == 403
-    assert tenant_response.status_code == 403
+    assert tenant_response.status_code == 401
     assert cashier_response.json()["error"]["code"] == "FORBIDDEN"
+    assert tenant_response.json()["error"]["code"] == "UNAUTHORIZED"
 
 
 @pytest.mark.anyio

@@ -4,9 +4,15 @@ from fastapi import Depends, Header, HTTPException, Request, status
 
 from myretail_api.clients.erpnext import ERPNextClient, ERPNextConfigurationError
 from myretail_api.models.auth import TenantContext
-from myretail_api.security import AuthConfigurationError, TokenValidationError, parse_access_token
+from myretail_api.security import (
+    AuthConfigurationError,
+    TokenValidationError,
+    VerifiedAccessToken,
+    parse_access_token,
+)
 from myretail_api.state.pos_repository import POSStateRepository
-from myretail_api.state.protocols import IdempotencyRepository
+from myretail_api.state.protocols import IdempotencyRepository, SessionRepository
+from myretail_api.state.sessions import SessionStateError
 from myretail_api.tenancy import IsolatedTenantRoute
 
 
@@ -64,11 +70,20 @@ def get_pos_store(request: Request) -> POSStateRepository:
     return repository
 
 
-def require_tenant_context(
+def get_session_repository(request: Request) -> SessionRepository:
+    repository = getattr(request.app.state, "session_repository", None)
+    if repository is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication session state is not ready",
+        )
+    return repository
+
+
+def require_signed_access_token(
     route: Annotated[IsolatedTenantRoute, Depends(get_tenant_route_snapshot)],
     authorization: Annotated[str | None, Header()] = None,
-    tenant_header: Annotated[str | None, Header(alias="X-MyRetail-Tenant")] = None,
-) -> TenantContext:
+) -> VerifiedAccessToken:
     if not authorization:
         raise _unauthorized()
 
@@ -77,7 +92,7 @@ def require_tenant_context(
         raise _unauthorized()
 
     try:
-        context = parse_access_token(token, route=route)
+        return parse_access_token(token, route=route)
     except AuthConfigurationError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -86,13 +101,41 @@ def require_tenant_context(
     except TokenValidationError as exc:
         raise _unauthorized() from exc
 
-    if context.tenant != route.tenant_slug or tenant_header != context.tenant:
+async def require_active_access_token(
+    route: Annotated[IsolatedTenantRoute, Depends(get_tenant_route_snapshot)],
+    token: Annotated[VerifiedAccessToken, Depends(require_signed_access_token)],
+    repository: Annotated[SessionRepository, Depends(get_session_repository)],
+    tenant_header: Annotated[str | None, Header(alias="X-MyRetail-Tenant")] = None,
+) -> VerifiedAccessToken:
+    try:
+        session = await repository.validate_session(
+            tenant_id=route.tenant_slug,
+            session_id=token.session_id,
+            principal_id=token.principal_id,
+            auth_epoch=token.auth_epoch,
+            route_version=token.route_version,
+        )
+    except SessionStateError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication session state is unavailable",
+        ) from exc
+    if session is None:
+        raise _unauthorized()
+
+    if token.tenant != route.tenant_slug or tenant_header != token.tenant:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Tenant context does not match access token",
         )
 
-    return context
+    return token
+
+
+async def require_tenant_context(
+    token: Annotated[VerifiedAccessToken, Depends(require_active_access_token)],
+) -> TenantContext:
+    return token.context
 
 
 def _unauthorized() -> HTTPException:

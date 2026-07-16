@@ -6,6 +6,7 @@ import json
 import threading
 import time
 from pathlib import Path
+from tempfile import gettempdir
 
 import httpx
 import pytest
@@ -17,7 +18,7 @@ from myretail_api.clients.erpnext import (
     ERPNextUserLoginError,
 )
 from myretail_api.config import Settings, get_settings
-from myretail_api.dependencies import get_erpnext_client
+from myretail_api.dependencies import get_erpnext_client, get_session_repository
 from myretail_api.main import create_app
 from myretail_api.models.auth import AuthenticatedUser
 from myretail_api.rate_limit import (
@@ -31,6 +32,7 @@ from myretail_api.security import (
     map_erpnext_roles,
     parse_access_token,
 )
+from myretail_api.state.sessions import SessionStateError, SQLiteSessionRepository
 from myretail_api.tenancy import build_isolated_tenant_route
 
 
@@ -101,6 +103,30 @@ class DomainManagerOnlyAuthClient:
         )
 
 
+class FlexibleAuthClient:
+    async def authenticate_user(self, *, email: str, password: str) -> ERPNextUser:
+        assert password == "correct-password"
+        return ERPNextUser(
+            email=email.strip().casefold(),
+            full_name=email.split("@", maxsplit=1)[0].title(),
+            roles=["System Manager"],
+        )
+
+
+class UnavailableSessionRepository:
+    async def issue_session(self, **_: object) -> object:
+        raise SessionStateError("safe test failure")
+
+    async def validate_session(self, **_: object) -> object:
+        raise SessionStateError("safe test failure")
+
+    async def revoke_session(self, **_: object) -> None:
+        raise SessionStateError("safe test failure")
+
+    async def revoke_principal_sessions(self, **_: object) -> None:
+        raise SessionStateError("safe test failure")
+
+
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
@@ -111,13 +137,19 @@ def make_test_settings(
     *,
     pos_cashier_assignments: dict[str, object] | None = None,
 ) -> Settings:
+    effective_rate_limit_path = rate_limit_path or (
+        Path(gettempdir()) / "myretail-test-rate-limit.sqlite3"
+    )
     return Settings(
         tenant_slug="myretail",
         auth_secret=SecretStr("test-auth-secret"),
         auth_token_ttl_seconds=900,
         erpnext_api_key=SecretStr("test-key"),
         erpnext_api_secret=SecretStr("test-secret"),
-        auth_rate_limit_db_path=rate_limit_path or Path("test-rate-limit.sqlite3"),
+        auth_rate_limit_db_path=effective_rate_limit_path,
+        auth_session_db_path=effective_rate_limit_path.with_name(
+            "test-auth-sessions.sqlite3"
+        ),
         pos_cashier_assignments=pos_cashier_assignments or {},
     )
 
@@ -500,6 +532,14 @@ def auth_headers(
 ) -> dict[str, str]:
     token_settings = make_test_settings()
     token_settings.tenant_slug = tenant
+    session = SQLiteSessionRepository(
+        token_settings.auth_session_db_path
+    ).issue_session_sync(
+        tenant_id=tenant,
+        email="damir@example.com",
+        route_version=token_settings.tenant_route_version,
+        ttl_seconds=token_settings.auth_token_ttl_seconds,
+    )
     token, _ = create_access_token(
         route=build_isolated_tenant_route(token_settings),
         user=AuthenticatedUser(
@@ -507,6 +547,7 @@ def auth_headers(
             full_name="Damir",
             roles=["Owner"],
         ),
+        session=session,
     )
     return {
         "Authorization": f"Bearer {token}",
@@ -516,6 +557,12 @@ def auth_headers(
 
 def test_tokens_from_previous_authorization_policy_are_rejected() -> None:
     settings = make_test_settings()
+    session = SQLiteSessionRepository(settings.auth_session_db_path).issue_session_sync(
+        tenant_id=settings.tenant_slug,
+        email="legacy-admin@example.com",
+        route_version=settings.tenant_route_version,
+        ttl_seconds=settings.auth_token_ttl_seconds,
+    )
     token, _ = create_access_token(
         route=build_isolated_tenant_route(settings),
         user=AuthenticatedUser(
@@ -523,6 +570,7 @@ def test_tokens_from_previous_authorization_policy_are_rejected() -> None:
             full_name="Legacy Admin",
             roles=["Admin"],
         ),
+        session=session,
     )
     encoded_header, encoded_payload, _ = token.split(".")
     payload = json.loads(_decode_token_part(encoded_payload))
@@ -611,3 +659,234 @@ async def test_current_session_rejects_tenant_mismatch() -> None:
         )
 
     assert response.status_code == 403
+
+
+async def _login_token(
+    client: httpx.AsyncClient,
+    *,
+    email: str,
+) -> str:
+    response = await client.post(
+        "/auth/login",
+        json={
+            "tenant": "myretail",
+            "email": email,
+            "password": "correct-password",
+        },
+    )
+    assert response.status_code == 200, response.text
+    return str(response.json()["access_token"])
+
+
+def _token_headers(token: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "X-MyRetail-Tenant": "myretail",
+    }
+
+
+@pytest.mark.anyio
+async def test_logout_revokes_only_the_current_session_and_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    settings = make_test_settings(tmp_path / "rate-limit.sqlite3")
+    app = create_app(settings)
+    app.dependency_overrides[get_erpnext_client] = FlexibleAuthClient
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first = await _login_token(client, email="user@example.com")
+        second = await _login_token(client, email="user@example.com")
+
+        logout = await client.post("/auth/logout", headers=_token_headers(first))
+        replay = await client.post("/auth/logout", headers=_token_headers(first))
+        first_after = await client.get("/auth/me", headers=_token_headers(first))
+        second_after = await client.get("/auth/me", headers=_token_headers(second))
+
+    assert logout.status_code == 204
+    assert replay.status_code == 204
+    assert first_after.status_code == 401
+    assert second_after.status_code == 200
+
+
+@pytest.mark.anyio
+async def test_owner_revoke_invalidates_all_user_sessions_without_existence_leak(
+    tmp_path: Path,
+) -> None:
+    settings = make_test_settings(tmp_path / "rate-limit.sqlite3")
+    app = create_app(settings)
+    app.dependency_overrides[get_erpnext_client] = FlexibleAuthClient
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        owner = await _login_token(client, email="owner@example.com")
+        first = await _login_token(client, email="user@example.com")
+        second = await _login_token(client, email="user@example.com")
+
+        known = await client.post(
+            "/auth/sessions/revoke",
+            headers=_token_headers(owner),
+            json={"email": "USER@example.com"},
+        )
+        unknown = await client.post(
+            "/auth/sessions/revoke",
+            headers=_token_headers(owner),
+            json={"email": "missing@example.com"},
+        )
+        first_after = await client.get("/auth/me", headers=_token_headers(first))
+        second_after = await client.get("/auth/me", headers=_token_headers(second))
+        owner_after = await client.get("/auth/me", headers=_token_headers(owner))
+
+    assert known.status_code == 204
+    assert unknown.status_code == 204
+    assert known.content == unknown.content == b""
+    assert first_after.status_code == 401
+    assert second_after.status_code == 401
+    assert owner_after.status_code == 200
+
+
+@pytest.mark.anyio
+async def test_session_state_unavailability_fails_closed_without_issuing_token(
+    tmp_path: Path,
+) -> None:
+    settings = make_test_settings(tmp_path / "rate-limit.sqlite3")
+    app = create_app(settings)
+    app.dependency_overrides[get_erpnext_client] = FlexibleAuthClient
+    app.dependency_overrides[get_session_repository] = UnavailableSessionRepository
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/auth/login",
+            json={
+                "tenant": "myretail",
+                "email": "user@example.com",
+                "password": "correct-password",
+            },
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": "Authentication session state is unavailable"
+    }
+    assert "access_token" not in response.text
+
+
+@pytest.mark.anyio
+async def test_two_app_instances_share_revocation_boundary(tmp_path: Path) -> None:
+    settings = make_test_settings(tmp_path / "rate-limit.sqlite3")
+    first_app = create_app(settings)
+    second_app = create_app(settings)
+    first_app.dependency_overrides[get_erpnext_client] = FlexibleAuthClient
+    second_app.dependency_overrides[get_erpnext_client] = FlexibleAuthClient
+
+    async with (
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=first_app), base_url="http://first"
+        ) as first,
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=second_app), base_url="http://second"
+        ) as second,
+    ):
+        token = await _login_token(first, email="user@example.com")
+        before = await second.get("/auth/me", headers=_token_headers(token))
+        revoked = await second.post("/auth/logout", headers=_token_headers(token))
+        after = await first.get("/auth/me", headers=_token_headers(token))
+
+    assert before.status_code == 200
+    assert revoked.status_code == 204
+    assert after.status_code == 401
+
+
+@pytest.mark.anyio
+async def test_logout_accepts_missing_session_but_rejects_invalid_signature(
+    tmp_path: Path,
+) -> None:
+    settings = make_test_settings(tmp_path / "rate-limit.sqlite3")
+    app = create_app(settings)
+    detached = SQLiteSessionRepository(tmp_path / "detached-sessions.sqlite3")
+    session = detached.issue_session_sync(
+        tenant_id=settings.tenant_slug,
+        email="user@example.com",
+        route_version=settings.tenant_route_version,
+        ttl_seconds=settings.auth_token_ttl_seconds,
+    )
+    token, _ = create_access_token(
+        route=build_isolated_tenant_route(settings),
+        user=AuthenticatedUser(
+            email="user@example.com",
+            full_name="User",
+            roles=["Owner"],
+        ),
+        session=session,
+    )
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        missing = await client.post("/auth/logout", headers=_token_headers(token))
+        invalid = await client.post(
+            "/auth/logout",
+            headers=_token_headers(f"{token[:-1]}x"),
+        )
+
+    assert missing.status_code == 204
+    assert invalid.status_code == 401
+
+
+@pytest.mark.anyio
+async def test_admin_revoke_requires_admin_role_and_valid_body(tmp_path: Path) -> None:
+    settings = make_test_settings(tmp_path / "rate-limit.sqlite3")
+    app = create_app(settings)
+    repository = app.state.session_repository
+    session = repository.issue_session_sync(
+        tenant_id=settings.tenant_slug,
+        email="cashier@example.com",
+        route_version=settings.tenant_route_version,
+        ttl_seconds=settings.auth_token_ttl_seconds,
+    )
+    cashier_token, _ = create_access_token(
+        route=build_isolated_tenant_route(settings),
+        user=AuthenticatedUser(
+            email="cashier@example.com",
+            full_name="Cashier",
+            roles=["Cashier"],
+        ),
+        session=session,
+    )
+    app.dependency_overrides[get_erpnext_client] = FlexibleAuthClient
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        owner = await _login_token(client, email="owner@example.com")
+        forbidden = await client.post(
+            "/auth/sessions/revoke",
+            headers=_token_headers(cashier_token),
+            json={"email": "user@example.com"},
+        )
+        invalid = await client.post(
+            "/auth/sessions/revoke",
+            headers=_token_headers(owner),
+            json={"email": "not-an-email"},
+        )
+
+    assert forbidden.status_code == 403
+    assert invalid.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_logout_and_request_validation_fail_closed_on_session_state_outage(
+    tmp_path: Path,
+) -> None:
+    settings = make_test_settings(tmp_path / "rate-limit.sqlite3")
+    app = create_app(settings)
+    app.dependency_overrides[get_erpnext_client] = FlexibleAuthClient
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        token = await _login_token(client, email="user@example.com")
+        app.dependency_overrides[get_session_repository] = UnavailableSessionRepository
+        current = await client.get("/auth/me", headers=_token_headers(token))
+        logout = await client.post("/auth/logout", headers=_token_headers(token))
+
+    assert current.status_code == 503
+    assert logout.status_code == 503

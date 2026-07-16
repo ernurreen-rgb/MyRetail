@@ -30,7 +30,7 @@ Startup и PostgreSQL acceptance обязаны доказать:
 
 ### Schema, RLS и pre-auth exception
 
-- Alembic revision точно равна package constant `20260716_04`;
+- Alembic revision точно равна package constant `20260716_05`;
 - table inventory точно равен утверждённым tenant + pre-auth tables;
 - любая extra table блокирует startup до review и новой versioned migration;
 - каждая tenant table имеет ровно одну ожидаемую permissive policy для `myretail_api`,
@@ -47,7 +47,7 @@ Startup и PostgreSQL acceptance обязаны доказать:
 В disposable database CI выполняет:
 
 1. clean `upgrade head`;
-2. `current == 20260716_04 (head)`;
+2. `current == 20260716_05 (head)`;
 3. `downgrade base`;
 4. отсутствие active revision;
 5. повторный `upgrade head` и сверку current;
@@ -103,5 +103,6 @@ Production по-прежнему обязан не стартовать. Phase 6
 - production-like multi-process live QA и reconciliation с ERPNext;
 - формальная фиксация rollback/forward-fix criteria и операционного владельца.
 
-Отдельный readiness HTTP endpoint, session revocation, tenant-to-ERPNext routing и Returns
-integrity не входят в 6A.6. Они остаются отдельными утверждёнными решениями/фазами.
+Отдельный readiness HTTP endpoint, tenant-to-ERPNext routing и Returns integrity
+не входят в 6A.6. Session revocation реализован отдельной Phase 8B поверх того же
+PostgreSQL foundation и описан в `session-revocation.md`.

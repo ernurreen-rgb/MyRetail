@@ -263,7 +263,7 @@ async def test_sqlite_lifespan_does_not_create_postgresql_pool(tmp_path: Path) -
 
 
 def test_expected_revision_is_package_owned_not_environment_overridable() -> None:
-    assert EXPECTED_STATE_SCHEMA_REVISION == "20260716_04"
+    assert EXPECTED_STATE_SCHEMA_REVISION == "20260716_05"
     assert "state_expected_schema_revision" not in Settings.model_fields
 
 

@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class LoginRequest(BaseModel):
@@ -19,6 +19,25 @@ class LoginResponse(BaseModel):
     expires_in: int
     tenant: str
     user: AuthenticatedUser
+
+
+class SessionRevokeRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, value: str) -> str:
+        normalized = value.strip()
+        local, separator, domain = normalized.partition("@")
+        if (
+            not separator
+            or not local
+            or not domain
+            or "@" in domain
+            or any(character.isspace() for character in normalized)
+        ):
+            raise ValueError("email must be a valid address")
+        return normalized
 
 
 class TenantContext(BaseModel):

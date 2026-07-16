@@ -3,11 +3,14 @@ import binascii
 import hashlib
 import hmac
 import json
-from datetime import UTC, datetime, timedelta
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
+from uuid import UUID
 
 from myretail_api.config import POSCashierAssignment, Settings
 from myretail_api.models.auth import AuthenticatedUser, TenantContext
+from myretail_api.state.protocols import AuthSession
 from myretail_api.tenancy import IsolatedTenantRoute
 
 
@@ -25,7 +28,26 @@ MYRETAIL_ADMIN_ROLE = "MyRetail Admin"
 # Bump this value when a deployed authorization policy must invalidate every
 # token issued under the previous policy. The signed claim keeps rollout
 # invalidation independent from per-process memory or local state stores.
-AUTHORIZATION_POLICY_VERSION = 3
+AUTHORIZATION_POLICY_VERSION = 4
+
+
+@dataclass(frozen=True)
+class VerifiedAccessToken:
+    context: TenantContext
+    session_id: UUID
+    principal_id: UUID
+    auth_epoch: int
+    route_version: int
+    issued_at: datetime
+    expires_at: datetime
+
+    @property
+    def tenant(self) -> str:
+        return self.context.tenant
+
+    @property
+    def user(self) -> AuthenticatedUser:
+        return self.context.user
 
 
 def map_erpnext_roles(erpnext_roles: list[str], *, has_pos_assignment: bool = False) -> list[str]:
@@ -58,23 +80,34 @@ def create_access_token(
     *,
     route: IsolatedTenantRoute,
     user: AuthenticatedUser,
-    now: datetime | None = None,
+    session: AuthSession,
 ) -> tuple[str, int]:
     secret = _auth_secret(route)
-    issued_at = now or datetime.now(UTC)
-    expires_at = issued_at + timedelta(seconds=route.auth_token_ttl_seconds)
+    normalized_email = user.email.strip().casefold()
+    if session.tenant_id != route.tenant_slug:
+        raise AuthConfigurationError("Session tenant does not match the token route")
+    if session.route_version != route.route_version:
+        raise AuthConfigurationError("Session route version does not match the token route")
+    if session.normalized_email != normalized_email:
+        raise AuthConfigurationError("Session principal does not match the token user")
+    if session.revoked_at is not None or session.expires_at <= session.issued_at:
+        raise AuthConfigurationError("Session is not eligible for token issuance")
     payload = {
         "iss": route.auth_issuer,
         "aud": route.auth_audience,
+        "sub": session.normalized_email,
+        "jti": str(session.session_id),
+        "principal_id": str(session.principal_id),
         "tenant_id": str(route.tenant_id),
         "tenant": route.tenant_slug,
-        "route_version": route.route_version,
+        "route_version": session.route_version,
+        "auth_epoch": session.auth_epoch,
         "email": user.email,
         "full_name": user.full_name,
         "roles": user.roles,
         "authz_version": AUTHORIZATION_POLICY_VERSION,
-        "iat": int(issued_at.timestamp()),
-        "exp": int(expires_at.timestamp()),
+        "iat": int(session.issued_at.timestamp()),
+        "exp": int(session.expires_at.timestamp()),
     }
     encoded_header = _encode_json({"alg": "HS256", "typ": "JWT"})
     encoded_payload = _encode_json(payload)
@@ -88,7 +121,7 @@ def parse_access_token(
     *,
     route: IsolatedTenantRoute,
     now: datetime | None = None,
-) -> TenantContext:
+) -> VerifiedAccessToken:
     secret = _auth_secret(route)
     parts = token.split(".")
     if len(parts) != 3:
@@ -101,9 +134,12 @@ def parse_access_token(
 
     payload = _decode_json(parts[1])
     expires_at = _int_claim(payload, "exp")
+    issued_at = _int_claim(payload, "iat")
     current_time = now or datetime.now(UTC)
     if expires_at <= int(current_time.timestamp()):
         raise TokenValidationError("Token has expired")
+    if issued_at >= expires_at or issued_at > int(current_time.timestamp()) + 60:
+        raise TokenValidationError("Token issuance time is invalid")
     authorization_policy_version = payload.get("authz_version")
     if (
         not isinstance(authorization_policy_version, int)
@@ -124,6 +160,14 @@ def parse_access_token(
 
     tenant = _str_claim(payload, "tenant")
     email = _str_claim(payload, "email")
+    subject = _str_claim(payload, "sub")
+    if subject != email.strip().casefold():
+        raise TokenValidationError("Token subject does not match the user identity")
+    session_id = _uuid_claim(payload, "jti")
+    principal_id = _uuid_claim(payload, "principal_id")
+    auth_epoch = _int_claim(payload, "auth_epoch")
+    if auth_epoch < 1:
+        raise TokenValidationError("Invalid auth_epoch claim")
     roles = payload.get("roles")
     if not isinstance(roles, list) or not all(isinstance(role, str) for role in roles):
         raise TokenValidationError("Invalid roles claim")
@@ -133,7 +177,15 @@ def parse_access_token(
         full_name=payload.get("full_name") if isinstance(payload.get("full_name"), str) else None,
         roles=roles,
     )
-    return TenantContext(tenant=tenant, user=user)
+    return VerifiedAccessToken(
+        context=TenantContext(tenant=tenant, user=user),
+        session_id=session_id,
+        principal_id=principal_id,
+        auth_epoch=auth_epoch,
+        route_version=route_version,
+        issued_at=datetime.fromtimestamp(issued_at, UTC),
+        expires_at=datetime.fromtimestamp(expires_at, UTC),
+    )
 
 
 def _auth_secret(route: IsolatedTenantRoute) -> str:
@@ -187,3 +239,11 @@ def _int_claim(payload: dict[str, Any], name: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
         raise TokenValidationError(f"Invalid {name} claim")
     return value
+
+
+def _uuid_claim(payload: dict[str, Any], name: str) -> UUID:
+    value = _str_claim(payload, name)
+    try:
+        return UUID(value)
+    except ValueError as exc:
+        raise TokenValidationError(f"Invalid {name} claim") from exc

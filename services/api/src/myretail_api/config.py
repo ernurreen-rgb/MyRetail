@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     auth_rate_limit_window_seconds: int = Field(default=300, ge=1, le=86_400)
     auth_rate_limit_capacity: int = Field(default=10_000, ge=2, le=1_000_000)
     auth_rate_limit_db_path: Path = API_ROOT / ".data" / "login-rate-limit.sqlite3"
+    auth_session_db_path: Path = API_ROOT / ".data" / "auth-sessions.sqlite3"
     auth_rate_limit_secret: SecretStr | None = None
     auth_client_ip_mode: Literal["direct", "trusted_proxy"] = "direct"
     auth_trusted_proxy_cidrs: list[str] = Field(default_factory=list)
