@@ -3,16 +3,28 @@ from typing import Annotated
 from fastapi import Depends, Header, HTTPException, Request, status
 
 from myretail_api.clients.erpnext import ERPNextClient, ERPNextConfigurationError
-from myretail_api.config import Settings, get_settings
 from myretail_api.models.auth import TenantContext
 from myretail_api.security import AuthConfigurationError, TokenValidationError, parse_access_token
 from myretail_api.state.pos_repository import POSStateRepository
 from myretail_api.state.protocols import IdempotencyRepository
+from myretail_api.tenancy import IsolatedTenantRoute
 
 
-def get_erpnext_client(settings: Annotated[Settings, Depends(get_settings)]) -> ERPNextClient:
+def get_tenant_route_snapshot(request: Request) -> IsolatedTenantRoute:
+    route = getattr(request.app.state, "tenant_route_snapshot", None)
+    if not isinstance(route, IsolatedTenantRoute):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Tenant route is not ready",
+        )
+    return route
+
+
+def get_erpnext_client(
+    route: Annotated[IsolatedTenantRoute, Depends(get_tenant_route_snapshot)],
+) -> ERPNextClient:
     try:
-        return ERPNextClient(settings)
+        return ERPNextClient(route.erpnext)
     except ERPNextConfigurationError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -53,7 +65,7 @@ def get_pos_store(request: Request) -> POSStateRepository:
 
 
 def require_tenant_context(
-    settings: Annotated[Settings, Depends(get_settings)],
+    route: Annotated[IsolatedTenantRoute, Depends(get_tenant_route_snapshot)],
     authorization: Annotated[str | None, Header()] = None,
     tenant_header: Annotated[str | None, Header(alias="X-MyRetail-Tenant")] = None,
 ) -> TenantContext:
@@ -65,7 +77,7 @@ def require_tenant_context(
         raise _unauthorized()
 
     try:
-        context = parse_access_token(token, settings=settings)
+        context = parse_access_token(token, route=route)
     except AuthConfigurationError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -74,7 +86,7 @@ def require_tenant_context(
     except TokenValidationError as exc:
         raise _unauthorized() from exc
 
-    if context.tenant != settings.tenant_slug or tenant_header != context.tenant:
+    if context.tenant != route.tenant_slug or tenant_header != context.tenant:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Tenant context does not match access token",

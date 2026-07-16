@@ -13,10 +13,15 @@ from myretail_api.config import (
     validate_state_foundation_settings,
 )
 from myretail_api.state.postgres import PostgresStateRuntime, StateStartupError
+from myretail_api.tenancy import (
+    InvalidTenantRouteSettingsError,
+    build_isolated_tenant_route,
+)
 
 SAFE_PREFLIGHT_ERRORS = (
     InvalidAuthRateLimitSettingsError,
     InvalidStateFoundationSettingsError,
+    InvalidTenantRouteSettingsError,
     StateStartupError,
     UnsafeProductionStateError,
 )
@@ -26,6 +31,7 @@ async def run_preflight(settings: Settings) -> None:
     validate_production_state_storage(settings)
     validate_state_foundation_settings(settings)
     validate_auth_rate_limit_settings(settings)
+    build_isolated_tenant_route(settings)
     runtime = await PostgresStateRuntime.start(settings)
     await runtime.close()
 

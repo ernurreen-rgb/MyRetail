@@ -3,6 +3,10 @@
 Статус: runtime/preflight gate. Этот документ не подтверждает готовность production
 инфраструктуры и не закрывает MR-SEC-010 без внешних evidence gates Phase 6B.2–6B.3.
 
+Production state preflight также проверяет fixed isolated tenant → ERPNext boundary из
+[tenant-isolated-site-boundary.md](tenant-isolated-site-boundary.md). Controlled PostgreSQL
+не разрешает shared tenant routing и не заменяет отдельную ERPNext site/database boundary.
+
 ## Граница 6B.1
 
 Production API может перейти от безусловного запрета к startup-проверке PostgreSQL только

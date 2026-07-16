@@ -26,6 +26,7 @@ from myretail_api.routers.products import router as products_router
 from myretail_api.routers.purchases import purchases_router, suppliers_router
 from myretail_api.routers.stock import router as stock_router
 from myretail_api.state.lifespan import build_state_lifespan
+from myretail_api.tenancy import build_isolated_tenant_route
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -33,6 +34,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     validate_production_state_storage(effective_settings)
     validate_state_foundation_settings(effective_settings)
     validate_auth_rate_limit_settings(effective_settings)
+    tenant_route = build_isolated_tenant_route(effective_settings)
     app = FastAPI(
         title="MyRetail API",
         version="0.1.0",
@@ -40,6 +42,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=build_state_lifespan(effective_settings),
     )
     app.state.settings = effective_settings
+    app.state.tenant_route_snapshot = tenant_route
     if effective_settings.state_backend == "sqlite":
         app.state.login_rate_limiter = build_sqlite_login_rate_limiter(effective_settings)
     app.dependency_overrides[get_settings] = _settings_provider(effective_settings)

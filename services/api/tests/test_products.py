@@ -19,6 +19,7 @@ from myretail_api.models.products import (
     ProductUpdate,
 )
 from myretail_api.security import create_access_token
+from myretail_api.tenancy import build_isolated_tenant_route
 
 
 class StubERPNextClient:
@@ -158,9 +159,10 @@ def auth_headers(
     header_tenant: str = "myretail",
     roles: list[str] | None = None,
 ) -> dict[str, str]:
+    token_settings = make_test_settings()
+    token_settings.tenant_slug = tenant
     token, _ = create_access_token(
-        settings=make_test_settings(),
-        tenant=tenant,
+        route=build_isolated_tenant_route(token_settings),
         user=AuthenticatedUser(
             email="damir@example.com",
             full_name="Damir",
@@ -174,9 +176,10 @@ def auth_headers(
 
 
 def make_app(erpnext_client: object) -> object:
-    app = create_app()
+    settings = make_test_settings()
+    app = create_app(settings)
     app.dependency_overrides[get_erpnext_client] = lambda: erpnext_client
-    app.dependency_overrides[get_settings] = make_test_settings
+    app.dependency_overrides[get_settings] = lambda: settings
     return app
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from uuid import UUID
 
 from pydantic import SecretStr
 
@@ -12,6 +13,18 @@ def controlled_settings() -> Settings:
     return Settings(
         _env_file=None,
         environment="production",
+        tenancy_mode="isolated_site",
+        tenant_id=UUID("018f76c8-bef9-7b89-8c55-72152d8bcf2a"),
+        tenant_slug="preflight-tenant",
+        tenant_route_version=1,
+        auth_issuer="https://api.preflight.invalid",
+        auth_audience="myretail-preflight",
+        auth_secret=SecretStr(
+            "production-auth-secret-that-is-at-least-32-bytes"
+        ),
+        erpnext_base_url="https://erp.preflight.invalid",
+        erpnext_api_key=SecretStr("preflight-erp-key"),
+        erpnext_api_secret=SecretStr("preflight-erp-secret"),
         state_backend="postgresql",
         state_production_enablement="controlled",
         state_database_url=SecretStr(

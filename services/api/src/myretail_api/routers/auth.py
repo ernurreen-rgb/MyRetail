@@ -10,7 +10,11 @@ from myretail_api.clients.erpnext import (
     ERPNextUserLoginError,
 )
 from myretail_api.config import Settings, get_settings
-from myretail_api.dependencies import get_erpnext_client, require_tenant_context
+from myretail_api.dependencies import (
+    get_erpnext_client,
+    get_tenant_route_snapshot,
+    require_tenant_context,
+)
 from myretail_api.models.auth import AuthenticatedUser, LoginRequest, LoginResponse, TenantContext
 from myretail_api.rate_limit import (
     LoginRateLimiter,
@@ -24,6 +28,7 @@ from myretail_api.security import (
     get_pos_cashier_assignment,
     map_erpnext_roles,
 )
+from myretail_api.tenancy import IsolatedTenantRoute
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -40,6 +45,7 @@ async def login(
     http_request: Request,
     request: LoginRequest,
     settings: Annotated[Settings, Depends(get_settings)],
+    route: Annotated[IsolatedTenantRoute, Depends(get_tenant_route_snapshot)],
     client: Annotated[ERPNextClient, Depends(get_erpnext_client)],
     rate_limiter: Annotated[LoginRateLimiter, Depends(get_login_rate_limiter)],
 ) -> LoginResponse:
@@ -63,7 +69,7 @@ async def login(
     if decision.reservation_at is None:
         raise _rate_limit_unavailable()
 
-    if tenant != settings.tenant_slug:
+    if tenant != route.tenant_slug:
         raise _invalid_credentials()
 
     try:
@@ -105,8 +111,7 @@ async def login(
 
     try:
         access_token, expires_in = create_access_token(
-            settings=settings,
-            tenant=settings.tenant_slug,
+            route=route,
             user=user,
         )
     except AuthConfigurationError as exc:
@@ -134,7 +139,7 @@ async def login(
     return LoginResponse(
         access_token=access_token,
         expires_in=expires_in,
-        tenant=settings.tenant_slug,
+        tenant=route.tenant_slug,
         user=user,
     )
 

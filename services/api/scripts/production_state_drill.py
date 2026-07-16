@@ -27,6 +27,7 @@ DATABASE_NAME = "myretail_state_test"
 SENTINEL_ID = "00000000-0000-4000-8000-000000006b02"
 SENTINEL_TENANT = "phase6b2-restore-drill"
 OTHER_TENANT = "phase6b2-other-tenant"
+ISOLATED_TENANT_ID = "018f76c8-bef9-7b89-8c55-72152d8bcf2a"
 PREFIX_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 OWNERSHIP_LABEL = "com.myretail.production-state-drill.owner"
 
@@ -152,7 +153,10 @@ class ProductionStateDrill:
         self._tls_volume_owned = False
         self._data_volume_owned = False
         self._ownership_token = secrets.token_hex(16)
+        self._auth_key = secrets.token_urlsafe(32)
         self._rate_limit_key = secrets.token_urlsafe(32)
+        self._erp_api_key = secrets.token_urlsafe(18)
+        self._erp_api_secret = secrets.token_urlsafe(32)
 
     def run(self) -> DatabaseSnapshot:
         if self.build_images_enabled:
@@ -601,8 +605,14 @@ rm -f /tls/ca.key /tls/ca.srl /tls/server.csr /tmp/server.cnf
 
     def _application_environment(self, *, host: str | None = None) -> dict[str, str]:
         return {
+            "MYRETAIL_AUTH_AUDIENCE": "myretail-production-drill",
+            "MYRETAIL_AUTH_ISSUER": "https://api.production-drill.invalid",
             "MYRETAIL_AUTH_RATE_LIMIT_SECRET": self._rate_limit_key,
+            "MYRETAIL_AUTH_SECRET": self._auth_key,
             "MYRETAIL_ENVIRONMENT": "production",
+            "MYRETAIL_ERPNEXT_API_KEY": self._erp_api_key,
+            "MYRETAIL_ERPNEXT_API_SECRET": self._erp_api_secret,
+            "MYRETAIL_ERPNEXT_BASE_URL": "https://erp.production-drill.invalid",
             "MYRETAIL_STATE_BACKEND": "postgresql",
             "MYRETAIL_STATE_DATABASE_URL": self._database_url(
                 "myretail_api", host=host
@@ -610,6 +620,10 @@ rm -f /tls/ca.key /tls/ca.srl /tls/server.csr /tmp/server.cnf
             "MYRETAIL_STATE_POSTGRES_SSL_MODE": "verify-full",
             "MYRETAIL_STATE_POSTGRES_SSL_ROOT_CERT_PATH": "/tls/ca.crt",
             "MYRETAIL_STATE_PRODUCTION_ENABLEMENT": "controlled",
+            "MYRETAIL_TENANCY_MODE": "isolated_site",
+            "MYRETAIL_TENANT_ID": ISOLATED_TENANT_ID,
+            "MYRETAIL_TENANT_ROUTE_VERSION": "1",
+            "MYRETAIL_TENANT_SLUG": SENTINEL_TENANT,
         }
 
     def _database_url(self, role: str, *, host: str | None = None) -> str:
@@ -666,9 +680,14 @@ rm -f /tls/ca.key /tls/ca.srl /tls/server.csr /tmp/server.cnf
         combined_output = f"{result.stdout}\n{result.stderr}"
         if result.returncode == 0:
             raise DrillError("verify TLS hostname mismatch: preflight unexpectedly passed")
-        if (
-            "postgresql+asyncpg" in combined_output
-            or self._rate_limit_key in combined_output
+        if "postgresql+asyncpg" in combined_output or any(
+            secret in combined_output
+            for secret in (
+                self._auth_key,
+                self._rate_limit_key,
+                self._erp_api_key,
+                self._erp_api_secret,
+            )
         ):
             raise DrillError("verify TLS hostname mismatch: diagnostic exposed configuration")
 

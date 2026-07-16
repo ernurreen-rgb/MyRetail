@@ -22,6 +22,7 @@ from myretail_api.pos_store import POSStoreConflictError
 from myretail_api.security import create_access_token
 from myretail_api.state.pos_repository import PostgresPOSRepository
 from myretail_api.state.postgres import PostgresStateRuntime
+from myretail_api.tenancy import build_isolated_tenant_route
 
 APP_DATABASE_URL = os.environ.get("MYRETAIL_TEST_POSTGRES_APP_URL", "")
 
@@ -186,8 +187,7 @@ def headers(
     roles: list[str] | None = None,
 ) -> dict[str, str]:
     token, _ = create_access_token(
-        settings=settings,
-        tenant=settings.tenant_slug,
+        route=build_isolated_tenant_route(settings),
         user=AuthenticatedUser(
             email="cashier@example.test",
             full_name="Cashier",
