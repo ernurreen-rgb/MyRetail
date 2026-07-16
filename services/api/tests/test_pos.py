@@ -11,6 +11,7 @@ from pydantic import SecretStr, ValidationError
 from myretail_api.clients.erpnext import (
     ERPNextAmbiguousCreateError,
     ERPNextConflictError,
+    ERPNextUnavailableError,
     ERPNextValidationError,
 )
 from myretail_api.config import POSCashierAssignment, Settings, get_settings
@@ -435,6 +436,46 @@ class SlowCancelERPNextClient(StubPOSErpnextClient):
         self.cancel_attempts += 1
         self.cancel_started.set()
         await self.release_cancel.wait()
+        await super().cancel_pos_return(invoice_id, reason=reason, comment=comment)
+
+
+class LostResponseCancelERPNextClient(StubPOSErpnextClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancel_attempts = 0
+        self.docstatus_reads = 0
+
+    async def cancel_pos_return(
+        self,
+        invoice_id: str,
+        *,
+        reason: str,
+        comment: str | None,
+    ) -> None:
+        self.cancel_attempts += 1
+        await super().cancel_pos_return(invoice_id, reason=reason, comment=comment)
+        raise ERPNextAmbiguousCreateError("lost response after return cancellation")
+
+    async def get_pos_return_docstatus(self, invoice_id: str) -> int:
+        self.docstatus_reads += 1
+        if self.cancel_attempts == 1 and self.docstatus_reads == 2:
+            raise ERPNextUnavailableError("cancel recovery read is unavailable")
+        return await super().get_pos_return_docstatus(invoice_id)
+
+
+class AlreadyCancelledReturnERPNextClient(StubPOSErpnextClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancel_attempts = 0
+
+    async def cancel_pos_return(
+        self,
+        invoice_id: str,
+        *,
+        reason: str,
+        comment: str | None,
+    ) -> None:
+        self.cancel_attempts += 1
         await super().cancel_pos_return(invoice_id, reason=reason, comment=comment)
 
 
@@ -2200,6 +2241,207 @@ async def test_return_cancel_requires_admin_and_is_idempotent(tmp_path: Path) ->
 
 
 @pytest.mark.anyio
+async def test_cancel_return_lost_response_recovers_once(tmp_path: Path) -> None:
+    erpnext = LostResponseCancelERPNextClient()
+    app = make_app(erpnext, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        shift = await open_shift(client, tmp_path)
+        sale = await create_sale(client, tmp_path, shift_id=str(shift["id"]))
+        created = await client.post(
+            "/pos/returns",
+            headers=auth_headers(tmp_path, key=str(uuid4())),
+            json={
+                "sale_id": sale["id"],
+                "register_id": "POS-1",
+                "shift_id": shift["id"],
+                "refund_method": "cash",
+                "reason": "other",
+                "lines": [
+                    {
+                        "line_id": f"{sale['id']}:line:1",
+                        "quantity": "1.000",
+                    }
+                ],
+            },
+        )
+        return_id = created.json()["return_id"]
+        cancel_key = str(uuid4())
+        first = await client.post(
+            f"/pos/returns/{return_id}/cancel",
+            headers=auth_headers(tmp_path, roles=["Owner"], key=cancel_key),
+            json={"reason": "other"},
+        )
+        pending = await client.get(
+            f"/pos/returns/{return_id}",
+            headers=auth_headers(tmp_path, roles=["Owner"]),
+        )
+        recovered = await client.post(
+            f"/pos/returns/{return_id}/cancel",
+            headers=auth_headers(tmp_path, roles=["Owner"], key=cancel_key),
+            json={"reason": "other"},
+        )
+        replay = await client.post(
+            f"/pos/returns/{return_id}/cancel",
+            headers=auth_headers(tmp_path, roles=["Owner"], key=cancel_key),
+            json={"reason": "other"},
+        )
+
+    assert first.status_code == 503
+    assert first.json()["error"]["code"] == "RETURN_RECOVERY_REQUIRED"
+    assert pending.status_code == 200
+    assert pending.json()["state"] == "pending_recovery"
+    assert recovered.status_code == replay.status_code == 200
+    assert recovered.json()["state"] == replay.json()["state"] == "cancelled"
+    assert erpnext.cancel_attempts == 1
+    with sqlite3.connect(tmp_path / "pos.sqlite3") as connection:
+        events = connection.execute(
+            """
+            SELECT effect_kind, amount_delta FROM pos_shift_cash_events
+            WHERE source_type = 'return' AND source_id = ?
+            ORDER BY effect_kind
+            """,
+            (return_id,),
+        ).fetchall()
+        intent = connection.execute(
+            """
+            SELECT state, result_id FROM pos_operation_intents
+            WHERE operation = 'cancel_return'
+            """
+        ).fetchone()
+        totals = connection.execute(
+            """
+            SELECT cash_returns_total, expected_cash FROM pos_shifts
+            WHERE id = ?
+            """,
+            (shift["id"],),
+        ).fetchone()
+    assert events == [("return", "-100.00"), ("return_cancel", "100.00")]
+    assert intent == ("completed", return_id)
+    assert totals == ("0.00", "10100.00")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("legacy_state", ["submitted", "cancel_pending"])
+async def test_legacy_cached_cancel_failure_recovers_confirmed_erp_cancel_once(
+    tmp_path: Path,
+    legacy_state: str,
+) -> None:
+    erpnext = AlreadyCancelledReturnERPNextClient()
+    app = make_app(erpnext, tmp_path)
+    cancel_key = str(uuid4())
+    cancel_body = {"reason": "other", "comment": None}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        shift = await open_shift(client, tmp_path)
+        sale = await create_sale(client, tmp_path, shift_id=str(shift["id"]))
+        created = await client.post(
+            "/pos/returns",
+            headers=auth_headers(tmp_path, key=str(uuid4())),
+            json={
+                "sale_id": sale["id"],
+                "register_id": "POS-1",
+                "shift_id": shift["id"],
+                "refund_method": "cash",
+                "reason": "other",
+                "lines": [
+                    {
+                        "line_id": f"{sale['id']}:line:1",
+                        "quantity": "1.000",
+                    }
+                ],
+            },
+        )
+        assert created.status_code == 201
+        return_id = created.json()["return_id"]
+
+        now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        request_hash = _request_hash(
+            "cancel_return",
+            {"return_id": return_id, **cancel_body},
+        )
+        with sqlite3.connect(tmp_path / "pos.sqlite3") as connection:
+            invoice_id = connection.execute(
+                "SELECT erpnext_return_invoice_id FROM pos_returns WHERE id = ?",
+                (return_id,),
+            ).fetchone()[0]
+            connection.execute(
+                "UPDATE pos_returns SET state = ? WHERE id = ?",
+                (legacy_state, return_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO pos_idempotency (
+                    tenant, operation, user_email, idempotency_key, request_hash,
+                    status, status_code, response_body, lease_until, fencing_token,
+                    created_at, updated_at
+                ) VALUES (?, 'cancel_return', ?, ?, ?, 'completed', 503, ?, ?, 1, ?, ?)
+                """,
+                (
+                    "myretail",
+                    "cashier@example.kz",
+                    cancel_key,
+                    request_hash,
+                    '{"error":{"code":"RETURN_RECOVERY_REQUIRED"}}',
+                    now,
+                    now,
+                    now,
+                ),
+            )
+        erpnext.cancelled_returns.add(str(invoice_id))
+
+        pending_options = await client.get(
+            f"/pos/sales/{sale['id']}/return-options",
+            headers=auth_headers(tmp_path, roles=["Owner"]),
+        )
+        recovered = await client.post(
+            f"/pos/returns/{return_id}/cancel",
+            headers=auth_headers(tmp_path, roles=["Owner"], key=cancel_key),
+            json={"reason": "other"},
+        )
+        replay = await client.post(
+            f"/pos/returns/{return_id}/cancel",
+            headers=auth_headers(tmp_path, roles=["Owner"], key=cancel_key),
+            json={"reason": "other"},
+        )
+
+    assert pending_options.status_code == 200
+    assert pending_options.json()["lines"][0]["already_returned_quantity"] == "1.000"
+    assert pending_options.json()["lines"][0]["available_to_return_quantity"] == "0.000"
+    assert recovered.status_code == replay.status_code == 200
+    assert recovered.json()["state"] == replay.json()["state"] == "cancelled"
+    assert erpnext.cancelled_returns == {str(invoice_id)}
+    assert erpnext.cancel_attempts == 0
+    with sqlite3.connect(tmp_path / "pos.sqlite3") as connection:
+        events = connection.execute(
+            """
+            SELECT effect_kind, amount_delta FROM pos_shift_cash_events
+            WHERE source_type = 'return' AND source_id = ?
+            ORDER BY effect_kind
+            """,
+            (return_id,),
+        ).fetchall()
+        totals = connection.execute(
+            """
+            SELECT cash_returns_total, expected_cash FROM pos_shifts
+            WHERE id = ?
+            """,
+            (shift["id"],),
+        ).fetchone()
+        intents = connection.execute(
+            """
+            SELECT state, result_id FROM pos_operation_intents
+            WHERE operation = 'cancel_return'
+            """
+        ).fetchall()
+    assert events == [("return", "-100.00"), ("return_cancel", "100.00")]
+    assert totals == ("0.00", "10100.00")
+    assert intents == [("completed", return_id)]
+
+
+@pytest.mark.anyio
 async def test_ambiguous_return_is_pending_recovery_without_second_create(tmp_path: Path) -> None:
     erpnext = FlakyReturnERPNextClient()
     app = make_app(erpnext, tmp_path)
@@ -2655,6 +2897,115 @@ async def test_cancel_return_is_serialized_before_erpnext_call(tmp_path: Path) -
             "/pos/returns", headers=auth_headers(tmp_path, key=str(uuid4())), json=body
         )
         return_id = created.json()["return_id"]
+        first_key = str(uuid4())
+        second_key = str(uuid4())
+        first_task = asyncio.create_task(
+            client.post(
+                f"/pos/returns/{return_id}/cancel",
+                headers=auth_headers(tmp_path, roles=["Owner"], key=first_key),
+                json={"reason": "other"},
+            )
+        )
+        await erpnext.cancel_started.wait()
+        second_task = asyncio.create_task(
+            client.post(
+                f"/pos/returns/{return_id}/cancel",
+                headers=auth_headers(
+                    tmp_path,
+                    email="second-owner@example.kz",
+                    roles=["Owner"],
+                    key=second_key,
+                ),
+                json={"reason": "other"},
+            )
+        )
+        await asyncio.sleep(0.1)
+        pending = await client.get(
+            f"/pos/returns/{return_id}",
+            headers=auth_headers(tmp_path, roles=["Owner"]),
+        )
+        erpnext.release_cancel.set()
+        first, second = await asyncio.gather(first_task, second_task)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["return_id"] == second.json()["return_id"] == return_id
+    assert pending.status_code == 200
+    assert pending.json()["state"] == "pending_recovery"
+    assert erpnext.cancel_attempts == 1
+    with sqlite3.connect(tmp_path / "pos.sqlite3") as connection:
+        events = connection.execute(
+            """
+            SELECT effect_kind, amount_delta FROM pos_shift_cash_events
+            WHERE source_type = 'return' AND source_id = ?
+            ORDER BY effect_kind
+            """,
+            (return_id,),
+        ).fetchall()
+        aliases = connection.execute(
+            """
+            SELECT COUNT(*) FROM pos_operation_intent_aliases AS alias
+            JOIN pos_operation_intents AS intent ON intent.id = alias.intent_id
+            WHERE intent.operation = 'cancel_return' AND intent.result_id = ?
+            """,
+            (return_id,),
+        ).fetchone()
+        intent = connection.execute(
+            """
+            SELECT state, user_email, external_key FROM pos_operation_intents
+            WHERE operation = 'cancel_return' AND result_id = ?
+            """,
+            (return_id,),
+        ).fetchone()
+        totals = connection.execute(
+            """
+            SELECT cash_returns_total, expected_cash FROM pos_shifts
+            WHERE id = ?
+            """,
+            (shift["id"],),
+        ).fetchone()
+    assert events == [("return", "-100.00"), ("return_cancel", "100.00")]
+    assert aliases == (2,)
+    assert intent == (
+        "completed",
+        f"return:{return_id}:cancel",
+        _request_hash(
+            "cancel_return_marker",
+            {"tenant": "myretail", "return_id": return_id},
+        ),
+    )
+    assert totals == ("0.00", "10100.00")
+
+
+@pytest.mark.anyio
+async def test_incompatible_cancel_return_is_rejected_without_second_erp_call(
+    tmp_path: Path,
+) -> None:
+    erpnext = SlowCancelERPNextClient()
+    app = make_app(erpnext, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        shift = await open_shift(client, tmp_path)
+        sale = await create_sale(client, tmp_path, shift_id=str(shift["id"]))
+        created = await client.post(
+            "/pos/returns",
+            headers=auth_headers(tmp_path, key=str(uuid4())),
+            json={
+                "sale_id": sale["id"],
+                "register_id": "POS-1",
+                "shift_id": shift["id"],
+                "refund_method": "cash",
+                "reason": "other",
+                "lines": [
+                    {
+                        "line_id": f"{sale['id']}:line:1",
+                        "quantity": "1.000",
+                    }
+                ],
+            },
+        )
+        return_id = created.json()["return_id"]
         first_task = asyncio.create_task(
             client.post(
                 f"/pos/returns/{return_id}/cancel",
@@ -2663,18 +3014,188 @@ async def test_cancel_return_is_serialized_before_erpnext_call(tmp_path: Path) -
             )
         )
         await erpnext.cancel_started.wait()
-        second = await client.post(
+        incompatible = await client.post(
             f"/pos/returns/{return_id}/cancel",
             headers=auth_headers(tmp_path, roles=["Owner"], key=str(uuid4())),
-            json={"reason": "other"},
+            json={"reason": "cashier_error"},
         )
         erpnext.release_cancel.set()
         first = await first_task
 
     assert first.status_code == 200
-    assert second.status_code == 409
-    assert second.json()["error"]["code"] == "RETURN_CANCEL_NOT_ALLOWED"
+    assert incompatible.status_code == 409
+    assert incompatible.json()["error"]["code"] == "SHIFT_CHANGED"
     assert erpnext.cancel_attempts == 1
+
+
+@pytest.mark.anyio
+async def test_active_cancel_return_blocks_shift_close_before_erp_call(
+    tmp_path: Path,
+) -> None:
+    erpnext = SlowCancelERPNextClient()
+    app = make_app(erpnext, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        shift = await open_shift(client, tmp_path)
+        sale = await create_sale(client, tmp_path, shift_id=str(shift["id"]))
+        created = await client.post(
+            "/pos/returns",
+            headers=auth_headers(tmp_path, key=str(uuid4())),
+            json={
+                "sale_id": sale["id"],
+                "register_id": "POS-1",
+                "shift_id": shift["id"],
+                "refund_method": "cash",
+                "reason": "other",
+                "lines": [
+                    {
+                        "line_id": f"{sale['id']}:line:1",
+                        "quantity": "1.000",
+                    }
+                ],
+            },
+        )
+        refreshed = await client.get(
+            "/pos/shifts/current?register_id=POS-1",
+            headers=auth_headers(tmp_path),
+        )
+        return_id = created.json()["return_id"]
+        cancel_task = asyncio.create_task(
+            client.post(
+                f"/pos/returns/{return_id}/cancel",
+                headers=auth_headers(tmp_path, roles=["Owner"], key=str(uuid4())),
+                json={"reason": "other"},
+            )
+        )
+        await erpnext.cancel_started.wait()
+        close = await client.post(
+            f"/pos/shifts/{shift['id']}/close",
+            headers=auth_headers(tmp_path, key=str(uuid4())),
+            json={
+                "actual_cash": "10000.00",
+                "expected_updated_at": refreshed.json()["updated_at"],
+            },
+        )
+        erpnext.release_cancel.set()
+        cancelled = await cancel_task
+
+    assert created.status_code == 201
+    assert close.status_code == 409
+    assert close.json()["error"]["code"] == "SHIFT_CHANGED"
+    assert erpnext.closings == []
+    assert cancelled.status_code == 200
+    assert erpnext.cancel_attempts == 1
+
+
+@pytest.mark.anyio
+async def test_active_shift_close_blocks_cancel_return_before_erp_call(
+    tmp_path: Path,
+) -> None:
+    erpnext = BlockingCommittedCloseERPNextClient()
+    app = make_app(erpnext, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        shift = await open_shift(client, tmp_path)
+        sale = await create_sale(client, tmp_path, shift_id=str(shift["id"]))
+        created = await client.post(
+            "/pos/returns",
+            headers=auth_headers(tmp_path, key=str(uuid4())),
+            json={
+                "sale_id": sale["id"],
+                "register_id": "POS-1",
+                "shift_id": shift["id"],
+                "refund_method": "cash",
+                "reason": "other",
+                "lines": [
+                    {
+                        "line_id": f"{sale['id']}:line:1",
+                        "quantity": "1.000",
+                    }
+                ],
+            },
+        )
+        refreshed = await client.get(
+            "/pos/shifts/current?register_id=POS-1",
+            headers=auth_headers(tmp_path),
+        )
+        close_task = asyncio.create_task(
+            client.post(
+                f"/pos/shifts/{shift['id']}/close",
+                headers=auth_headers(tmp_path, key=str(uuid4())),
+                json={
+                    "actual_cash": "10000.00",
+                    "expected_updated_at": refreshed.json()["updated_at"],
+                },
+            )
+        )
+        await erpnext.closing_created.wait()
+        cancelled = await client.post(
+            f"/pos/returns/{created.json()['return_id']}/cancel",
+            headers=auth_headers(tmp_path, roles=["Owner"], key=str(uuid4())),
+            json={"reason": "other"},
+        )
+        erpnext.release_response.set()
+        closed = await close_task
+
+    assert created.status_code == 201
+    assert cancelled.status_code == 409
+    assert cancelled.json()["error"]["code"] == "SHIFT_CHANGED"
+    assert erpnext.cancelled_returns == set()
+    assert closed.status_code == 200
+    assert erpnext.closings == ["CLOSE-1"]
+
+
+@pytest.mark.anyio
+async def test_cancel_return_on_closed_shift_fails_before_erp_call(tmp_path: Path) -> None:
+    erpnext = StubPOSErpnextClient()
+    app = make_app(erpnext, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        shift = await open_shift(client, tmp_path)
+        sale = await create_sale(client, tmp_path, shift_id=str(shift["id"]))
+        created = await client.post(
+            "/pos/returns",
+            headers=auth_headers(tmp_path, key=str(uuid4())),
+            json={
+                "sale_id": sale["id"],
+                "register_id": "POS-1",
+                "shift_id": shift["id"],
+                "refund_method": "cash",
+                "reason": "other",
+                "lines": [
+                    {
+                        "line_id": f"{sale['id']}:line:1",
+                        "quantity": "1.000",
+                    }
+                ],
+            },
+        )
+        current = await client.get(
+            "/pos/shifts/current?register_id=POS-1",
+            headers=auth_headers(tmp_path),
+        )
+        closed = await client.post(
+            f"/pos/shifts/{shift['id']}/close",
+            headers=auth_headers(tmp_path, key=str(uuid4())),
+            json={
+                "actual_cash": "10000.00",
+                "expected_updated_at": current.json()["updated_at"],
+            },
+        )
+        cancelled = await client.post(
+            f"/pos/returns/{created.json()['return_id']}/cancel",
+            headers=auth_headers(tmp_path, roles=["Owner"], key=str(uuid4())),
+            json={"reason": "other"},
+        )
+
+    assert created.status_code == 201
+    assert closed.status_code == 200
+    assert cancelled.status_code == 409
+    assert cancelled.json()["error"]["code"] == "POS_OPENING_OUTDATED"
+    assert erpnext.cancelled_returns == set()
 
 
 @pytest.mark.anyio

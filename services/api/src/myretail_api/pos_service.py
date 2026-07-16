@@ -439,8 +439,20 @@ class POSService:
             payload=payload,
             success_status=200,
             conflict_code="IDEMPOTENCY_KEY_REUSED",
-            execute=lambda: self._cancel_return_once(context, return_id, request),
-            recover=lambda: self._recover_cancel_return(context, return_id, request),
+            execute=lambda: self._cancel_return_once(context, return_id, request, key),
+            recover=lambda: self._recover_cancel_return(
+                context,
+                return_id,
+                request,
+                key,
+            ),
+            recover_cached_failure=lambda: self._recover_cancel_return(
+                context,
+                return_id,
+                request,
+                key,
+                allow_cancelled_replay=True,
+            ),
         )
 
     async def _open_shift_once(
@@ -1141,7 +1153,11 @@ class POSService:
         )
 
     async def _cancel_return_once(
-        self, context: TenantContext, return_id: str, request: ReturnCancelRequest
+        self,
+        context: TenantContext,
+        return_id: str,
+        request: ReturnCancelRequest,
+        key: str,
     ) -> ReturnResponse:
         row = await self._store.get_return(context.tenant, return_id)
         if row is None:
@@ -1149,69 +1165,469 @@ class POSService:
         self._ensure_return_scope(context, row)
         if row["state"] == "cancelled":
             raise POSApiError(409, "RETURN_ALREADY_CANCELLED", "Возврат уже отменён")
+        if row["state"] not in {"submitted", "cancel_pending"}:
+            raise POSApiError(
+                503,
+                "RETURN_RECOVERY_REQUIRED",
+                "Возврат ещё не подтверждён ERPNext",
+                {"return_id": return_id},
+            )
+        invoice_id = str(row.get("erpnext_return_invoice_id") or "")
+        if not invoice_id:
+            raise POSApiError(
+                503,
+                "RETURN_RECOVERY_REQUIRED",
+                "ERPNext return id отсутствует",
+                {"return_id": return_id},
+            )
+        shift_row = await self._store.get_shift(context.tenant, str(row["shift_id"]))
+        if shift_row is None:
+            raise POSApiError(409, "SHIFT_NOT_OPEN", "Смена не найдена")
+        shift = self._to_shift(shift_row)
+        if shift.status != "open":
+            raise POSApiError(
+                409,
+                "POS_OPENING_OUTDATED",
+                "POS Opening Entry неактуальна для компенсации возврата",
+            )
+
+        business_hash = _request_hash(
+            "cancel_return",
+            {"return_id": return_id, **request.model_dump(mode="json")},
+        )
+        now = _now()
+        claim = await self._begin_cancel_return_intent(
+            context,
+            return_id=return_id,
+            key=key,
+            business_hash=business_hash,
+            scope_id=f"shift:{shift.id}",
+            stable_marker=_request_hash(
+                "cancel_return_marker",
+                {"tenant": context.tenant, "return_id": return_id},
+            ),
+            expected_shift_updated_at=shift.updated_at.astimezone(UTC)
+            .isoformat()
+            .replace("+00:00", "Z"),
+            payload={
+                "cancel": {
+                    "tenant": context.tenant,
+                    "return_id": return_id,
+                    "shift_id": str(row["shift_id"]),
+                    "erpnext_return_invoice_id": invoice_id,
+                    "refund_total": str(row["refund_total"]),
+                    "cancelled_by": context.user.email,
+                    "reason": request.reason,
+                    "comment": request.comment,
+                    "cancelled_at": now,
+                },
+                "cash_event": {
+                    "event_id": str(uuid4()),
+                    "created_at": now,
+                },
+            },
+        )
+        if not claim.acquired:
+            return await self._wait_cancel_return_intent_result(
+                context,
+                return_id=return_id,
+                key=key,
+                business_hash=business_hash,
+            )
+        if claim.intent["state"] == "completed":
+            return await self._cancel_return_from_terminal_intent(context, claim.intent)
+        if claim.recovery_only:
+            return await self._recover_cancel_return_intent(context, claim.intent)
+
+        await self._prepare_cancel_return_intent(context, claim.intent)
+        await self._mark_intent_erp_pending(
+            context.tenant,
+            str(claim.intent["id"]),
+            int(claim.intent["fencing_token"]),
+        )
+        return await self._execute_cancel_return_intent(context, claim.intent)
+
+    async def _begin_cancel_return_intent(
+        self,
+        context: TenantContext,
+        *,
+        return_id: str,
+        key: str,
+        business_hash: str,
+        scope_id: str,
+        stable_marker: str,
+        payload: dict[str, Any],
+        expected_shift_updated_at: str,
+    ) -> POSIntentBeginResult:
+        principal = _cancel_return_principal(return_id)
         try:
-            claimed = await self._store.claim_return_cancel(
-                context.tenant,
-                return_id,
+            existing = await self._store.find_operation_intent_by_alias(
+                tenant=context.tenant,
+                operation="cancel_return",
+                user_email=principal,
+                key=key,
+                business_hash=business_hash,
+            )
+            if existing is not None:
+                if existing["state"] == "completed":
+                    return POSIntentBeginResult(
+                        acquired=True,
+                        intent=existing,
+                        recovery_only=True,
+                    )
+                return await self._store.claim_operation_intent(
+                    context.tenant,
+                    str(existing["id"]),
+                )
+            claim = await self._store.begin_operation_intent(
+                tenant=context.tenant,
+                operation="cancel_return",
+                scope_id=scope_id,
+                user_email=principal,
+                business_hash=business_hash,
+                payload=payload,
+                external_key=stable_marker,
+                expected_shift_updated_at=expected_shift_updated_at,
+            )
+            canonical = await self._store.attach_operation_intent_alias(
+                tenant=context.tenant,
+                operation="cancel_return",
+                user_email=principal,
+                key=key,
+                intent_id=str(claim.intent["id"]),
+                business_hash=business_hash,
+            )
+            return POSIntentBeginResult(
+                acquired=claim.acquired,
+                intent=canonical,
+                recovery_only=claim.recovery_only,
             )
         except POSStoreConflictError as exc:
-            raise POSApiError(409, exc.code, exc.message, exc.fields) from exc
-        if not claimed:
-            raise POSApiError(404, "RETURN_NOT_FOUND", "Возврат не найден")
-        if claimed["state"] == "cancelled":
-            raise POSApiError(409, "RETURN_ALREADY_CANCELLED", "Возврат уже отменён")
-        if claimed["state"] != "cancel_pending" or not claimed.get("erpnext_return_invoice_id"):
-            raise POSApiError(503, "RETURN_RECOVERY_REQUIRED", "Возврат ещё не подтверждён ERPNext")
-        try:
-            await self._call_erp(
-                self._erpnext.cancel_pos_return(
-                    str(claimed["erpnext_return_invoice_id"]),
-                    reason=request.reason,
-                    comment=request.comment,
-                )
+            code = (
+                "IDEMPOTENCY_KEY_REUSED"
+                if exc.code == "IDEMPOTENCY_CONFLICT"
+                else exc.code
             )
-        except ERPNextAmbiguousCreateError:
-            raise
-        except Exception:
-            await self._store.release_return_cancel(context.tenant, return_id)
-            raise
-        return await self._to_return(
-            await self._store.mark_return_cancelled(
-                tenant=context.tenant,
-                return_id=return_id,
-                cancelled_by=context.user.email,
-                reason=request.reason,
-                comment=request.comment,
-            )
-        )
+            raise POSApiError(409, code, exc.message, exc.fields) from exc
 
     async def _recover_cancel_return(
-        self, context: TenantContext, return_id: str, request: ReturnCancelRequest
+        self,
+        context: TenantContext,
+        return_id: str,
+        request: ReturnCancelRequest,
+        key: str,
+        *,
+        allow_cancelled_replay: bool = False,
     ) -> ReturnResponse | None:
+        business_hash = _request_hash(
+            "cancel_return",
+            {"return_id": return_id, **request.model_dump(mode="json")},
+        )
+        principal = _cancel_return_principal(return_id)
+        try:
+            intent = await self._store.find_operation_intent_by_alias(
+                tenant=context.tenant,
+                operation="cancel_return",
+                user_email=principal,
+                key=key,
+                business_hash=business_hash,
+            )
+            if intent is None:
+                intent = await self._store.find_active_operation_intent(
+                    tenant=context.tenant,
+                    operation="cancel_return",
+                    user_email=principal,
+                    business_hash=business_hash,
+                )
+                if intent is not None:
+                    intent = await self._store.attach_operation_intent_alias(
+                        tenant=context.tenant,
+                        operation="cancel_return",
+                        user_email=principal,
+                        key=key,
+                        intent_id=str(intent["id"]),
+                        business_hash=business_hash,
+                    )
+        except POSStoreConflictError as exc:
+            raise POSApiError(
+                409,
+                "IDEMPOTENCY_KEY_REUSED",
+                exc.message,
+                exc.fields,
+            ) from exc
+        if intent is not None:
+            if intent["state"] == "completed":
+                return await self._cancel_return_from_terminal_intent(context, intent)
+            try:
+                claim = await self._store.claim_operation_intent(
+                    context.tenant,
+                    str(intent["id"]),
+                )
+            except POSStoreConflictError as exc:
+                raise POSApiError(409, exc.code, exc.message, exc.fields) from exc
+            if not claim.acquired:
+                return await self._wait_cancel_return_intent_result(
+                    context,
+                    return_id=return_id,
+                    key=key,
+                    business_hash=business_hash,
+                )
+            return await self._recover_cancel_return_intent(context, claim.intent)
+
         row = await self._store.get_return(context.tenant, return_id)
         if row is None:
             return None
         if row["state"] == "cancelled":
+            if allow_cancelled_replay:
+                return await self._to_return(row)
             raise POSApiError(409, "RETURN_ALREADY_CANCELLED", "Возврат уже отменён")
-        if not row.get("erpnext_return_invoice_id"):
-            raise POSApiError(503, "RETURN_RECOVERY_REQUIRED", "ERPNext return id отсутствует")
-        docstatus = await self._erpnext.get_pos_return_docstatus(
-            str(row["erpnext_return_invoice_id"])
-        )
-        if docstatus == 2:
-            return await self._to_return(
-                await self._store.mark_return_cancelled(
-                    tenant=context.tenant,
-                    return_id=return_id,
-                    cancelled_by=context.user.email,
-                    reason=request.reason,
-                    comment=request.comment,
-                )
+        if row["state"] == "cancel_pending":
+            return await self._cancel_return_once(
+                context,
+                return_id,
+                request,
+                key,
             )
-        raise POSApiError(
+        invoice_id = str(row.get("erpnext_return_invoice_id") or "")
+        if not invoice_id:
+            raise POSApiError(
+                503,
+                "RETURN_RECOVERY_REQUIRED",
+                "ERPNext return id отсутствует",
+                {"return_id": return_id},
+            )
+        try:
+            docstatus = await self._call_erp(
+                self._erpnext.get_pos_return_docstatus(invoice_id)
+            )
+        except POSApiError as exc:
+            if exc.status_code >= 500:
+                raise POSLegacyRecoveryError(
+                    exc.status_code,
+                    exc.code,
+                    exc.message,
+                    exc.fields,
+                ) from exc
+            raise
+        if docstatus == 2:
+            return await self._cancel_return_once(
+                context,
+                return_id,
+                request,
+                key,
+            )
+        if row["state"] == "submitted" and docstatus == 1:
+            return None
+        raise POSLegacyRecoveryError(
             503,
             "RETURN_RECOVERY_REQUIRED",
             "Результат отмены возврата ERPNext нельзя безопасно подтвердить",
+            {"return_id": return_id},
+        )
+
+    async def _recover_cancel_return_intent(
+        self,
+        context: TenantContext,
+        intent: dict[str, Any],
+    ) -> ReturnResponse:
+        if intent["state"] == "completed":
+            return await self._cancel_return_from_terminal_intent(context, intent)
+        await self._prepare_cancel_return_intent(context, intent)
+        return await self._execute_cancel_return_intent(context, intent)
+
+    async def _prepare_cancel_return_intent(
+        self,
+        context: TenantContext,
+        intent: dict[str, Any],
+    ) -> None:
+        payload = _durable_intent_payload(intent)
+        cancel = dict(payload["cancel"])
+        try:
+            await self._store.prepare_return_cancel_intent(
+                context.tenant,
+                str(intent["id"]),
+                int(intent["fencing_token"]),
+                str(cancel["return_id"]),
+            )
+        except POSStoreConflictError as exc:
+            raise POSApiError(409, exc.code, exc.message, exc.fields) from exc
+
+    async def _execute_cancel_return_intent(
+        self,
+        context: TenantContext,
+        intent: dict[str, Any],
+    ) -> ReturnResponse:
+        payload = _durable_intent_payload(intent)
+        cancel = dict(payload["cancel"])
+        invoice_id = str(cancel["erpnext_return_invoice_id"])
+        intent_id = str(intent["id"])
+        fencing_token = int(intent["fencing_token"])
+        try:
+            docstatus = await self._call_erp(
+                self._erpnext.get_pos_return_docstatus(invoice_id)
+            )
+        except POSApiError as exc:
+            await self._mark_intent_recovery_required(
+                context.tenant,
+                intent_id,
+                fencing_token,
+            )
+            raise POSApiError(
+                503,
+                "RETURN_RECOVERY_REQUIRED",
+                "Состояние отмены возврата ERPNext ещё не подтверждено",
+                {"return_id": str(cancel["return_id"])},
+            ) from exc
+        if docstatus == 2:
+            return await self._materialize_cancel_return_intent(context, intent)
+        if docstatus != 1:
+            await self._mark_intent_recovery_required(
+                context.tenant,
+                intent_id,
+                fencing_token,
+            )
+            raise POSApiError(
+                503,
+                "RETURN_RECOVERY_REQUIRED",
+                "ERPNext return не находится в отменяемом состоянии",
+                {"return_id": str(cancel["return_id"])},
+            )
+        try:
+            await self._call_erp(
+                self._erpnext.cancel_pos_return(
+                    invoice_id,
+                    reason=str(cancel["reason"]),
+                    comment=(
+                        str(cancel["comment"])
+                        if cancel.get("comment") is not None
+                        else None
+                    ),
+                )
+            )
+        except ERPNextAmbiguousCreateError:
+            await self._mark_intent_recovery_required(
+                context.tenant,
+                intent_id,
+                fencing_token,
+            )
+            try:
+                docstatus = await self._call_erp(
+                    self._erpnext.get_pos_return_docstatus(invoice_id)
+                )
+            except POSApiError:
+                raise POSApiError(
+                    503,
+                    "RETURN_RECOVERY_REQUIRED",
+                    "Результат отмены возврата ERPNext ещё не подтверждён",
+                    {"return_id": str(cancel["return_id"])},
+                ) from None
+            if docstatus == 2:
+                return await self._materialize_cancel_return_intent(context, intent)
+            raise POSApiError(
+                503,
+                "RETURN_RECOVERY_REQUIRED",
+                "Результат отмены возврата ERPNext ещё не подтверждён",
+                {"return_id": str(cancel["return_id"])},
+            ) from None
+        except POSApiError as exc:
+            await self._mark_intent_recovery_required(
+                context.tenant,
+                intent_id,
+                fencing_token,
+            )
+            try:
+                docstatus = await self._call_erp(
+                    self._erpnext.get_pos_return_docstatus(invoice_id)
+                )
+            except POSApiError:
+                docstatus = -1
+            if docstatus == 2:
+                return await self._materialize_cancel_return_intent(context, intent)
+            raise POSApiError(
+                503,
+                "RETURN_RECOVERY_REQUIRED",
+                "Результат отмены возврата ERPNext ещё не подтверждён",
+                {"return_id": str(cancel["return_id"])},
+            ) from exc
+        return await self._materialize_cancel_return_intent(context, intent)
+
+    async def _materialize_cancel_return_intent(
+        self,
+        context: TenantContext,
+        intent: dict[str, Any],
+    ) -> ReturnResponse:
+        try:
+            row = await self._store.materialize_return_cancel_intent(
+                context.tenant,
+                str(intent["id"]),
+                int(intent["fencing_token"]),
+            )
+        except POSStoreConflictError as exc:
+            if exc.code == "IDEMPOTENCY_CONFLICT":
+                raise POSApiError(409, exc.code, exc.message, exc.fields) from exc
+            raise POSApiError(
+                503,
+                "RETURN_RECOVERY_REQUIRED",
+                "Отмена ERPNext подтверждена, локальная проекция ожидает recovery",
+                {"return_id": str(_durable_intent_payload(intent)["cancel"]["return_id"])},
+            ) from exc
+        return await self._to_return(row)
+
+    async def _cancel_return_from_terminal_intent(
+        self,
+        context: TenantContext,
+        intent: dict[str, Any],
+    ) -> ReturnResponse:
+        result_id = intent.get("result_id")
+        if result_id:
+            row = await self._store.get_return(context.tenant, str(result_id))
+            if row is not None and row["state"] == "cancelled":
+                return await self._to_return(row)
+        raise POSApiError(
+            503,
+            "RETURN_RECOVERY_REQUIRED",
+            "Локальная проекция отмены возврата требует восстановления",
+        )
+
+    async def _wait_cancel_return_intent_result(
+        self,
+        context: TenantContext,
+        *,
+        return_id: str,
+        key: str,
+        business_hash: str,
+    ) -> ReturnResponse:
+        principal = _cancel_return_principal(return_id)
+        deadline = datetime.now(UTC).timestamp() + 5
+        while datetime.now(UTC).timestamp() < deadline:
+            try:
+                intent = await self._store.find_operation_intent_by_alias(
+                    tenant=context.tenant,
+                    operation="cancel_return",
+                    user_email=principal,
+                    key=key,
+                    business_hash=business_hash,
+                )
+            except POSStoreConflictError as exc:
+                raise POSApiError(
+                    409,
+                    "IDEMPOTENCY_KEY_REUSED",
+                    exc.message,
+                    exc.fields,
+                ) from exc
+            if intent is not None and intent["state"] == "completed":
+                return await self._cancel_return_from_terminal_intent(context, intent)
+            if intent is not None and intent["state"] == "failed":
+                raise POSApiError(
+                    409,
+                    "IDEMPOTENCY_KEY_REUSED",
+                    "Каноническая отмена возврата завершилась ошибкой",
+                )
+            await asyncio.sleep(0.05)
+        raise POSApiError(
+            503,
+            "RETURN_RECOVERY_REQUIRED",
+            "Отмена возврата ещё выполняется или ожидает recovery",
             {"return_id": return_id},
         )
 
@@ -1436,6 +1852,7 @@ class POSService:
         conflict_code: str = "IDEMPOTENCY_CONFLICT",
         execute: Any,
         recover: Any | None = None,
+        recover_cached_failure: Any | None = None,
     ) -> tuple[int, dict[str, object]]:
         request_hash = _request_hash(operation, payload)
         try:
@@ -1452,6 +1869,17 @@ class POSService:
                 conflict_code,
                 "Idempotency-Key уже использован для другого запроса",
             ) from exc
+        if (
+            begin.record is not None
+            and begin.record.status_code >= 500
+            and recover_cached_failure is not None
+        ):
+            try:
+                recovered = await recover_cached_failure()
+            except POSApiError as exc:
+                return exc.status_code, _error_response_body(exc)
+            if recovered is not None:
+                return success_status, jsonable_encoder(recovered)
         if begin.record is not None:
             return begin.record.status_code, begin.record.response_body
         if not begin.acquired:
@@ -1504,6 +1932,7 @@ class POSService:
             "close_shift",
             "create_sale",
             "create_return",
+            "cancel_return",
         }
         if begin.expired and recover is not None:
             try:
@@ -2092,6 +2521,10 @@ def _request_hash(operation: str, payload: dict[str, object]) -> str:
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _cancel_return_principal(return_id: str) -> str:
+    return f"return:{return_id}:cancel"
 
 
 def _error_response_body(exc: POSApiError) -> dict[str, object]:

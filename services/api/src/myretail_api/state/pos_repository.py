@@ -175,6 +175,34 @@ class SQLitePOSRepository:
             erpnext_invoice_id,
         )
 
+    async def prepare_return_cancel_intent(
+        self,
+        tenant: str,
+        intent_id: str,
+        fencing_token: int,
+        return_id: str,
+    ) -> dict[str, Any]:
+        return await self._run_tenant_intent(
+            tenant,
+            intent_id,
+            self._store.prepare_return_cancel_intent,
+            fencing_token,
+            return_id,
+        )
+
+    async def materialize_return_cancel_intent(
+        self,
+        tenant: str,
+        intent_id: str,
+        fencing_token: int,
+    ) -> dict[str, Any]:
+        return await self._run_tenant_intent(
+            tenant,
+            intent_id,
+            self._store.materialize_return_cancel_intent,
+            fencing_token,
+        )
+
     async def append_cash_event(
         self,
         *,
@@ -1398,6 +1426,387 @@ class PostgresPOSRepository:
                 )
         return _legacy_return(projected)
 
+    async def prepare_return_cancel_intent(
+        self,
+        tenant: str,
+        intent_id: str,
+        fencing_token: int,
+        return_id: str,
+    ) -> dict[str, Any]:
+        async with self._engine.begin() as connection:
+            await _set_tenant(connection, tenant)
+            intent = await _owned_intent(
+                connection,
+                tenant=tenant,
+                intent_id=intent_id,
+                owner_id=self._owner_id,
+                fencing_token=fencing_token,
+                operation="cancel_return",
+            )
+            payload = _object(intent["payload"])
+            cancel = _object(payload.get("cancel"))
+            if not (
+                str(cancel.get("tenant")) == tenant
+                and str(cancel.get("return_id")) == return_id
+            ):
+                raise POSStoreConflictError(
+                    "IDEMPOTENCY_CONFLICT",
+                    "Cancel intent does not match its return projection",
+                )
+            row = await _locked_row(
+                connection,
+                """
+                SELECT * FROM myretail_state.pos_returns
+                WHERE tenant_id = :tenant AND return_id = :row_id
+                FOR UPDATE
+                """,
+                tenant=tenant,
+                row_id=return_id,
+            )
+            if row is None:
+                raise POSStoreConflictError("RETURN_NOT_FOUND", "Return not found")
+            if row["state"] == "cancelled":
+                raise POSStoreConflictError(
+                    "RETURN_ALREADY_CANCELLED",
+                    "Return is already cancelled",
+                )
+            if row["state"] not in {"submitted", "cancel_pending"}:
+                raise POSStoreConflictError(
+                    "RETURN_RECOVERY_REQUIRED",
+                    "Return is not ready for cancellation",
+                )
+            if not (
+                str(row.get("erpnext_return_invoice_id") or "")
+                == str(cancel.get("erpnext_return_invoice_id") or "")
+                and str(row["shift_id"]) == str(cancel.get("shift_id"))
+                and _money(row["refund_total"]) == _money(cancel.get("refund_total"))
+            ):
+                raise POSStoreConflictError(
+                    "IDEMPOTENCY_CONFLICT",
+                    "Cancel snapshot no longer matches the return",
+                )
+            shift = await _locked_row(
+                connection,
+                """
+                SELECT * FROM myretail_state.pos_shifts
+                WHERE tenant_id = :tenant AND shift_id = :row_id
+                FOR UPDATE
+                """,
+                tenant=tenant,
+                row_id=str(row["shift_id"]),
+            )
+            if shift is None:
+                raise POSStoreConflictError("SHIFT_NOT_FOUND", "Shift not found")
+            if shift["status"] != "open":
+                raise POSStoreConflictError(
+                    "POS_OPENING_OUTDATED",
+                    "POS Opening Entry is outdated for return cancellation",
+                )
+            if row["state"] == "submitted":
+                updated = await connection.execute(
+                    text(
+                        """
+                        UPDATE myretail_state.pos_returns
+                        SET state = 'cancel_pending', updated_at = clock_timestamp()
+                        WHERE tenant_id = :tenant AND return_id = :return_id
+                          AND state = 'submitted'
+                        """
+                    ),
+                    {"tenant": tenant, "return_id": return_id},
+                )
+                if updated.rowcount != 1:
+                    raise POSStoreConflictError(
+                        "SHIFT_CHANGED",
+                        "Return cancellation state changed",
+                    )
+            projected = await _locked_row(
+                connection,
+                """
+                SELECT * FROM myretail_state.pos_returns
+                WHERE tenant_id = :tenant AND return_id = :row_id
+                """,
+                tenant=tenant,
+                row_id=return_id,
+            )
+            if projected is None:
+                raise POSStoreConflictError(
+                    "IDEMPOTENCY_CONFLICT",
+                    "Return projection is missing",
+                )
+        return _legacy_return(projected)
+
+    async def materialize_return_cancel_intent(
+        self,
+        tenant: str,
+        intent_id: str,
+        fencing_token: int,
+    ) -> dict[str, Any]:
+        async with self._engine.begin() as connection:
+            await _set_tenant(connection, tenant)
+            intent = await _owned_intent(
+                connection,
+                tenant=tenant,
+                intent_id=intent_id,
+                owner_id=self._owner_id,
+                fencing_token=fencing_token,
+                operation="cancel_return",
+            )
+            payload = _object(intent["payload"])
+            cancel = _object(payload.get("cancel"))
+            cash_event = _object(payload.get("cash_event"))
+            return_id = str(cancel["return_id"])
+            row = await _locked_row(
+                connection,
+                """
+                SELECT * FROM myretail_state.pos_returns
+                WHERE tenant_id = :tenant AND return_id = :row_id
+                FOR UPDATE
+                """,
+                tenant=tenant,
+                row_id=return_id,
+            )
+            if row is None:
+                raise POSStoreConflictError("RETURN_NOT_FOUND", "Return not found")
+            if row["state"] != "cancel_pending":
+                raise POSStoreConflictError(
+                    "RETURN_RECOVERY_REQUIRED",
+                    "Return cancellation projection is not pending",
+                )
+            shift_id = str(row["shift_id"])
+            if not (
+                str(cancel.get("tenant")) == tenant
+                and str(cancel.get("shift_id")) == shift_id
+                and str(cancel.get("erpnext_return_invoice_id") or "")
+                == str(row.get("erpnext_return_invoice_id") or "")
+                and _money(cancel.get("refund_total")) == _money(row["refund_total"])
+            ):
+                raise POSStoreConflictError(
+                    "IDEMPOTENCY_CONFLICT",
+                    "Cancel snapshot no longer matches the return",
+                )
+            shift = await _locked_row(
+                connection,
+                """
+                SELECT * FROM myretail_state.pos_shifts
+                WHERE tenant_id = :tenant AND shift_id = :row_id
+                FOR UPDATE
+                """,
+                tenant=tenant,
+                row_id=shift_id,
+            )
+            if shift is None:
+                raise POSStoreConflictError("SHIFT_NOT_FOUND", "Shift not found")
+            if shift["status"] != "open":
+                raise POSStoreConflictError(
+                    "POS_OPENING_OUTDATED",
+                    "POS Opening Entry is outdated for return cancellation",
+                )
+            original_event = (
+                (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT * FROM myretail_state.pos_shift_cash_events
+                            WHERE tenant_id = :tenant AND source_type = 'return'
+                              AND source_id = :return_id AND effect_kind = 'return'
+                            """
+                        ),
+                        {"tenant": tenant, "return_id": return_id},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            expected_return_amount = _money(-Decimal(str(row["refund_total"])))
+            if original_event is None or not (
+                str(original_event["shift_id"]) == shift_id
+                and _money(original_event["amount_delta"]) == expected_return_amount
+            ):
+                raise POSStoreConflictError(
+                    "RETURN_RECOVERY_REQUIRED",
+                    "Original return cash event is missing or invalid",
+                )
+            event_id = UUID(str(cash_event["event_id"]))
+            event_created_at = _datetime(cash_event["created_at"])
+            amount_delta = _cash_event_amount(
+                source_type="return",
+                effect_kind="return_cancel",
+                amount_delta=str(row["refund_total"]),
+            )
+            inserted_event = (
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO myretail_state.pos_shift_cash_events (
+                            tenant_id, event_id, shift_id, source_type, source_id,
+                            effect_kind, amount_delta, created_at
+                        ) VALUES (
+                            :tenant, CAST(:event_id AS uuid), :shift_id, 'return',
+                            :source_id, 'return_cancel', :amount_delta,
+                            CAST(:created_at AS timestamptz)
+                        )
+                        ON CONFLICT DO NOTHING
+                        RETURNING *
+                        """
+                    ),
+                    {
+                        "tenant": tenant,
+                        "event_id": str(event_id),
+                        "shift_id": shift_id,
+                        "source_id": return_id,
+                        "amount_delta": amount_delta,
+                        "created_at": event_created_at,
+                    },
+                )
+            ).mappings().one_or_none()
+            persisted_event = inserted_event or (
+                (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT * FROM myretail_state.pos_shift_cash_events
+                            WHERE tenant_id = :tenant AND source_type = 'return'
+                              AND source_id = :source_id
+                              AND effect_kind = 'return_cancel'
+                            """
+                        ),
+                        {"tenant": tenant, "source_id": return_id},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            expected_event = POSCashEvent(
+                event_id=event_id,
+                tenant_id=tenant,
+                shift_id=shift_id,
+                source_type="return",
+                source_id=return_id,
+                effect_kind="return_cancel",
+                amount_delta=amount_delta,
+                created_at=event_created_at,
+            )
+            if persisted_event is None or _cash_event(persisted_event) != expected_event:
+                raise POSStoreConflictError(
+                    "IDEMPOTENCY_CONFLICT",
+                    "Cash event identity is already bound to another effect",
+                )
+            cancelled_at = _datetime(cancel["cancelled_at"])
+            updated_return = await connection.execute(
+                text(
+                    """
+                    UPDATE myretail_state.pos_returns
+                    SET state = 'cancelled', cancelled_by = :cancelled_by,
+                        cancelled_at = CAST(:cancelled_at AS timestamptz),
+                        cancel_reason = :reason, cancel_comment = :comment,
+                        updated_at = CAST(:cancelled_at AS timestamptz)
+                    WHERE tenant_id = :tenant AND return_id = :return_id
+                      AND state = 'cancel_pending'
+                    """
+                ),
+                {
+                    "tenant": tenant,
+                    "return_id": return_id,
+                    "cancelled_by": str(cancel["cancelled_by"]),
+                    "cancelled_at": cancelled_at,
+                    "reason": str(cancel["reason"]),
+                    "comment": cancel.get("comment"),
+                },
+            )
+            if updated_return.rowcount != 1:
+                raise POSStoreConflictError(
+                    "SHIFT_CHANGED",
+                    "Return cancellation state changed",
+                )
+            cash_returns_total = (
+                await connection.execute(
+                    text(
+                        """
+                        SELECT COALESCE(-SUM(amount_delta), 0)
+                        FROM myretail_state.pos_shift_cash_events
+                        WHERE tenant_id = :tenant AND shift_id = :shift_id
+                          AND source_type = 'return'
+                        """
+                    ),
+                    {"tenant": tenant, "shift_id": shift_id},
+                )
+            ).scalar_one()
+            if Decimal(str(cash_returns_total)) < 0:
+                raise POSStoreConflictError(
+                    "IDEMPOTENCY_CONFLICT",
+                    "Cash return ledger total is invalid",
+                )
+            expected_cash = (
+                Decimal(str(shift["opening_cash"]))
+                + Decimal(str(shift["sales_total"]))
+                - Decimal(str(cash_returns_total))
+            )
+            updated_shift = await connection.execute(
+                text(
+                    """
+                    UPDATE myretail_state.pos_shifts
+                    SET cash_returns_total = :cash_returns_total,
+                        expected_cash = :expected_cash,
+                        updated_at = CAST(:updated_at AS timestamptz)
+                    WHERE tenant_id = :tenant AND shift_id = :shift_id
+                      AND status = 'open'
+                    """
+                ),
+                {
+                    "tenant": tenant,
+                    "shift_id": shift_id,
+                    "cash_returns_total": cash_returns_total,
+                    "expected_cash": expected_cash,
+                    "updated_at": cancelled_at,
+                },
+            )
+            if updated_shift.rowcount != 1:
+                raise POSStoreConflictError("SHIFT_CHANGED", "Shift changed")
+            completed = await connection.execute(
+                text(
+                    """
+                    UPDATE myretail_state.workflow_intents
+                    SET state = 'completed', erp_doc_type = 'Sales Invoice',
+                        erp_document_id = :erp_document_id, result_id = :result_id,
+                        lease_owner = NULL, lease_until = NULL,
+                        completed_at = clock_timestamp(), updated_at = clock_timestamp()
+                    WHERE tenant_id = :tenant
+                      AND intent_id = CAST(:intent_id AS uuid)
+                      AND lease_owner = CAST(:owner_id AS uuid)
+                      AND fencing_token = :fencing_token
+                      AND state IN ('reserved', 'erp_pending', 'recovery_required')
+                    """
+                ),
+                {
+                    "tenant": tenant,
+                    "intent_id": intent_id,
+                    "owner_id": str(self._owner_id),
+                    "fencing_token": fencing_token,
+                    "erp_document_id": str(cancel["erpnext_return_invoice_id"]),
+                    "result_id": return_id,
+                },
+            )
+            if completed.rowcount != 1:
+                raise POSStoreConflictError(
+                    "IDEMPOTENCY_CONFLICT",
+                    "Operation lease no longer belongs to this request",
+                )
+            projected = await _locked_row(
+                connection,
+                """
+                SELECT * FROM myretail_state.pos_returns
+                WHERE tenant_id = :tenant AND return_id = :row_id
+                """,
+                tenant=tenant,
+                row_id=return_id,
+            )
+            if projected is None:
+                raise POSStoreConflictError(
+                    "IDEMPOTENCY_CONFLICT",
+                    "Return projection is missing",
+                )
+        return _legacy_return(projected)
+
     async def append_cash_event(
         self,
         *,
@@ -1743,51 +2152,6 @@ class PostgresPOSRepository:
                 {"tenant": tenant, "return_id": return_id},
             )
 
-    async def claim_return_cancel(
-        self,
-        tenant: str,
-        return_id: str,
-    ) -> dict[str, Any]:
-        async with self._engine.begin() as connection:
-            await _set_tenant(connection, tenant)
-            row = (
-                (
-                    await connection.execute(
-                        text(
-                            """
-                        SELECT * FROM myretail_state.pos_returns
-                        WHERE tenant_id = :tenant AND return_id = :return_id
-                        FOR UPDATE
-                        """
-                        ),
-                        {"tenant": tenant, "return_id": return_id},
-                    )
-                )
-                .mappings()
-                .one_or_none()
-            )
-            if row is None:
-                return {}
-            if row["state"] == "cancel_pending":
-                raise POSStoreConflictError(
-                    "RETURN_CANCEL_NOT_ALLOWED",
-                    "Return cancellation is already in progress",
-                )
-            if row["state"] != "submitted":
-                return _legacy_return(row)
-            await connection.execute(
-                text(
-                    """
-                    UPDATE myretail_state.pos_returns
-                    SET state = 'cancel_pending', updated_at = clock_timestamp()
-                    WHERE tenant_id = :tenant AND return_id = :return_id
-                      AND state = 'submitted'
-                    """
-                ),
-                {"tenant": tenant, "return_id": return_id},
-            )
-        return await self.get_return(tenant, return_id) or {}
-
     async def mark_return_submitted(
         self,
         tenant: str,
@@ -2006,52 +2370,6 @@ class PostgresPOSRepository:
                 )
         return _legacy_return(projected)
 
-    async def mark_return_cancelled(
-        self,
-        *,
-        tenant: str,
-        return_id: str,
-        cancelled_by: str,
-        reason: str,
-        comment: str | None,
-    ) -> dict[str, Any]:
-        async with self._engine.begin() as connection:
-            await _set_tenant(connection, tenant)
-            await connection.execute(
-                text(
-                    """
-                    UPDATE myretail_state.pos_returns
-                    SET state = 'cancelled', cancelled_by = :cancelled_by,
-                        cancelled_at = clock_timestamp(), cancel_reason = :reason,
-                        cancel_comment = :comment, updated_at = clock_timestamp()
-                    WHERE tenant_id = :tenant AND return_id = :return_id
-                      AND state = 'cancel_pending'
-                    """
-                ),
-                {
-                    "tenant": tenant,
-                    "return_id": return_id,
-                    "cancelled_by": cancelled_by,
-                    "reason": reason,
-                    "comment": comment,
-                },
-            )
-        return await self.get_return(tenant, return_id) or {}
-
-    async def release_return_cancel(self, tenant: str, return_id: str) -> None:
-        async with self._engine.begin() as connection:
-            await _set_tenant(connection, tenant)
-            await connection.execute(
-                text(
-                    """
-                    UPDATE myretail_state.pos_returns
-                    SET state = 'submitted', updated_at = clock_timestamp()
-                    WHERE tenant_id = :tenant AND return_id = :return_id
-                      AND state = 'cancel_pending'
-                    """
-                ),
-                {"tenant": tenant, "return_id": return_id},
-            )
 
     async def return_options(
         self,
@@ -2066,7 +2384,7 @@ class PostgresPOSRepository:
             """
             SELECT lines FROM myretail_state.pos_returns
             WHERE tenant_id = :tenant AND sale_id = :sale_id
-              AND state = 'submitted'
+              AND state IN ('submitted', 'cancel_pending')
             """,
             {"tenant": tenant, "sale_id": sale_id},
         )

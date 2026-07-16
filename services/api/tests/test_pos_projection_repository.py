@@ -53,8 +53,10 @@ class ProjectionERPNextStub:
         self.sales: list[str] = []
         self.returns: list[str] = []
         self.cancelled_returns: set[str] = set()
+        self.cancel_attempts = 0
         self._sale_lock = asyncio.Lock()
         self._return_lock = asyncio.Lock()
+        self._cancel_lock = asyncio.Lock()
 
     async def list_pos_registers(self, tenant: str) -> list[Register]:
         _ = tenant
@@ -122,7 +124,10 @@ class ProjectionERPNextStub:
         comment: str | None,
     ) -> None:
         _ = reason, comment
-        self.cancelled_returns.add(invoice_id)
+        async with self._cancel_lock:
+            self.cancel_attempts += 1
+            await asyncio.sleep(0.05)
+            self.cancelled_returns.add(invoice_id)
 
     async def get_pos_return_docstatus(self, invoice_id: str) -> int:
         return 2 if invoice_id in self.cancelled_returns else 1
@@ -361,21 +366,48 @@ async def test_postgresql_request_path_is_shared_and_exact_once_across_two_pools
             assert after_return.json()["sales_total"] == "200.00"
             assert after_return.json()["expected_cash"] == "10100.00"
 
-            cancel_key = str(uuid4())
-            cancelled = await second.post(
-                f"/pos/returns/{returned.json()['return_id']}/cancel",
-                headers=headers(settings, key=cancel_key, roles=["Owner"]),
-                json={"reason": "cashier_error"},
-            )
-            cancel_replay = await first.post(
-                f"/pos/returns/{returned.json()['return_id']}/cancel",
-                headers=headers(settings, key=cancel_key, roles=["Owner"]),
-                json={"reason": "cashier_error"},
+            cancelled, cancel_replay = await asyncio.gather(
+                second.post(
+                    f"/pos/returns/{returned.json()['return_id']}/cancel",
+                    headers=headers(settings, key=str(uuid4()), roles=["Owner"]),
+                    json={"reason": "cashier_error"},
+                ),
+                first.post(
+                    f"/pos/returns/{returned.json()['return_id']}/cancel",
+                    headers=headers(settings, key=str(uuid4()), roles=["Owner"]),
+                    json={"reason": "cashier_error"},
+                ),
             )
             assert cancelled.status_code == 200, cancelled.text
             assert cancel_replay.status_code == 200, cancel_replay.text
             assert cancelled.json()["state"] == "cancelled"
             assert erpnext.cancelled_returns == {"RET-1"}
+            assert erpnext.cancel_attempts == 1
+            after_cancel = await first.get(
+                "/pos/shifts/current",
+                params={"register_id": "POS-1"},
+                headers=headers(settings),
+            )
+            assert after_cancel.status_code == 200, after_cancel.text
+            assert after_cancel.json()["sales_total"] == "200.00"
+            assert after_cancel.json()["expected_cash"] == "10200.00"
+            cash_events = await first_app.state.pos_state_repository.list_cash_events(
+                tenant_id=settings.tenant_slug,
+                shift_id=shift["id"],
+            )
+            return_events = [
+                event
+                for event in cash_events
+                if event.source_id == returned.json()["return_id"]
+            ]
+            assert [event.effect_kind for event in return_events] == [
+                "return",
+                "return_cancel",
+            ]
+            assert [event.amount_delta for event in return_events] == [
+                "-100.00",
+                "100.00",
+            ]
             filtered_returns = await first.get(
                 "/pos/returns",
                 params={
@@ -744,5 +776,122 @@ async def test_postgresql_sale_projection_recovers_after_runtime_recreation(
         assert not terminal.acquired
         assert terminal.intent["state"] == "completed"
         assert terminal.intent["result_id"] == return_id
+
+        cancel_intent = await second.begin_operation_intent(
+            tenant=tenant,
+            operation="cancel_return",
+            scope_id=f"shift:{shift_id}",
+            user_email=f"return:{return_id}:cancel",
+            business_hash=f"cancel-{return_id}",
+            external_key=f"cancel-marker-{return_id}",
+            payload={
+                "cancel": {
+                    "tenant": tenant,
+                    "return_id": return_id,
+                    "shift_id": shift_id,
+                    "erpnext_return_invoice_id": "RET-RECOVERED",
+                    "refund_total": "100.00",
+                    "cancelled_by": "owner@example.test",
+                    "reason": "cashier_error",
+                    "comment": None,
+                    "cancelled_at": "2026-07-16T12:03:00Z",
+                },
+                "cash_event": {
+                    "event_id": str(uuid4()),
+                    "created_at": "2026-07-16T12:03:00Z",
+                },
+            },
+            expected_shift_updated_at=str(shift_after_return["updated_at"]),
+        )
+        cancel_stale_token = int(cancel_intent.intent["fencing_token"])
+        prepared = await second.prepare_return_cancel_intent(
+            tenant,
+            str(cancel_intent.intent["id"]),
+            cancel_stale_token,
+            return_id,
+        )
+        assert prepared["state"] == "cancel_pending"
+        assert await second.mark_operation_erp_pending(
+            tenant,
+            str(cancel_intent.intent["id"]),
+            cancel_stale_token,
+        )
+        assert await second.mark_operation_recovery_required(
+            tenant,
+            str(cancel_intent.intent["id"]),
+            cancel_stale_token,
+        )
+        cancel_takeover = await second.claim_operation_intent(
+            tenant,
+            str(cancel_intent.intent["id"]),
+        )
+        assert cancel_takeover.acquired
+        assert int(cancel_takeover.intent["fencing_token"]) > cancel_stale_token
+
+        with pytest.raises(POSStoreConflictError, match="lease"):
+            await second.materialize_return_cancel_intent(
+                tenant,
+                str(cancel_intent.intent["id"]),
+                cancel_stale_token,
+            )
+        still_pending = await second.get_return(tenant, return_id)
+        events_before_cancel = await second.list_cash_events(
+            tenant_id=tenant,
+            shift_id=shift_id,
+        )
+        assert still_pending is not None
+        assert still_pending["state"] == "cancel_pending"
+        assert [event.effect_kind for event in events_before_cancel] == ["return"]
+
+        cancelled = await second.materialize_return_cancel_intent(
+            tenant,
+            str(cancel_takeover.intent["id"]),
+            int(cancel_takeover.intent["fencing_token"]),
+        )
+        shift_after_cancel = await second.get_shift(tenant, shift_id)
+        events_after_cancel = await second.list_cash_events(
+            tenant_id=tenant,
+            shift_id=shift_id,
+        )
+        async with second_runtime.engine.connect() as connection:
+            transaction = await connection.begin()
+            try:
+                await connection.execute(
+                    text("SELECT set_config('myretail.tenant_id', :tenant, true)"),
+                    {"tenant": tenant},
+                )
+                internal_after_cancel = (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT cash_returns_total
+                            FROM myretail_state.pos_shifts
+                            WHERE tenant_id = :tenant AND shift_id = :shift_id
+                            """
+                        ),
+                        {"tenant": tenant, "shift_id": shift_id},
+                    )
+                ).scalar_one()
+            finally:
+                await transaction.rollback()
+        cancel_terminal = await second.claim_operation_intent(
+            tenant,
+            str(cancel_takeover.intent["id"]),
+        )
+        assert cancelled["state"] == "cancelled"
+        assert shift_after_cancel is not None
+        assert str(internal_after_cancel) == "0.000000"
+        assert shift_after_cancel["expected_cash"] == "10100.00"
+        assert [event.effect_kind for event in events_after_cancel] == [
+            "return",
+            "return_cancel",
+        ]
+        assert [event.amount_delta for event in events_after_cancel] == [
+            "-100.00",
+            "100.00",
+        ]
+        assert not cancel_terminal.acquired
+        assert cancel_terminal.intent["state"] == "completed"
+        assert cancel_terminal.intent["result_id"] == return_id
     finally:
         await second_runtime.close()

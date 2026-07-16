@@ -1212,6 +1212,258 @@ class POSStore:
             connection.commit()
         return self.get_return(str(return_row["tenant"]), result_id) or return_row
 
+    def prepare_return_cancel_intent(
+        self,
+        intent_id: str,
+        fencing_token: int,
+        return_id: str,
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            intent = self._owned_intent(
+                connection,
+                intent_id,
+                fencing_token,
+                operation="cancel_return",
+            )
+            payload = _intent_payload(intent)
+            cancel = dict(payload["cancel"])
+            tenant = str(intent["tenant"])
+            if not (
+                str(cancel.get("tenant")) == tenant
+                and str(cancel.get("return_id")) == return_id
+            ):
+                connection.rollback()
+                raise POSStoreConflictError(
+                    "IDEMPOTENCY_CONFLICT",
+                    "Cancel intent does not match its return projection",
+                )
+            row = connection.execute(
+                "SELECT * FROM pos_returns WHERE tenant = ? AND id = ?",
+                (tenant, return_id),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                raise POSStoreConflictError("RETURN_NOT_FOUND", "Return not found")
+            return_row = dict(row)
+            if return_row["state"] == "cancelled":
+                connection.rollback()
+                raise POSStoreConflictError(
+                    "RETURN_ALREADY_CANCELLED",
+                    "Return is already cancelled",
+                )
+            if return_row["state"] not in {"submitted", "cancel_pending"}:
+                connection.rollback()
+                raise POSStoreConflictError(
+                    "RETURN_RECOVERY_REQUIRED",
+                    "Return is not ready for cancellation",
+                )
+            if not (
+                str(return_row.get("erpnext_return_invoice_id") or "")
+                == str(cancel.get("erpnext_return_invoice_id") or "")
+                and str(return_row["shift_id"]) == str(cancel.get("shift_id"))
+                and _format_money(Decimal(str(return_row["refund_total"])))
+                == _format_money(Decimal(str(cancel.get("refund_total"))))
+            ):
+                connection.rollback()
+                raise POSStoreConflictError(
+                    "IDEMPOTENCY_CONFLICT",
+                    "Cancel snapshot no longer matches the return",
+                )
+            shift = connection.execute(
+                "SELECT status FROM pos_shifts WHERE tenant = ? AND id = ?",
+                (tenant, return_row["shift_id"]),
+            ).fetchone()
+            if shift is None:
+                connection.rollback()
+                raise POSStoreConflictError("SHIFT_NOT_FOUND", "Shift not found")
+            if str(shift["status"]) != "open":
+                connection.rollback()
+                raise POSStoreConflictError(
+                    "POS_OPENING_OUTDATED",
+                    "POS Opening Entry is outdated for return cancellation",
+                )
+            if return_row["state"] == "submitted":
+                updated = connection.execute(
+                    """
+                    UPDATE pos_returns
+                    SET state = 'cancel_pending', updated_at = ?
+                    WHERE tenant = ? AND id = ? AND state = 'submitted'
+                    """,
+                    (_now(), tenant, return_id),
+                )
+                if updated.rowcount != 1:
+                    connection.rollback()
+                    raise POSStoreConflictError(
+                        "SHIFT_CHANGED",
+                        "Return cancellation state changed",
+                    )
+            connection.commit()
+        return self.get_return(tenant, return_id) or return_row
+
+    def materialize_return_cancel_intent(
+        self,
+        intent_id: str,
+        fencing_token: int,
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            intent = self._owned_intent(
+                connection,
+                intent_id,
+                fencing_token,
+                operation="cancel_return",
+            )
+            payload = _intent_payload(intent)
+            cancel = dict(payload["cancel"])
+            cash_event = dict(payload["cash_event"])
+            tenant = str(intent["tenant"])
+            return_id = str(cancel["return_id"])
+            row = connection.execute(
+                "SELECT * FROM pos_returns WHERE tenant = ? AND id = ?",
+                (tenant, return_id),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                raise POSStoreConflictError("RETURN_NOT_FOUND", "Return not found")
+            return_row = dict(row)
+            if return_row["state"] != "cancel_pending":
+                connection.rollback()
+                raise POSStoreConflictError(
+                    "RETURN_RECOVERY_REQUIRED",
+                    "Return cancellation projection is not pending",
+                )
+            shift_id = str(return_row["shift_id"])
+            if not (
+                str(cancel.get("tenant")) == tenant
+                and str(cancel.get("shift_id")) == shift_id
+                and str(cancel.get("erpnext_return_invoice_id") or "")
+                == str(return_row.get("erpnext_return_invoice_id") or "")
+                and _format_money(Decimal(str(cancel.get("refund_total"))))
+                == _format_money(Decimal(str(return_row["refund_total"])))
+            ):
+                connection.rollback()
+                raise POSStoreConflictError(
+                    "IDEMPOTENCY_CONFLICT",
+                    "Cancel snapshot no longer matches the return",
+                )
+            shift = connection.execute(
+                "SELECT * FROM pos_shifts WHERE tenant = ? AND id = ?",
+                (tenant, shift_id),
+            ).fetchone()
+            if shift is None:
+                connection.rollback()
+                raise POSStoreConflictError("SHIFT_NOT_FOUND", "Shift not found")
+            shift_data = dict(shift)
+            if shift_data["status"] != "open":
+                connection.rollback()
+                raise POSStoreConflictError(
+                    "POS_OPENING_OUTDATED",
+                    "POS Opening Entry is outdated for return cancellation",
+                )
+            original_event = connection.execute(
+                """
+                SELECT * FROM pos_shift_cash_events
+                WHERE tenant = ? AND source_type = 'return'
+                  AND source_id = ? AND effect_kind = 'return'
+                """,
+                (tenant, return_id),
+            ).fetchone()
+            expected_return_amount = _format_money(
+                -Decimal(str(return_row["refund_total"]))
+            )
+            if original_event is None or not (
+                str(original_event["shift_id"]) == shift_id
+                and _format_money(Decimal(str(original_event["amount_delta"])))
+                == expected_return_amount
+            ):
+                connection.rollback()
+                raise POSStoreConflictError(
+                    "RETURN_RECOVERY_REQUIRED",
+                    "Original return cash event is missing or invalid",
+                )
+            cancelled_at = str(cancel["cancelled_at"])
+            self._append_cash_event(
+                connection,
+                event_id=str(cash_event["event_id"]),
+                tenant=tenant,
+                shift_id=shift_id,
+                source_type="return",
+                source_id=return_id,
+                effect_kind="return_cancel",
+                amount_delta=str(return_row["refund_total"]),
+                created_at=str(cash_event["created_at"]),
+            )
+            updated_return = connection.execute(
+                """
+                UPDATE pos_returns
+                SET state = 'cancelled', cancelled_by = ?, cancelled_at = ?,
+                    cancel_reason = ?, cancel_comment = ?, updated_at = ?
+                WHERE tenant = ? AND id = ? AND state = 'cancel_pending'
+                """,
+                (
+                    str(cancel["cancelled_by"]),
+                    cancelled_at,
+                    str(cancel["reason"]),
+                    cancel.get("comment"),
+                    cancelled_at,
+                    tenant,
+                    return_id,
+                ),
+            )
+            if updated_return.rowcount != 1:
+                connection.rollback()
+                raise POSStoreConflictError(
+                    "SHIFT_CHANGED",
+                    "Return cancellation state changed",
+                )
+            ledger_rows = connection.execute(
+                """
+                SELECT amount_delta FROM pos_shift_cash_events
+                WHERE tenant = ? AND shift_id = ? AND source_type = 'return'
+                """,
+                (tenant, shift_id),
+            ).fetchall()
+            cash_returns_total = _format_money(
+                -sum((Decimal(str(item[0])) for item in ledger_rows), Decimal("0.00"))
+            )
+            if Decimal(cash_returns_total) < 0:
+                connection.rollback()
+                raise POSStoreConflictError(
+                    "IDEMPOTENCY_CONFLICT",
+                    "Cash return ledger total is invalid",
+                )
+            expected_cash = _money_subtract(
+                _money_add(shift_data["opening_cash"], shift_data["sales_total"]),
+                cash_returns_total,
+            )
+            updated_shift = connection.execute(
+                """
+                UPDATE pos_shifts
+                SET cash_returns_total = ?, expected_cash = ?, updated_at = ?
+                WHERE tenant = ? AND id = ? AND status = 'open'
+                """,
+                (
+                    cash_returns_total,
+                    expected_cash,
+                    cancelled_at,
+                    tenant,
+                    shift_id,
+                ),
+            )
+            if updated_shift.rowcount != 1:
+                connection.rollback()
+                raise POSStoreConflictError("SHIFT_CHANGED", "Shift changed")
+            self._complete_return_intent(
+                connection,
+                intent_id,
+                fencing_token,
+                erpnext_document_id=str(cancel["erpnext_return_invoice_id"]),
+                result_id=return_id,
+            )
+            connection.commit()
+        return self.get_return(tenant, return_id) or return_row
+
     @staticmethod
     def _owned_intent(
         connection: sqlite3.Connection,
@@ -1762,33 +2014,6 @@ class POSStore:
                 (tenant, return_id),
             )
 
-    def claim_return_cancel(self, tenant: str, return_id: str) -> dict[str, Any]:
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT * FROM pos_returns WHERE tenant = ? AND id = ?",
-                (tenant, return_id),
-            ).fetchone()
-            if row is None:
-                connection.rollback()
-                return {}
-            state = str(row["state"])
-            if state == "cancel_pending":
-                connection.rollback()
-                raise POSStoreConflictError(
-                    "RETURN_CANCEL_NOT_ALLOWED", "Отмена возврата уже выполняется"
-                )
-            if state != "submitted":
-                connection.rollback()
-                return dict(row)
-            connection.execute(
-                "UPDATE pos_returns SET state = 'cancel_pending', updated_at = ? "
-                "WHERE tenant = ? AND id = ? AND state = 'submitted'",
-                (_now(), tenant, return_id),
-            )
-            connection.commit()
-        return self.get_return(tenant, return_id) or {}
-
     def mark_return_submitted(
         self, tenant: str, return_id: str, erpnext_invoice_id: str
     ) -> dict[str, Any]:
@@ -1900,42 +2125,6 @@ class POSStore:
             connection.commit()
         return self.get_return(tenant, return_id) or return_row
 
-    def mark_return_cancelled(
-        self,
-        *,
-        tenant: str,
-        return_id: str,
-        cancelled_by: str,
-        reason: str,
-        comment: str | None,
-    ) -> dict[str, Any]:
-        with self._connect() as connection:
-            connection.execute(
-                """
-                UPDATE pos_returns
-                SET state = 'cancelled', cancelled_by = ?, cancelled_at = ?,
-                    cancel_reason = ?, cancel_comment = ?, updated_at = ?
-                WHERE tenant = ? AND id = ? AND state = 'cancel_pending'
-                """,
-                (
-                    cancelled_by,
-                    _now(),
-                    reason,
-                    comment,
-                    _now(),
-                    tenant,
-                    return_id,
-                ),
-            )
-        return self.get_return(tenant, return_id) or {}
-
-    def release_return_cancel(self, tenant: str, return_id: str) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                "UPDATE pos_returns SET state = 'submitted', updated_at = ? "
-                "WHERE tenant = ? AND id = ? AND state = 'cancel_pending'",
-                (_now(), tenant, return_id),
-            )
 
     def return_options(
         self, tenant: str, sale_id: str
@@ -1948,7 +2137,8 @@ class POSStore:
             rows = connection.execute(
                 """
                 SELECT lines_json FROM pos_returns
-                WHERE tenant = ? AND sale_id = ? AND state = 'submitted'
+                WHERE tenant = ? AND sale_id = ?
+                  AND state IN ('submitted', 'cancel_pending')
                 """,
                 (tenant, sale_id),
             ).fetchall()
