@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_en
 from myretail_api.config import InvalidStateFoundationSettingsError, Settings
 from myretail_api.state.schema import (
     EXPECTED_STATE_SCHEMA_REVISION,
+    PREAUTH_STATE_TABLES,
     STATE_APP_ROLE,
     STATE_SCHEMA,
     TENANT_STATE_TABLES,
@@ -53,6 +54,7 @@ class PostgresStateRuntime:
                 transaction = await connection.begin()
                 try:
                     await _verify_connection_contract(connection)
+                    await _verify_preauth_rate_limit_contract(connection)
                     await _verify_rls_canary(connection)
                 finally:
                     await transaction.rollback()
@@ -292,3 +294,82 @@ async def _verify_rls_canary(connection: AsyncConnection) -> None:
     ).scalar_one()
     if cross_tenant_rows != 0:
         raise StateStartupError("PostgreSQL state RLS canary isolation failed")
+
+
+async def _verify_preauth_rate_limit_contract(connection: AsyncConnection) -> None:
+    table_result = await connection.execute(
+        text(
+            """
+            SELECT c.relname, c.relrowsecurity, c.relforcerowsecurity,
+                   has_table_privilege(
+                       current_user, quote_ident(n.nspname) || '.' || quote_ident(c.relname),
+                       'SELECT'
+                   ) AS can_select,
+                   has_table_privilege(
+                       current_user, quote_ident(n.nspname) || '.' || quote_ident(c.relname),
+                       'INSERT'
+                   ) AS can_insert,
+                   has_table_privilege(
+                       current_user, quote_ident(n.nspname) || '.' || quote_ident(c.relname),
+                       'UPDATE'
+                   ) AS can_update,
+                   has_table_privilege(
+                       current_user, quote_ident(n.nspname) || '.' || quote_ident(c.relname),
+                       'DELETE'
+                   ) AS can_delete,
+                   has_table_privilege(
+                       current_user, quote_ident(n.nspname) || '.' || quote_ident(c.relname),
+                       'TRUNCATE, REFERENCES, TRIGGER'
+                   ) AS has_extra_privileges
+            FROM pg_class AS c
+            JOIN pg_namespace AS n ON n.oid = c.relnamespace
+            WHERE n.nspname = :schema_name
+              AND c.relname = ANY(CAST(:table_names AS text[]))
+              AND c.relkind = 'r'
+            """
+        ),
+        {
+            "schema_name": STATE_SCHEMA,
+            "table_names": list(PREAUTH_STATE_TABLES),
+        },
+    )
+    tables = {row["relname"]: row for row in table_result.mappings()}
+    if set(tables) != set(PREAUTH_STATE_TABLES):
+        raise StateStartupError("PostgreSQL pre-auth state table contract is invalid")
+    buckets = tables["auth_rate_limit_buckets"]
+    meta = tables["auth_rate_limit_meta"]
+    if any(row["relrowsecurity"] or row["relforcerowsecurity"] for row in tables.values()):
+        raise StateStartupError("PostgreSQL pre-auth RLS exception contract is invalid")
+    if not all(
+        buckets[name]
+        for name in ("can_select", "can_insert", "can_update", "can_delete")
+    ) or buckets["has_extra_privileges"]:
+        raise StateStartupError("PostgreSQL pre-auth bucket grants are invalid")
+    if (
+        not meta["can_select"]
+        or not meta["can_update"]
+        or meta["can_insert"]
+        or meta["can_delete"]
+        or meta["has_extra_privileges"]
+    ):
+        raise StateStartupError("PostgreSQL pre-auth meta grants are invalid")
+
+    meta_state = (
+        await connection.execute(
+            text(
+                """
+                SELECT singleton_id,
+                       bucket_count,
+                       (SELECT count(*)
+                        FROM myretail_state.auth_rate_limit_buckets) AS actual_count
+                FROM myretail_state.auth_rate_limit_meta
+                """
+            )
+        )
+    ).mappings().one_or_none()
+    if (
+        meta_state is None
+        or meta_state["singleton_id"] != 1
+        or int(meta_state["bucket_count"]) != int(meta_state["actual_count"])
+    ):
+        raise StateStartupError("PostgreSQL pre-auth capacity state is invalid")

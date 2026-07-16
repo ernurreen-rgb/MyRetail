@@ -135,7 +135,7 @@ jobs:
           MYRETAIL_STATE_MIGRATION_DATABASE_URL: postgresql+asyncpg://myretail_state_migrator@127.0.0.1:5432/myretail_state_test
         run: |
           myretail-state-migrate upgrade head
-          test "$(myretail-state-migrate current)" = "20260716_01 (head)"
+          test "$(myretail-state-migrate current)" = "20260716_02 (head)"
       - name: Verify migrations ship inside the wheel
         run: |
           python -m pip wheel --no-deps --no-build-isolation services/api --wheel-dir dist
@@ -150,6 +150,7 @@ jobs:
               "myretail_api/migrations/env.py",
               "myretail_api/migrations/script.py.mako",
               "myretail_api/migrations/versions/v20260716_01_state_foundation.py",
+              "myretail_api/migrations/versions/v20260716_02_auth_rate_limit_grants.py",
           }
           missing = required - files
           if missing:
@@ -167,4 +168,5 @@ jobs:
           services/api/tests/test_idempotency_repository.py
           services/api/tests/test_pos_coordination_repository.py
           services/api/tests/test_pos_projection_repository.py
+          services/api/tests/test_rate_limit.py
           services/api/tests/test_stock.py

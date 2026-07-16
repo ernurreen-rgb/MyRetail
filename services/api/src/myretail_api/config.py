@@ -1,4 +1,5 @@
 from functools import lru_cache
+from ipaddress import ip_network
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
@@ -15,6 +16,10 @@ class UnsafeProductionStateError(RuntimeError):
 
 class InvalidStateFoundationSettingsError(RuntimeError):
     """Raised when the opt-in PostgreSQL foundation configuration is unsafe."""
+
+
+class InvalidAuthRateLimitSettingsError(RuntimeError):
+    """Raised when auth rate-limit identity or client-IP settings are unsafe."""
 
 
 class POSCashierAssignment(BaseModel):
@@ -35,6 +40,9 @@ class Settings(BaseSettings):
     auth_rate_limit_window_seconds: int = Field(default=300, ge=1, le=86_400)
     auth_rate_limit_capacity: int = Field(default=10_000, ge=2, le=1_000_000)
     auth_rate_limit_db_path: Path = API_ROOT / ".data" / "login-rate-limit.sqlite3"
+    auth_rate_limit_secret: SecretStr | None = None
+    auth_client_ip_mode: Literal["direct", "trusted_proxy"] = "direct"
+    auth_trusted_proxy_cidrs: list[str] = Field(default_factory=list)
     erpnext_base_url: str = "http://myretail.localhost:8080"
     erpnext_api_key: SecretStr | None = None
     erpnext_api_secret: SecretStr | None = None
@@ -114,4 +122,43 @@ def validate_state_foundation_settings(settings: Settings) -> None:
     if settings.environment == "production" and settings.state_postgres_ssl_mode != "verify-full":
         raise InvalidStateFoundationSettingsError(
             "Production PostgreSQL state transport requires verify-full TLS"
+        )
+
+
+def validate_auth_rate_limit_settings(settings: Settings) -> None:
+    if settings.auth_client_ip_mode == "direct":
+        if settings.auth_trusted_proxy_cidrs:
+            raise InvalidAuthRateLimitSettingsError(
+                "Trusted proxy CIDRs require explicit trusted_proxy client-IP mode"
+            )
+    elif not settings.auth_trusted_proxy_cidrs:
+        raise InvalidAuthRateLimitSettingsError(
+            "Trusted proxy client-IP mode requires a non-empty CIDR allowlist"
+        )
+
+    for cidr in settings.auth_trusted_proxy_cidrs:
+        try:
+            ip_network(cidr, strict=False)
+        except ValueError:
+            raise InvalidAuthRateLimitSettingsError(
+                "Trusted proxy CIDR allowlist contains an invalid network"
+            ) from None
+
+    if settings.state_backend != "postgresql":
+        return
+    secret = (
+        settings.auth_rate_limit_secret.get_secret_value()
+        if settings.auth_rate_limit_secret is not None
+        else ""
+    )
+    if len(secret.encode("utf-8")) < 32:
+        raise InvalidAuthRateLimitSettingsError(
+            "PostgreSQL auth rate-limit state requires a dedicated secret of at least 32 bytes"
+        )
+    if (
+        settings.auth_secret is not None
+        and secret == settings.auth_secret.get_secret_value()
+    ):
+        raise InvalidAuthRateLimitSettingsError(
+            "Auth token and rate-limit state must use distinct secrets"
         )

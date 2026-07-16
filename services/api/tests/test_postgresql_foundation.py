@@ -56,6 +56,7 @@ def postgres_settings(database_url: str = APP_DATABASE_URL) -> Settings:
         _env_file=None,
         environment="test",
         state_backend="postgresql",
+        auth_rate_limit_secret=SecretStr("test-rate-limit-secret-32-bytes-minimum"),
         state_database_url=SecretStr(database_url),
         state_pool_min_size=1,
         state_pool_max_size=2,
@@ -219,6 +220,52 @@ async def test_roles_ownership_rls_and_revision_match_contract() -> None:
             for row in preauth_rls
         )
 
+        bucket_privileges = {
+            privilege: bool(
+                await connection.fetchval(
+                    "SELECT has_table_privilege($1, $2, $3)",
+                    STATE_APP_ROLE,
+                    f"{STATE_SCHEMA}.auth_rate_limit_buckets",
+                    privilege,
+                )
+            )
+            for privilege in (
+                "SELECT",
+                "INSERT",
+                "UPDATE",
+                "DELETE",
+                "TRUNCATE",
+                "REFERENCES",
+                "TRIGGER",
+            )
+        }
+        assert bucket_privileges == {
+            "SELECT": True,
+            "INSERT": True,
+            "UPDATE": True,
+            "DELETE": True,
+            "TRUNCATE": False,
+            "REFERENCES": False,
+            "TRIGGER": False,
+        }
+        meta_privileges = {
+            privilege: bool(
+                await connection.fetchval(
+                    "SELECT has_table_privilege($1, $2, $3)",
+                    STATE_APP_ROLE,
+                    f"{STATE_SCHEMA}.auth_rate_limit_meta",
+                    privilege,
+                )
+            )
+            for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE")
+        }
+        assert meta_privileges == {
+            "SELECT": True,
+            "INSERT": False,
+            "UPDATE": True,
+            "DELETE": False,
+        }
+
         assert (
             await connection.fetchval("SELECT version_num FROM public.alembic_version")
             == EXPECTED_STATE_SCHEMA_REVISION
@@ -289,6 +336,25 @@ async def test_startup_fails_closed_when_rls_canary_cannot_write() -> None:
         async with admin_connection() as connection:
             await connection.execute(
                 f"GRANT INSERT ON {STATE_SCHEMA}.rls_canary TO {STATE_APP_ROLE}"
+            )
+
+
+@pytest.mark.anyio
+async def test_startup_fails_closed_on_preauth_capacity_drift() -> None:
+    async with admin_connection() as connection:
+        await connection.execute(
+            f"UPDATE {STATE_SCHEMA}.auth_rate_limit_meta SET bucket_count = 1 "
+            "WHERE singleton_id = 1"
+        )
+    try:
+        with pytest.raises(StateStartupError, match="pre-auth capacity state"):
+            await PostgresStateRuntime.start(postgres_settings())
+    finally:
+        async with admin_connection() as connection:
+            await connection.execute(
+                f"UPDATE {STATE_SCHEMA}.auth_rate_limit_meta SET bucket_count = "
+                f"(SELECT count(*) FROM {STATE_SCHEMA}.auth_rate_limit_buckets) "
+                "WHERE singleton_id = 1"
             )
 
 

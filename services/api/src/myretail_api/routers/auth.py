@@ -1,7 +1,7 @@
-from typing import Annotated
+from datetime import datetime
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from starlette.concurrency import run_in_threadpool
 
 from myretail_api.clients.erpnext import (
     ERPNextClient,
@@ -12,7 +12,12 @@ from myretail_api.clients.erpnext import (
 from myretail_api.config import Settings, get_settings
 from myretail_api.dependencies import get_erpnext_client, require_tenant_context
 from myretail_api.models.auth import AuthenticatedUser, LoginRequest, LoginResponse, TenantContext
-from myretail_api.rate_limit import LoginRateLimiter, get_login_rate_limiter
+from myretail_api.rate_limit import (
+    LoginRateLimiter,
+    RateLimitStateError,
+    get_login_rate_limiter,
+    resolve_login_client_ip,
+)
 from myretail_api.security import (
     AuthConfigurationError,
     create_access_token,
@@ -40,19 +45,23 @@ async def login(
 ) -> LoginResponse:
     tenant = request.tenant.strip()
     email = request.email.strip()
-    client_ip = http_request.client.host if http_request.client else "unknown"
-    retry_after = await run_in_threadpool(
-        rate_limiter.check_and_record,
-        tenant=tenant,
-        client_ip=client_ip,
-        login=email,
-    )
-    if retry_after is not None:
+    client_ip = resolve_login_client_ip(http_request, settings)
+    try:
+        decision = await rate_limiter.check_and_record(
+            tenant=tenant,
+            client_ip=client_ip,
+            login=email,
+        )
+    except RateLimitStateError as exc:
+        raise _rate_limit_unavailable() from exc
+    if not decision.allowed:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Too many login attempts",
-            headers={"Retry-After": str(retry_after)},
+            headers={"Retry-After": str(decision.retry_after_seconds)},
         )
+    if decision.reservation_at is None:
+        raise _rate_limit_unavailable()
 
     if tenant != settings.tenant_slug:
         raise _invalid_credentials()
@@ -65,11 +74,13 @@ async def login(
     except ERPNextUserLoginError as exc:
         raise _invalid_credentials() from exc
     except (ERPNextRoleVerificationError, ERPNextUnavailableError) as exc:
-        await run_in_threadpool(
-            rate_limiter.discard,
+        await _compensate_rate_limit(
+            rate_limiter,
+            action="discard",
             tenant=tenant,
             client_ip=client_ip,
             login=email,
+            reservation_at=decision.reservation_at,
         )
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -99,22 +110,26 @@ async def login(
             user=user,
         )
     except AuthConfigurationError as exc:
-        await run_in_threadpool(
-            rate_limiter.discard,
+        await _compensate_rate_limit(
+            rate_limiter,
+            action="discard",
             tenant=tenant,
             client_ip=client_ip,
             login=email,
+            reservation_at=decision.reservation_at,
         )
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Auth integration is not configured",
         ) from exc
 
-    await run_in_threadpool(
-        rate_limiter.clear,
+    await _compensate_rate_limit(
+        rate_limiter,
+        action="clear",
         tenant=tenant,
         client_ip=client_ip,
         login=email,
+        reservation_at=decision.reservation_at,
     )
     return LoginResponse(
         access_token=access_token,
@@ -129,4 +144,39 @@ def _invalid_credentials() -> HTTPException:
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Invalid email or password",
         headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+async def _compensate_rate_limit(
+    rate_limiter: LoginRateLimiter,
+    *,
+    action: Literal["clear", "discard"],
+    tenant: str,
+    client_ip: str,
+    login: str,
+    reservation_at: datetime,
+) -> None:
+    try:
+        if action == "clear":
+            await rate_limiter.clear(
+                tenant=tenant,
+                client_ip=client_ip,
+                login=login,
+                reservation_at=reservation_at,
+            )
+        else:
+            await rate_limiter.discard(
+                tenant=tenant,
+                client_ip=client_ip,
+                login=login,
+                reservation_at=reservation_at,
+            )
+    except RateLimitStateError as exc:
+        raise _rate_limit_unavailable() from exc
+
+
+def _rate_limit_unavailable() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Authentication protection is unavailable",
     )

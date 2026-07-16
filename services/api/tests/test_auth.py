@@ -20,7 +20,11 @@ from myretail_api.config import Settings, get_settings
 from myretail_api.dependencies import get_erpnext_client
 from myretail_api.main import create_app
 from myretail_api.models.auth import AuthenticatedUser
-from myretail_api.rate_limit import get_login_rate_limiter
+from myretail_api.rate_limit import (
+    RateLimitDecision,
+    RateLimitStateError,
+    get_login_rate_limiter,
+)
 from myretail_api.security import (
     TokenValidationError,
     create_access_token,
@@ -54,9 +58,14 @@ class BlockingRateLimiter:
     def __init__(self, release: threading.Event) -> None:
         self._release = release
 
-    def check_and_record(self, **_: object) -> int:
-        self._release.wait(timeout=1)
-        return 60
+    async def check_and_record(self, **_: object) -> RateLimitDecision:
+        await asyncio.to_thread(self._release.wait, 1)
+        return RateLimitDecision(allowed=False, retry_after_seconds=60)
+
+
+class UnavailableRateLimiter:
+    async def check_and_record(self, **_: object) -> RateLimitDecision:
+        raise RateLimitStateError("safe test failure")
 
 
 class UnmappedRoleAuthClient:
@@ -148,7 +157,7 @@ def test_domain_manager_can_only_map_to_cashier_with_explicit_assignment() -> No
 @pytest.mark.anyio
 async def test_login_returns_myretail_token(tmp_path: Path) -> None:
     settings = make_test_settings(tmp_path / "rate-limit.sqlite3")
-    app = create_app()
+    app = create_app(settings)
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_erpnext_client] = SuccessfulAuthClient
     transport = httpx.ASGITransport(app=app)
@@ -180,7 +189,7 @@ async def test_login_returns_myretail_token(tmp_path: Path) -> None:
 @pytest.mark.anyio
 async def test_explicit_myretail_admin_login_returns_admin_role(tmp_path: Path) -> None:
     settings = make_test_settings(tmp_path / "rate-limit.sqlite3")
-    app = create_app()
+    app = create_app(settings)
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_erpnext_client] = ExplicitMyRetailAdminAuthClient
     transport = httpx.ASGITransport(app=app)
@@ -202,7 +211,7 @@ async def test_explicit_myretail_admin_login_returns_admin_role(tmp_path: Path) 
 @pytest.mark.anyio
 async def test_domain_manager_roles_cannot_login_as_myretail_admin(tmp_path: Path) -> None:
     settings = make_test_settings(tmp_path / "rate-limit.sqlite3")
-    app = create_app()
+    app = create_app(settings)
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_erpnext_client] = DomainManagerOnlyAuthClient
     transport = httpx.ASGITransport(app=app)
@@ -224,7 +233,7 @@ async def test_domain_manager_roles_cannot_login_as_myretail_admin(tmp_path: Pat
 @pytest.mark.anyio
 async def test_login_rejects_invalid_password(tmp_path: Path) -> None:
     settings = make_test_settings(tmp_path / "rate-limit.sqlite3")
-    app = create_app()
+    app = create_app(settings)
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_erpnext_client] = FailingAuthClient
     transport = httpx.ASGITransport(app=app)
@@ -248,7 +257,7 @@ async def test_login_rejects_invalid_password(tmp_path: Path) -> None:
 @pytest.mark.anyio
 async def test_login_rejects_unknown_tenant(tmp_path: Path) -> None:
     settings = make_test_settings(tmp_path / "rate-limit.sqlite3")
-    app = create_app()
+    app = create_app(settings)
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_erpnext_client] = SuccessfulAuthClient
     transport = httpx.ASGITransport(app=app)
@@ -270,7 +279,7 @@ async def test_login_rejects_unknown_tenant(tmp_path: Path) -> None:
 @pytest.mark.anyio
 async def test_login_rejects_user_without_mapped_role(tmp_path: Path) -> None:
     settings = make_test_settings(tmp_path / "rate-limit.sqlite3")
-    app = create_app()
+    app = create_app(settings)
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_erpnext_client] = UnmappedRoleAuthClient
     transport = httpx.ASGITransport(app=app)
@@ -292,7 +301,7 @@ async def test_login_rejects_user_without_mapped_role(tmp_path: Path) -> None:
 @pytest.mark.anyio
 async def test_generic_erp_roles_require_explicit_pos_assignment(tmp_path: Path) -> None:
     settings = make_test_settings(tmp_path / "rate-limit.sqlite3")
-    app = create_app()
+    app = create_app(settings)
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_erpnext_client] = GenericERPUserAuthClient
     transport = httpx.ASGITransport(app=app)
@@ -322,7 +331,7 @@ async def test_assigned_generic_erp_user_maps_to_cashier(tmp_path: Path) -> None
             }
         },
     )
-    app = create_app()
+    app = create_app(settings)
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_erpnext_client] = GenericERPUserAuthClient
     transport = httpx.ASGITransport(app=app)
@@ -345,7 +354,7 @@ async def test_assigned_generic_erp_user_maps_to_cashier(tmp_path: Path) -> None
 async def test_login_rate_limit_blocks_repeated_failures(tmp_path: Path) -> None:
     settings = make_test_settings(tmp_path / "rate-limit.sqlite3")
     settings.auth_rate_limit_attempts = 2
-    app = create_app()
+    app = create_app(settings)
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_erpnext_client] = FailingAuthClient
     transport = httpx.ASGITransport(app=app, client=("192.0.2.10", 1234))
@@ -373,7 +382,7 @@ async def test_login_global_client_limit_cannot_be_bypassed_with_tenant_or_login
     settings = make_test_settings(tmp_path / "rate-limit.sqlite3")
     settings.auth_rate_limit_attempts = 10
     settings.auth_rate_limit_client_attempts = 2
-    app = create_app()
+    app = create_app(settings)
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_erpnext_client] = FailingAuthClient
     transport = httpx.ASGITransport(app=app, client=("192.0.2.10", 1234))
@@ -404,7 +413,7 @@ async def test_login_infrastructure_failure_discards_only_current_rate_limit_att
 ) -> None:
     settings = make_test_settings(tmp_path / "rate-limit.sqlite3")
     settings.auth_rate_limit_attempts = 2
-    app = create_app()
+    app = create_app(settings)
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_erpnext_client] = FailingAuthClient
     transport = httpx.ASGITransport(app=app, client=("192.0.2.10", 1234))
@@ -434,7 +443,7 @@ async def test_login_rate_limit_sqlite_wait_does_not_block_async_health_requests
 ) -> None:
     settings = make_test_settings(tmp_path / "rate-limit.sqlite3")
     release = threading.Event()
-    app = create_app()
+    app = create_app(settings)
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_erpnext_client] = FailingAuthClient
     app.dependency_overrides[get_login_rate_limiter] = lambda: BlockingRateLimiter(release)
@@ -457,6 +466,30 @@ async def test_login_rate_limit_sqlite_wait_does_not_block_async_health_requests
     assert health.status_code == 200
     assert health_elapsed < 0.5
     assert login.status_code == 429
+
+
+@pytest.mark.anyio
+async def test_login_fails_closed_when_shared_rate_limit_state_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    settings = make_test_settings(tmp_path / "rate-limit.sqlite3")
+    app = create_app(settings)
+    app.dependency_overrides[get_erpnext_client] = SuccessfulAuthClient
+    app.dependency_overrides[get_login_rate_limiter] = UnavailableRateLimiter
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/auth/login",
+            json={
+                "tenant": "myretail",
+                "email": "damir@example.com",
+                "password": "correct-password",
+            },
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Authentication protection is unavailable"}
 
 
 def auth_headers(
@@ -521,7 +554,7 @@ def _decode_token_part(value: str) -> str:
 @pytest.mark.anyio
 async def test_current_session_returns_verified_token_context() -> None:
     settings = make_test_settings()
-    app = create_app()
+    app = create_app(settings)
     app.dependency_overrides[get_settings] = lambda: settings
     transport = httpx.ASGITransport(app=app)
 
@@ -542,7 +575,7 @@ async def test_current_session_returns_verified_token_context() -> None:
 @pytest.mark.anyio
 async def test_current_session_rejects_invalid_token() -> None:
     settings = make_test_settings()
-    app = create_app()
+    app = create_app(settings)
     app.dependency_overrides[get_settings] = lambda: settings
     transport = httpx.ASGITransport(app=app)
 
@@ -563,7 +596,7 @@ async def test_current_session_rejects_invalid_token() -> None:
 @pytest.mark.anyio
 async def test_current_session_rejects_tenant_mismatch() -> None:
     settings = make_test_settings()
-    app = create_app()
+    app = create_app(settings)
     app.dependency_overrides[get_settings] = lambda: settings
     transport = httpx.ASGITransport(app=app)
 

@@ -59,6 +59,7 @@ class POSIdempotencyClaim:
 class RateLimitDecision:
     allowed: bool
     retry_after_seconds: int = 0
+    reservation_at: datetime | None = None
 
 
 class IdempotencyRepository(Protocol):
@@ -270,12 +271,23 @@ class LoginRateLimitRepository(Protocol):
         *,
         client_bucket_key: str,
         login_bucket_key: str,
-        now: datetime,
     ) -> RateLimitDecision: ...
 
-    async def clear(self, *, client_bucket_key: str, login_bucket_key: str) -> None: ...
+    async def clear(
+        self,
+        *,
+        client_bucket_key: str,
+        login_bucket_key: str,
+        reservation_at: datetime,
+    ) -> None: ...
 
-    async def discard(self, *, client_bucket_key: str, login_bucket_key: str) -> None: ...
+    async def discard(
+        self,
+        *,
+        client_bucket_key: str,
+        login_bucket_key: str,
+        reservation_at: datetime,
+    ) -> None: ...
 
 
 class StateHealthRepository(Protocol):

@@ -41,6 +41,7 @@ def postgres_settings() -> Settings:
         _env_file=None,
         environment="test",
         state_backend="postgresql",
+        auth_rate_limit_secret=SecretStr("test-rate-limit-secret-32-bytes-minimum"),
         state_database_url=SecretStr(APP_DATABASE_URL),
         state_pool_min_size=1,
         state_pool_max_size=2,

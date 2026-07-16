@@ -559,6 +559,9 @@ def make_postgres_app(
     settings = make_test_settings(tmp_path)
     settings.tenant_slug = tenant
     settings.state_backend = "postgresql"
+    settings.auth_rate_limit_secret = SecretStr(
+        "test-rate-limit-secret-32-bytes-minimum"
+    )
     settings.state_database_url = SecretStr(POSTGRES_APP_DATABASE_URL)
     settings.state_pool_min_size = 1
     settings.state_pool_max_size = 2
