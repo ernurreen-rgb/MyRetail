@@ -48,9 +48,11 @@ is cross-platform and hash-verified, while the application locks target Linux x8
 - `services/api/sbom-migrations.cdx.json` is the separate reproducible migration artifact SBOM.
 
 CI installs the development lock with `--require-hashes`, installs the local API package with
-`--no-deps --no-build-isolation`, and blocks lock or SBOM drift. A future production API image
-must install `requirements.lock` with `--require-hashes` and then install the prebuilt MyRetail API
-wheel with `--no-deps`; there is no production API image in this repository yet.
+`--no-deps --no-build-isolation`, and blocks lock or SBOM drift. Production container targets are
+defined in `services/api/Dockerfile`: `api` installs `requirements.lock`, while `migration` installs
+`requirements-migrations.lock`; both install the same prebuilt MyRetail API wheel with `--no-deps`.
+The image defaults to `MYRETAIL_ENVIRONMENT=production`, runs as UID/GID 10001 and therefore fails
+closed until the controlled PostgreSQL environment is explicitly provided.
 
 Regenerate artifacts only in the pinned Linux target. The normal update path first installs the
 existing development lock, then runs the generator; add `--upgrade` only for an intentional
@@ -77,6 +79,14 @@ API:
 
 ```powershell
 .\.venv\Scripts\python.exe -m uvicorn myretail_api.main:app --app-dir services/api/src --reload
+```
+
+Production artifacts and the disposable PostgreSQL TLS/restore rehearsal are documented in
+`docs/security/postgresql-production-artifact-drill.md`. The single cross-platform acceptance
+command builds both container targets and cleans all disposable Docker resources:
+
+```powershell
+.\.venv\Scripts\python.exe services/api/scripts/production_state_drill.py
 ```
 
 ## Validate
