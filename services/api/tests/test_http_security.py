@@ -1,7 +1,10 @@
+from pathlib import Path
+
 import httpx
 import pytest
 from fastapi import Response
 
+from myretail_api.config import Settings
 from myretail_api.dependencies import get_erpnext_client
 from myretail_api.main import create_app
 
@@ -22,13 +25,29 @@ def anyio_backend() -> str:
         "/purchases",
     ],
 )
-async def test_sensitive_api_routes_are_not_cacheable_on_errors(path: str) -> None:
-    app = create_app()
+async def test_sensitive_api_routes_are_not_cacheable_on_errors(
+    path: str,
+    tmp_path: Path,
+) -> None:
+    app = create_app(
+        Settings(
+            _env_file=None,
+            environment="test",
+            stock_idempotency_db_path=tmp_path / "idempotency.sqlite3",
+            pos_db_path=tmp_path / "pos.sqlite3",
+        )
+    )
     app.dependency_overrides[get_erpnext_client] = object
     transport = httpx.ASGITransport(app=app)
 
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get(path, headers={"X-MyRetail-Tenant": "myretail"})
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=transport, base_url="http://test") as client,
+    ):
+        response = await client.get(
+            path,
+            headers={"X-MyRetail-Tenant": "myretail"},
+        )
 
     assert response.status_code == 401
     assert response.headers["cache-control"] == "private, no-store, max-age=0"

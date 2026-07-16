@@ -32,6 +32,7 @@ from myretail_api.models.stock import WarehouseRef
 from myretail_api.pos_service import _request_hash
 from myretail_api.pos_store import POSStore, POSStoreMigrationError
 from myretail_api.security import create_access_token
+from myretail_api.state.pos_repository import SQLitePOSRepository
 
 
 @pytest.fixture
@@ -447,10 +448,11 @@ def make_app(
 ):
     settings = settings or make_settings(tmp_path)
     store = POSStore(settings.pos_db_path)
+    repository = SQLitePOSRepository(store)
     app = create_app()
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_erpnext_client] = lambda: erpnext
-    app.dependency_overrides[get_pos_store] = lambda: store
+    app.dependency_overrides[get_pos_store] = lambda: repository
     return app
 
 

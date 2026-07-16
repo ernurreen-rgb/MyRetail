@@ -12,6 +12,7 @@ from myretail_api.config import (
 from myretail_api.main import create_app
 from myretail_api.state.idempotency import SQLiteIdempotencyRepository
 from myretail_api.state.pos_coordination import SQLitePOSCoordinationRepository
+from myretail_api.state.pos_repository import SQLitePOSRepository
 from myretail_api.state.schema import EXPECTED_STATE_SCHEMA_REVISION
 
 
@@ -147,6 +148,11 @@ async def test_sqlite_lifespan_does_not_create_postgresql_pool(tmp_path: Path) -
         assert isinstance(
             app.state.pos_coordination_repository,
             SQLitePOSCoordinationRepository,
+        )
+        assert isinstance(app.state.pos_state_repository, SQLitePOSRepository)
+        assert (
+            app.state.pos_coordination_repository
+            is app.state.pos_state_repository.coordination_repository
         )
 
 

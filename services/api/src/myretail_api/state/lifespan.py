@@ -10,9 +10,9 @@ from myretail_api.state.idempotency import (
     PostgresIdempotencyRepository,
     SQLiteIdempotencyRepository,
 )
-from myretail_api.state.pos_coordination import (
-    PostgresPOSCoordinationRepository,
-    SQLitePOSCoordinationRepository,
+from myretail_api.state.pos_repository import (
+    PostgresPOSRepository,
+    SQLitePOSRepository,
 )
 from myretail_api.state.postgres import PostgresStateRuntime
 
@@ -26,19 +26,20 @@ def build_state_lifespan(
         if settings.state_backend == "postgresql":
             runtime = await PostgresStateRuntime.start(settings)
             idempotency_repository = PostgresIdempotencyRepository(runtime.engine)
-            pos_coordination_repository = PostgresPOSCoordinationRepository(
-                runtime.engine
-            )
+            pos_repository = PostgresPOSRepository(runtime.engine)
         else:
             idempotency_repository = SQLiteIdempotencyRepository(
                 IdempotencyStore(settings.stock_idempotency_db_path)
             )
-            pos_coordination_repository = SQLitePOSCoordinationRepository(
+            pos_repository = SQLitePOSRepository(
                 POSStore(settings.pos_db_path)
             )
         app.state.postgres_state_runtime = runtime
         app.state.shared_idempotency_repository = idempotency_repository
-        app.state.pos_coordination_repository = pos_coordination_repository
+        app.state.pos_state_repository = pos_repository
+        app.state.pos_coordination_repository = (
+            pos_repository.coordination_repository
+        )
         try:
             yield
         finally:

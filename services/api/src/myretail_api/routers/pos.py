@@ -29,14 +29,14 @@ from myretail_api.models.pos import (
     ShiftOpenRequest,
 )
 from myretail_api.pos_service import POSApiError, POSService
-from myretail_api.pos_store import POSStore
+from myretail_api.state.pos_repository import POSStateRepository
 
 router = APIRouter(prefix="/pos", tags=["pos"])
 
 
 def get_pos_service(
     erpnext: Annotated[ERPNextClient, Depends(get_erpnext_client)],
-    store: Annotated[POSStore, Depends(get_pos_store)],
+    store: Annotated[POSStateRepository, Depends(get_pos_store)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> POSService:
     return POSService(erpnext=erpnext, store=store, settings=settings)

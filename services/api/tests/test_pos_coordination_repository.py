@@ -21,6 +21,7 @@ from myretail_api.state.pos_coordination import (
     PostgresPOSCoordinationRepository,
     SQLitePOSCoordinationRepository,
 )
+from myretail_api.state.pos_repository import PostgresPOSRepository
 from myretail_api.state.postgres import PostgresStateRuntime
 from myretail_api.state.protocols import (
     POSIdempotencyRepository,
@@ -320,6 +321,8 @@ async def test_postgresql_lifespan_exposes_one_process_scoped_repository() -> No
         repository = app.state.pos_coordination_repository
         assert isinstance(repository, PostgresPOSCoordinationRepository)
         assert repository._engine is app.state.postgres_state_runtime.engine
+        assert isinstance(app.state.pos_state_repository, PostgresPOSRepository)
+        assert app.state.pos_state_repository.coordination_repository is repository
 
 
 @pytest.mark.anyio

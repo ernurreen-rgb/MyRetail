@@ -58,10 +58,10 @@ from myretail_api.pos_store import (
     POSIdempotencyConflictError,
     POSIdempotencyRecord,
     POSIntentBeginResult,
-    POSStore,
     POSStoreConflictError,
 )
 from myretail_api.security import get_pos_cashier_assignment
+from myretail_api.state.pos_repository import POSStateRepository
 
 ADMIN_ROLES = {"Owner", "Admin"}
 
@@ -82,7 +82,13 @@ class POSLegacyRecoveryError(POSApiError):
 
 
 class POSService:
-    def __init__(self, *, erpnext: ERPNextClient, store: POSStore, settings: Settings) -> None:
+    def __init__(
+        self,
+        *,
+        erpnext: ERPNextClient,
+        store: POSStateRepository,
+        settings: Settings,
+    ) -> None:
         self._erpnext = erpnext
         self._store = store
         self._settings = settings
@@ -134,7 +140,11 @@ class POSService:
 
     async def current_shift(self, context: TenantContext, *, register_id: str) -> Shift:
         self._require_pos_role(context)
-        row = self._store.get_current_shift(context.tenant, register_id, context.user.email)
+        row = await self._store.get_current_shift(
+            context.tenant,
+            register_id,
+            context.user.email,
+        )
         if row is None:
             raise POSApiError(404, "SHIFT_NOT_FOUND", "Смена не найдена")
         shift = self._to_shift(row)
@@ -174,8 +184,8 @@ class POSService:
         self, context: TenantContext, *, shift_id: str, limit: int, offset: int
     ) -> HeldReceiptList:
         self._require_pos_role(context)
-        shift = self._require_shift_access(context, shift_id)
-        rows = self._store.list_open_held_receipts(context.tenant, shift.id)
+        shift = await self._require_shift_access(context, shift_id)
+        rows = await self._store.list_open_held_receipts(context.tenant, shift.id)
         page = rows[offset : offset + limit]
         return HeldReceiptList(
             items=[self._to_held(row) for row in page],
@@ -199,10 +209,10 @@ class POSService:
 
     async def get_held(self, context: TenantContext, held_id: str) -> HeldReceipt:
         self._require_pos_role(context)
-        row = self._store.get_held_receipt(context.tenant, held_id)
+        row = await self._store.get_held_receipt(context.tenant, held_id)
         if row is None:
             raise POSApiError(404, "HELD_RECEIPT_NOT_FOUND", "Отложенный чек не найден")
-        self._require_shift_access(context, str(row["shift_id"]))
+        await self._require_shift_access(context, str(row["shift_id"]))
         return self._to_held(row)
 
     async def update_held(
@@ -210,7 +220,7 @@ class POSService:
     ) -> HeldReceipt:
         self._require_pos_role(context)
         existing = await self.get_held(context, held_id)
-        shift = self._require_shift_access(context, existing.shift_id)
+        shift = await self._require_shift_access(context, existing.shift_id)
         lines = (
             request.lines
             if request.lines is not None
@@ -226,7 +236,7 @@ class POSService:
         totals = await self._build_lines(context, shift, lines)
         now = _now()
         try:
-            row = self._store.update_held_receipt(
+            row = await self._store.update_held_receipt(
                 {
                     "id": held_id,
                     "tenant": context.tenant,
@@ -252,11 +262,11 @@ class POSService:
 
     async def delete_held(self, context: TenantContext, held_id: str) -> None:
         self._require_pos_role(context)
-        row = self._store.get_held_receipt(context.tenant, held_id)
+        row = await self._store.get_held_receipt(context.tenant, held_id)
         if row is not None:
-            self._require_shift_access(context, str(row["shift_id"]))
+            await self._require_shift_access(context, str(row["shift_id"]))
         try:
-            self._store.delete_held_receipt(context.tenant, held_id)
+            await self._store.delete_held_receipt(context.tenant, held_id)
         except POSStoreConflictError as exc:
             raise POSApiError(409, exc.code, exc.message, exc.fields) from exc
 
@@ -290,7 +300,7 @@ class POSService:
         effective_cashier = (
             cashier_email if ADMIN_ROLES.intersection(context.user.roles) else context.user.email
         )
-        rows, count = self._store.list_sales(
+        rows, count = await self._store.list_sales(
             tenant=context.tenant,
             cashier_email=effective_cashier,
             register_id=register_id,
@@ -306,7 +316,7 @@ class POSService:
 
     async def get_sale(self, context: TenantContext, sale_id: str) -> Sale:
         self._require_pos_role(context)
-        row = self._store.get_sale(context.tenant, sale_id)
+        row = await self._store.get_sale(context.tenant, sale_id)
         if row is None:
             raise POSApiError(404, "SALE_NOT_FOUND", "Продажа не найдена")
         sale = self._to_sale(row)
@@ -315,12 +325,12 @@ class POSService:
             and sale.cashier.email != context.user.email
         ):
             raise POSApiError(404, "SALE_NOT_FOUND", "Продажа не найдена")
-        return self._with_return_summary(sale, context.tenant)
+        return await self._with_return_summary(sale, context.tenant)
 
     async def return_options(self, context: TenantContext, sale_id: str) -> ReturnOptions:
         self._require_pos_role(context)
         sale = await self.get_sale(context, sale_id)
-        _, lines = self._store.return_options(context.tenant, sale_id)
+        _, lines = await self._store.return_options(context.tenant, sale_id)
         return ReturnOptions(
             sale_id=sale.id,
             receipt_number=sale.receipt_number,
@@ -383,7 +393,7 @@ class POSService:
         effective_cashier = (
             cashier_email if ADMIN_ROLES.intersection(context.user.roles) else context.user.email
         )
-        rows, count = self._store.list_returns(
+        rows, count = await self._store.list_returns(
             tenant=context.tenant,
             cashier_email=effective_cashier,
             q=q,
@@ -404,11 +414,11 @@ class POSService:
 
     async def get_return(self, context: TenantContext, return_id: str) -> ReturnResponse:
         self._require_pos_role(context)
-        row = self._store.get_return(context.tenant, return_id)
+        row = await self._store.get_return(context.tenant, return_id)
         if row is None:
             raise POSApiError(404, "RETURN_NOT_FOUND", "Возврат не найден")
         self._ensure_return_scope(context, row)
-        return self._to_return(row)
+        return await self._to_return(row)
 
     async def cancel_return(
         self,
@@ -441,7 +451,7 @@ class POSService:
             raise POSApiError(409, "REGISTER_INACTIVE", "Касса неактивна")
         opened_at = _now()
         shift_id = f"SHIFT-{uuid4().hex[:12].upper()}"
-        claim = self._begin_durable_intent(
+        claim = await self._begin_durable_intent(
             context,
             operation="open_shift",
             scope_id=f"register:{register.id}",
@@ -468,7 +478,7 @@ class POSService:
             return await self._recover_open_shift_intent(context, claim.intent)
         intent_id = str(claim.intent["id"])
         fencing_token = int(claim.intent["fencing_token"])
-        self._mark_intent_erp_pending(intent_id, fencing_token)
+        await self._mark_intent_erp_pending(context.tenant, intent_id, fencing_token)
         try:
             opening_id = await self._call_erp(
                 self._erpnext.create_pos_opening(
@@ -481,14 +491,25 @@ class POSService:
                 )
             )
         except ERPNextAmbiguousCreateError:
-            self._mark_intent_recovery_required(intent_id, fencing_token)
+            await self._mark_intent_recovery_required(
+                context.tenant,
+                intent_id,
+                fencing_token,
+            )
             return await self._recover_open_shift_intent(context, claim.intent)
         except POSApiError:
-            self._store.fail_operation_intent(intent_id, fencing_token)
+            await self._store.fail_operation_intent(
+                context.tenant,
+                intent_id,
+                fencing_token,
+            )
             raise
         try:
-            row = self._store.materialize_open_shift_intent(
-                intent_id, fencing_token, opening_id
+            row = await self._store.materialize_open_shift_intent(
+                context.tenant,
+                intent_id,
+                fencing_token,
+                opening_id,
             )
         except POSStoreConflictError as exc:
             raise POSApiError(409, exc.code, exc.message, exc.fields) from exc
@@ -497,12 +518,12 @@ class POSService:
     async def _close_shift_once(
         self, context: TenantContext, shift_id: str, request: ShiftCloseRequest
     ) -> Shift:
-        shift = self._require_shift_access(
+        shift = await self._require_shift_access(
             context, shift_id, allow_admin=True, reason=request.reason
         )
         if shift.status == "closed":
             raise POSApiError(409, "SHIFT_CLOSED", "Смена закрыта")
-        if self._store.list_open_held_receipts(context.tenant, shift.id):
+        if await self._store.list_open_held_receipts(context.tenant, shift.id):
             raise POSApiError(
                 409, "SHIFT_HAS_HELD_RECEIPTS", "Закройте отложенные чеки перед закрытием смены"
             )
@@ -513,7 +534,7 @@ class POSService:
         )
         expected_updated_at = shift.updated_at.astimezone(UTC).isoformat().replace("+00:00", "Z")
         closed_at = _now()
-        claim = self._begin_durable_intent(
+        claim = await self._begin_durable_intent(
             context,
             operation="close_shift",
             scope_id=f"shift:{shift.id}",
@@ -539,7 +560,7 @@ class POSService:
             return await self._recover_close_shift_intent(context, claim.intent)
         intent_id = str(claim.intent["id"])
         fencing_token = int(claim.intent["fencing_token"])
-        self._mark_intent_erp_pending(intent_id, fencing_token)
+        await self._mark_intent_erp_pending(context.tenant, intent_id, fencing_token)
         try:
             closing_id = await self._call_erp(
                 self._erpnext.create_pos_closing(
@@ -551,14 +572,25 @@ class POSService:
                 )
             )
         except ERPNextAmbiguousCreateError:
-            self._mark_intent_recovery_required(intent_id, fencing_token)
+            await self._mark_intent_recovery_required(
+                context.tenant,
+                intent_id,
+                fencing_token,
+            )
             return await self._recover_close_shift_intent(context, claim.intent)
         except POSApiError:
-            self._store.fail_operation_intent(intent_id, fencing_token)
+            await self._store.fail_operation_intent(
+                context.tenant,
+                intent_id,
+                fencing_token,
+            )
             raise
         try:
-            row = self._store.materialize_close_shift_intent(
-                intent_id, fencing_token, closing_id
+            row = await self._store.materialize_close_shift_intent(
+                context.tenant,
+                intent_id,
+                fencing_token,
+                closing_id,
             )
         except POSStoreConflictError as exc:
             raise POSApiError(409, exc.code, exc.message, exc.fields) from exc
@@ -567,11 +599,11 @@ class POSService:
     async def _create_held_once(
         self, context: TenantContext, request: HeldReceiptCreate
     ) -> HeldReceipt:
-        shift = self._require_shift_access(context, request.shift_id)
+        shift = await self._require_shift_access(context, request.shift_id)
         totals = await self._build_lines(context, shift, request.lines)
         now = _now()
         try:
-            row = self._store.upsert_held_receipt(
+            row = await self._store.upsert_held_receipt(
                 {
                 "id": f"HELD-{uuid4().hex[:12].upper()}",
                 "tenant": context.tenant,
@@ -596,7 +628,7 @@ class POSService:
     async def _create_sale_once(
         self, context: TenantContext, request: SaleCreateRequest
     ) -> Sale:
-        shift = self._require_shift_access(context, request.shift_id)
+        shift = await self._require_shift_access(context, request.shift_id)
         if shift.status == "closed":
             raise POSApiError(409, "SHIFT_CLOSED", "Смена закрыта")
         held = None
@@ -622,7 +654,7 @@ class POSService:
         sale_id = f"SALE-{uuid4().hex[:12].upper()}"
         now = _now()
         expected_updated_at = shift.updated_at.astimezone(UTC).isoformat().replace("+00:00", "Z")
-        claim = self._begin_durable_intent(
+        claim = await self._begin_durable_intent(
             context,
             operation="create_sale",
             scope_id=f"shift:{shift.id}",
@@ -661,7 +693,7 @@ class POSService:
             return await self._recover_sale_intent(context, claim.intent)
         intent_id = str(claim.intent["id"])
         fencing_token = int(claim.intent["fencing_token"])
-        self._mark_intent_erp_pending(intent_id, fencing_token)
+        await self._mark_intent_erp_pending(context.tenant, intent_id, fencing_token)
         try:
             invoice_id = await self._call_sale_submit(
                 self._erpnext.create_pos_sales_invoice(
@@ -678,14 +710,25 @@ class POSService:
                 )
             )
         except ERPNextAmbiguousCreateError:
-            self._mark_intent_recovery_required(intent_id, fencing_token)
+            await self._mark_intent_recovery_required(
+                context.tenant,
+                intent_id,
+                fencing_token,
+            )
             return await self._recover_sale_intent(context, claim.intent)
         except POSApiError:
-            self._store.fail_operation_intent(intent_id, fencing_token)
+            await self._store.fail_operation_intent(
+                context.tenant,
+                intent_id,
+                fencing_token,
+            )
             raise
         try:
-            row = self._store.materialize_sale_intent(
-                intent_id, fencing_token, invoice_id
+            row = await self._store.materialize_sale_intent(
+                context.tenant,
+                intent_id,
+                fencing_token,
+                invoice_id,
             )
         except POSStoreConflictError as exc:
             raise POSApiError(409, exc.code, exc.message, exc.fields) from exc
@@ -697,7 +740,7 @@ class POSService:
         sale = await self.get_sale(context, request.sale_id)
         if sale.register.id != request.register_id or sale.shift_id != request.shift_id:
             raise POSApiError(404, "SALE_NOT_FOUND", "Продажа не найдена")
-        shift_row = self._store.get_shift(context.tenant, request.shift_id)
+        shift_row = await self._store.get_shift(context.tenant, request.shift_id)
         if shift_row is None:
             raise POSApiError(409, "SHIFT_NOT_OPEN", "Смена не найдена")
         shift = self._to_shift(shift_row)
@@ -712,7 +755,7 @@ class POSService:
                     "Возврат кассира возможен только в открытой смене",
                 )
 
-        _, option_rows = self._store.return_options(context.tenant, sale.id)
+        _, option_rows = await self._store.return_options(context.tenant, sale.id)
         options = {str(row["line_id"]): row for row in option_rows}
         if option_rows and all(
             Decimal(str(option["available_to_return_quantity"])) <= Decimal("0")
@@ -755,7 +798,7 @@ class POSService:
         return_id = f"RETURN-{uuid4().hex[:12].upper()}"
         now = _now()
         try:
-            self._store.create_pending_return(
+            await self._store.create_pending_return(
                 row={
                     "id": return_id,
                     "tenant": context.tenant,
@@ -797,10 +840,10 @@ class POSService:
                 )
             )
         except POSStoreConflictError as exc:
-            self._store.delete_pending_return(context.tenant, return_id)
+            await self._store.delete_pending_return(context.tenant, return_id)
             raise POSApiError(409, exc.code, exc.message, exc.fields) from exc
         except POSApiError as exc:
-            self._store.delete_pending_return(context.tenant, return_id)
+            await self._store.delete_pending_return(context.tenant, return_id)
             if shift.status == "closed" and exc.code == "VALIDATION_ERROR":
                 raise POSApiError(
                     409,
@@ -811,13 +854,17 @@ class POSService:
         except ERPNextAmbiguousCreateError:
             raise
         except Exception:
-            self._store.delete_pending_return(context.tenant, return_id)
+            await self._store.delete_pending_return(context.tenant, return_id)
             raise
-        submitted = self._store.mark_return_submitted(context.tenant, return_id, invoice_id)
-        return self._to_return(submitted)
+        submitted = await self._store.mark_return_submitted(
+            context.tenant,
+            return_id,
+            invoice_id,
+        )
+        return await self._to_return(submitted)
 
     async def _recover_return(self, context: TenantContext, key: str) -> ReturnResponse | None:
-        row = self._store.get_return_by_idempotency(
+        row = await self._store.get_return_by_idempotency(
             context.tenant, "create_return", context.user.email, key
         )
         if row is None:
@@ -832,21 +879,28 @@ class POSService:
                 "Результат возврата ERPNext нельзя безопасно подтвердить",
                 {"return_id": str(row["id"])},
             )
-        return self._to_return(
-            self._store.mark_return_submitted(context.tenant, str(row["id"]), invoice_id)
+        return await self._to_return(
+            await self._store.mark_return_submitted(
+                context.tenant,
+                str(row["id"]),
+                invoice_id,
+            )
         )
 
     async def _cancel_return_once(
         self, context: TenantContext, return_id: str, request: ReturnCancelRequest
     ) -> ReturnResponse:
-        row = self._store.get_return(context.tenant, return_id)
+        row = await self._store.get_return(context.tenant, return_id)
         if row is None:
             raise POSApiError(404, "RETURN_NOT_FOUND", "Возврат не найден")
         self._ensure_return_scope(context, row)
         if row["state"] == "cancelled":
             raise POSApiError(409, "RETURN_ALREADY_CANCELLED", "Возврат уже отменён")
         try:
-            claimed = self._store.claim_return_cancel(context.tenant, return_id)
+            claimed = await self._store.claim_return_cancel(
+                context.tenant,
+                return_id,
+            )
         except POSStoreConflictError as exc:
             raise POSApiError(409, exc.code, exc.message, exc.fields) from exc
         if not claimed:
@@ -866,10 +920,10 @@ class POSService:
         except ERPNextAmbiguousCreateError:
             raise
         except Exception:
-            self._store.release_return_cancel(context.tenant, return_id)
+            await self._store.release_return_cancel(context.tenant, return_id)
             raise
-        return self._to_return(
-            self._store.mark_return_cancelled(
+        return await self._to_return(
+            await self._store.mark_return_cancelled(
                 tenant=context.tenant,
                 return_id=return_id,
                 cancelled_by=context.user.email,
@@ -881,7 +935,7 @@ class POSService:
     async def _recover_cancel_return(
         self, context: TenantContext, return_id: str, request: ReturnCancelRequest
     ) -> ReturnResponse | None:
-        row = self._store.get_return(context.tenant, return_id)
+        row = await self._store.get_return(context.tenant, return_id)
         if row is None:
             return None
         if row["state"] == "cancelled":
@@ -892,8 +946,8 @@ class POSService:
             str(row["erpnext_return_invoice_id"])
         )
         if docstatus == 2:
-            return self._to_return(
-                self._store.mark_return_cancelled(
+            return await self._to_return(
+                await self._store.mark_return_cancelled(
                     tenant=context.tenant,
                     return_id=return_id,
                     cancelled_by=context.user.email,
@@ -1011,7 +1065,7 @@ class POSService:
                 return register
         raise POSApiError(404, "REGISTER_NOT_FOUND", "Касса не найдена")
 
-    def _require_shift_access(
+    async def _require_shift_access(
         self,
         context: TenantContext,
         shift_id: str,
@@ -1019,7 +1073,7 @@ class POSService:
         allow_admin: bool = False,
         reason: str | None = None,
     ) -> Shift:
-        row = self._store.get_shift(context.tenant, shift_id)
+        row = await self._store.get_shift(context.tenant, shift_id)
         if row is None:
             raise POSApiError(404, "SHIFT_NOT_FOUND", "Смена не найдена")
         shift = self._to_shift(row)
@@ -1032,7 +1086,7 @@ class POSService:
             return shift
         raise POSApiError(404, "SHIFT_NOT_FOUND", "Смена не найдена")
 
-    def _begin_durable_intent(
+    async def _begin_durable_intent(
         self,
         context: TenantContext,
         *,
@@ -1044,7 +1098,7 @@ class POSService:
         require_no_held_receipts: bool = False,
     ) -> POSIntentBeginResult:
         try:
-            claim = self._store.begin_operation_intent(
+            claim = await self._store.begin_operation_intent(
                 tenant=context.tenant,
                 operation=operation,
                 scope_id=scope_id,
@@ -1060,32 +1114,48 @@ class POSService:
             raise POSApiError(409, "SHIFT_CHANGED", "По смене уже выполняется операция")
         return claim
 
-    def _mark_intent_erp_pending(self, intent_id: str, fencing_token: int) -> None:
-        if not self._store.mark_operation_erp_pending(intent_id, fencing_token):
+    async def _mark_intent_erp_pending(
+        self,
+        tenant: str,
+        intent_id: str,
+        fencing_token: int,
+    ) -> None:
+        if not await self._store.mark_operation_erp_pending(
+            tenant,
+            intent_id,
+            fencing_token,
+        ):
             raise POSApiError(
                 409,
                 "IDEMPOTENCY_CONFLICT",
                 "Право выполнения операции уже передано другому запросу",
             )
 
-    def _mark_intent_recovery_required(
-        self, intent_id: str, fencing_token: int
+    async def _mark_intent_recovery_required(
+        self,
+        tenant: str,
+        intent_id: str,
+        fencing_token: int,
     ) -> None:
-        if not self._store.mark_operation_recovery_required(intent_id, fencing_token):
+        if not await self._store.mark_operation_recovery_required(
+            tenant,
+            intent_id,
+            fencing_token,
+        ):
             raise POSApiError(
                 409,
                 "IDEMPOTENCY_CONFLICT",
                 "Право восстановления операции уже передано другому запросу",
             )
 
-    def _claim_recovery_intent(
+    async def _claim_recovery_intent(
         self,
         context: TenantContext,
         *,
         operation: str,
         business_hash: str,
     ) -> POSIntentBeginResult | None:
-        intent = self._store.find_active_operation_intent(
+        intent = await self._store.find_active_operation_intent(
             tenant=context.tenant,
             operation=operation,
             user_email=context.user.email,
@@ -1094,7 +1164,10 @@ class POSService:
         if intent is None:
             return None
         try:
-            claim = self._store.claim_operation_intent(str(intent["id"]))
+            claim = await self._store.claim_operation_intent(
+                context.tenant,
+                str(intent["id"]),
+            )
         except POSStoreConflictError as exc:
             raise POSApiError(409, exc.code, exc.message, exc.fields) from exc
         return claim if claim.acquired else None
@@ -1113,7 +1186,7 @@ class POSService:
     ) -> tuple[int, dict[str, object]]:
         request_hash = _request_hash(operation, payload)
         try:
-            begin = self._store.begin_idempotency(
+            begin = await self._store.begin_idempotency(
                 tenant=context.tenant,
                 operation=operation,
                 user_email=context.user.email,
@@ -1138,9 +1211,9 @@ class POSService:
                 409, conflict_code, "Запрос с этим Idempotency-Key ещё выполняется"
             )
 
-        def complete(status_code: int, body: dict[str, object]) -> None:
+        async def complete(status_code: int, body: dict[str, object]) -> None:
             try:
-                self._store.complete_idempotency(
+                completed = await self._store.complete_idempotency(
                     tenant=context.tenant,
                     operation=operation,
                     user_email=context.user.email,
@@ -1150,6 +1223,12 @@ class POSService:
                     status_code=status_code,
                     response_body=body,
                 )
+                if not completed:
+                    raise POSApiError(
+                        409,
+                        conflict_code,
+                        "Idempotency completion ownership changed",
+                    )
             except POSIdempotencyConflictError as exc:
                 raise POSApiError(
                     409,
@@ -1157,8 +1236,8 @@ class POSService:
                     "Право завершения запроса уже передано другому процессу",
                 ) from exc
 
-        def release() -> None:
-            self._store.release_idempotency(
+        async def release() -> None:
+            await self._store.release_idempotency(
                 tenant=context.tenant,
                 operation=operation,
                 user_email=context.user.email,
@@ -1176,17 +1255,17 @@ class POSService:
                     if durable_operation and not isinstance(
                         exc, POSLegacyRecoveryError
                     ):
-                        release()
+                        await release()
                         raise
                     body = _error_response_body(exc)
-                    complete(exc.status_code, body)
+                    await complete(exc.status_code, body)
                     return exc.status_code, body
                 body = _error_response_body(exc)
-                complete(exc.status_code, body)
+                await complete(exc.status_code, body)
                 return exc.status_code, body
             if recovered is not None:
                 body = jsonable_encoder(recovered)
-                complete(success_status, body)
+                await complete(success_status, body)
                 return success_status, body
             if durable_operation:
                 recovery_error = POSApiError(
@@ -1195,7 +1274,7 @@ class POSService:
                     "Legacy-операция без durable intent требует ручной проверки",
                 )
                 body = _error_response_body(recovery_error)
-                complete(recovery_error.status_code, body)
+                await complete(recovery_error.status_code, body)
                 return recovery_error.status_code, body
 
         try:
@@ -1209,19 +1288,19 @@ class POSService:
                         if durable_operation and not isinstance(
                             exc, POSLegacyRecoveryError
                         ):
-                            release()
+                            await release()
                             raise
                         body = _error_response_body(exc)
-                        complete(exc.status_code, body)
+                        await complete(exc.status_code, body)
                         return exc.status_code, body
                     body = _error_response_body(exc)
-                    complete(exc.status_code, body)
+                    await complete(exc.status_code, body)
                     return exc.status_code, body
                 if recovered is not None:
                     body = jsonable_encoder(recovered)
-                    complete(success_status, body)
+                    await complete(success_status, body)
                     return success_status, body
-            release()
+            await release()
             raise POSApiError(
                 503,
                 "ERPNEXT_UNAVAILABLE",
@@ -1230,19 +1309,19 @@ class POSService:
         except POSApiError as exc:
             if exc.status_code < 500:
                 body = _error_response_body(exc)
-                complete(exc.status_code, body)
+                await complete(exc.status_code, body)
                 return exc.status_code, body
             if durable_operation:
-                release()
+                await release()
                 raise
             body = _error_response_body(exc)
-            complete(exc.status_code, body)
+            await complete(exc.status_code, body)
             return exc.status_code, body
         except Exception:
-            release()
+            await release()
             raise
         body = jsonable_encoder(result)
-        complete(success_status, body)
+        await complete(success_status, body)
         return success_status, body
 
     async def _wait_completed(
@@ -1256,7 +1335,7 @@ class POSService:
         deadline = datetime.now(UTC).timestamp() + 5
         while datetime.now(UTC).timestamp() < deadline:
             try:
-                record = self._store.get_completed_idempotency(
+                record = await self._store.get_completed_idempotency(
                     tenant=context.tenant,
                     operation=operation,
                     user_email=context.user.email,
@@ -1277,7 +1356,7 @@ class POSService:
     async def _recover_open_shift(
         self, context: TenantContext, request: ShiftOpenRequest, legacy_key: str
     ) -> Shift | None:
-        claim = self._claim_recovery_intent(
+        claim = await self._claim_recovery_intent(
             context,
             operation="open_shift",
             business_hash=_request_hash(
@@ -1309,7 +1388,9 @@ class POSService:
         payload = _durable_intent_payload(intent)
         shift_data = dict(payload["shift"])
         if intent["state"] == "materialized":
-            row = self._store.get_shift(context.tenant, str(intent["result_id"]))
+            row = await self._store.get_shift(
+                context.tenant, str(intent["result_id"])
+            )
             if row is not None:
                 return self._to_shift(row)
             raise POSApiError(
@@ -1325,15 +1406,17 @@ class POSService:
         )
         fencing_token = int(intent["fencing_token"])
         if opening_id is None:
-            self._mark_intent_recovery_required(str(intent["id"]), fencing_token)
+            await self._mark_intent_recovery_required(
+                context.tenant, str(intent["id"]), fencing_token
+            )
             raise POSApiError(
                 503,
                 "ERPNEXT_RECOVERY_PENDING",
                 "Создание смены имеет неопределённый результат; выполняется recovery",
             )
         try:
-            row = self._store.materialize_open_shift_intent(
-                str(intent["id"]), fencing_token, opening_id
+            row = await self._store.materialize_open_shift_intent(
+                context.tenant, str(intent["id"]), fencing_token, opening_id
             )
         except POSStoreConflictError as exc:
             raise POSApiError(409, exc.code, exc.message, exc.fields) from exc
@@ -1346,7 +1429,7 @@ class POSService:
         request: ShiftCloseRequest,
         legacy_key: str,
     ) -> Shift | None:
-        claim = self._claim_recovery_intent(
+        claim = await self._claim_recovery_intent(
             context,
             operation="close_shift",
             business_hash=_request_hash(
@@ -1355,7 +1438,7 @@ class POSService:
             ),
         )
         if claim is None:
-            row = self._store.get_shift(context.tenant, shift_id)
+            row = await self._store.get_shift(context.tenant, shift_id)
             if row is None:
                 return None
             shift = self._to_shift(row)
@@ -1383,7 +1466,9 @@ class POSService:
         payload = _durable_intent_payload(intent)
         close_data = dict(payload["close"])
         if intent["state"] == "materialized":
-            row = self._store.get_shift(context.tenant, str(intent["result_id"]))
+            row = await self._store.get_shift(
+                context.tenant, str(intent["result_id"])
+            )
             if row is not None:
                 return self._to_shift(row)
             raise POSApiError(
@@ -1399,15 +1484,17 @@ class POSService:
         )
         fencing_token = int(intent["fencing_token"])
         if closing_id is None:
-            self._mark_intent_recovery_required(str(intent["id"]), fencing_token)
+            await self._mark_intent_recovery_required(
+                context.tenant, str(intent["id"]), fencing_token
+            )
             raise POSApiError(
                 503,
                 "ERPNEXT_RECOVERY_PENDING",
                 "Закрытие смены имеет неопределённый результат; выполняется recovery",
             )
         try:
-            row = self._store.materialize_close_shift_intent(
-                str(intent["id"]), fencing_token, closing_id
+            row = await self._store.materialize_close_shift_intent(
+                context.tenant, str(intent["id"]), fencing_token, closing_id
             )
         except POSStoreConflictError as exc:
             raise POSApiError(409, exc.code, exc.message, exc.fields) from exc
@@ -1416,7 +1503,7 @@ class POSService:
     async def _recover_sale(
         self, context: TenantContext, request: SaleCreateRequest, legacy_key: str
     ) -> Sale | None:
-        claim = self._claim_recovery_intent(
+        claim = await self._claim_recovery_intent(
             context,
             operation="create_sale",
             business_hash=_request_hash(
@@ -1448,7 +1535,9 @@ class POSService:
         payload = _durable_intent_payload(intent)
         sale_data = dict(payload["sale"])
         if intent["state"] == "materialized":
-            row = self._store.get_sale(context.tenant, str(intent["result_id"]))
+            row = await self._store.get_sale(
+                context.tenant, str(intent["result_id"])
+            )
             if row is not None:
                 return self._to_sale(row)
             raise POSApiError(
@@ -1464,15 +1553,17 @@ class POSService:
         )
         fencing_token = int(intent["fencing_token"])
         if invoice_id is None:
-            self._mark_intent_recovery_required(str(intent["id"]), fencing_token)
+            await self._mark_intent_recovery_required(
+                context.tenant, str(intent["id"]), fencing_token
+            )
             raise POSApiError(
                 503,
                 "ERPNEXT_RECOVERY_PENDING",
                 "Продажа имеет неопределённый результат; выполняется recovery",
             )
         try:
-            row = self._store.materialize_sale_intent(
-                str(intent["id"]), fencing_token, invoice_id
+            row = await self._store.materialize_sale_intent(
+                context.tenant, str(intent["id"]), fencing_token, invoice_id
             )
         except POSStoreConflictError as exc:
             raise POSApiError(409, exc.code, exc.message, exc.fields) from exc
@@ -1625,8 +1716,8 @@ class POSService:
             created_at=_parse_dt(row["created_at"]),
         )
 
-    def _with_return_summary(self, sale: Sale, tenant: str) -> Sale:
-        _, option_rows = self._store.return_options(tenant, sale.id)
+    async def _with_return_summary(self, sale: Sale, tenant: str) -> Sale:
+        _, option_rows = await self._store.return_options(tenant, sale.id)
         options = {str(row["line_id"]): row for row in option_rows}
         returned_total = Decimal("0.00")
         enriched: list[SaleLine] = []
@@ -1671,9 +1762,11 @@ class POSService:
         if row.get("cashier_email") != context.user.email:
             raise POSApiError(404, "RETURN_NOT_FOUND", "Возврат не найден")
 
-    def _to_return(self, row: dict[str, Any]) -> ReturnResponse:
+    async def _to_return(self, row: dict[str, Any]) -> ReturnResponse:
         lines = [ReturnLine(**line) for line in json.loads(str(row["lines_json"]))]
-        _, options = self._store.return_options(str(row["tenant"]), str(row["sale_id"]))
+        _, options = await self._store.return_options(
+            str(row["tenant"]), str(row["sale_id"])
+        )
         if not options or all(
             Decimal(str(option["available_to_return_quantity"])) <= Decimal("0")
             for option in options
