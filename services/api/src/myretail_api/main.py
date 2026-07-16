@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from typing import Any
 
 from fastapi import FastAPI, Request, status
@@ -6,7 +7,12 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from myretail_api.config import Settings, get_settings, validate_production_state_storage
+from myretail_api.config import (
+    Settings,
+    get_settings,
+    validate_production_state_storage,
+    validate_state_foundation_settings,
+)
 from myretail_api.http_security import (
     ApiSecurityHeadersMiddleware,
     apply_api_security_headers,
@@ -17,15 +23,21 @@ from myretail_api.routers.pos import router as pos_router
 from myretail_api.routers.products import router as products_router
 from myretail_api.routers.purchases import purchases_router, suppliers_router
 from myretail_api.routers.stock import router as stock_router
+from myretail_api.state.lifespan import build_state_lifespan
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
-    validate_production_state_storage(settings or get_settings())
+    effective_settings = settings or get_settings()
+    validate_production_state_storage(effective_settings)
+    validate_state_foundation_settings(effective_settings)
     app = FastAPI(
         title="MyRetail API",
         version="0.1.0",
         summary="Stable API gateway between MyRetail clients and ERPNext.",
+        lifespan=build_state_lifespan(effective_settings),
     )
+    app.state.settings = effective_settings
+    app.dependency_overrides[get_settings] = _settings_provider(effective_settings)
     app.add_middleware(ApiSecurityHeadersMiddleware)
     app.add_exception_handler(Exception, internal_server_error_handler)
     app.add_exception_handler(StarletteHTTPException, product_http_exception_handler)
@@ -38,6 +50,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(suppliers_router)
     app.include_router(purchases_router)
     return app
+
+
+def _settings_provider(settings: Settings) -> Callable[[], Settings]:
+    def provide_settings() -> Settings:
+        return settings
+
+    return provide_settings
 
 
 async def internal_server_error_handler(request: Request, exc: Exception) -> Response:

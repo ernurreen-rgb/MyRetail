@@ -88,3 +88,77 @@ jobs:
         run: python -m bandit -r services/api/src services/api/scripts
       - run: python -m ruff check services/api
       - run: python -m pytest services/api/tests
+
+  postgresql-foundation:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18.4@sha256:bb9940981eeb86356ec91bda430f8e0ba8729cc0b319615a2c2d7ac932fdf7bb
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: services/api/requirements-dev.lock
+      - name: Install hash-locked Python dependencies
+        run: >-
+          python -m pip install
+          --disable-pip-version-check
+          --require-hashes
+          -r services/api/requirements-dev.lock
+      - name: Install MyRetail API without dependency resolution
+        run: >-
+          python -m pip install
+          --disable-pip-version-check
+          --no-deps
+          --no-build-isolation
+          -e services/api
+      - name: Bootstrap disposable PostgreSQL roles and databases
+        env:
+          POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
+        run: >-
+          docker exec -i "${POSTGRES_CONTAINER_ID}"
+          psql -U postgres -d postgres
+          < services/api/tests/postgresql/bootstrap_roles.sql
+      - name: Apply package-owned migration and verify current head
+        env:
+          MYRETAIL_STATE_MIGRATION_DATABASE_URL: postgresql+asyncpg://myretail_state_migrator@127.0.0.1:5432/myretail_state_test
+        run: |
+          myretail-state-migrate upgrade head
+          test "$(myretail-state-migrate current)" = "20260716_01 (head)"
+      - name: Verify migrations ship inside the wheel
+        run: |
+          python -m pip wheel --no-deps --no-build-isolation services/api --wheel-dir dist
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          wheel = next(Path("dist").glob("myretail_api-*.whl"))
+          with ZipFile(wheel) as archive:
+              files = set(archive.namelist())
+          required = {
+              "myretail_api/migrations/env.py",
+              "myretail_api/migrations/script.py.mako",
+              "myretail_api/migrations/versions/v20260716_01_state_foundation.py",
+          }
+          missing = required - files
+          if missing:
+              raise SystemExit(f"Migration artifact is incomplete: {sorted(missing)}")
+          PY
+      - name: Run PostgreSQL foundation acceptance
+        env:
+          MYRETAIL_TEST_POSTGRES_APP_URL: postgresql+asyncpg://myretail_api@127.0.0.1:5432/myretail_state_test
+          MYRETAIL_TEST_POSTGRES_ADMIN_URL: postgresql://postgres@127.0.0.1:5432/myretail_state_test
+          MYRETAIL_TEST_POSTGRES_UNMIGRATED_APP_URL: postgresql+asyncpg://myretail_api@127.0.0.1:5432/myretail_state_unmigrated_test
+          MYRETAIL_TEST_POSTGRES_UNMIGRATED_ADMIN_URL: postgresql://postgres@127.0.0.1:5432/myretail_state_unmigrated_test
+        run: python -m pytest services/api/tests/test_postgresql_foundation.py

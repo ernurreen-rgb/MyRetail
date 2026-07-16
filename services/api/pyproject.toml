@@ -8,17 +8,25 @@ version = "0.1.0"
 description = "MyRetail API gateway"
 requires-python = ">=3.11"
 dependencies = [
+    "SQLAlchemy==2.0.51",
+    "asyncpg==0.31.0",
     "fastapi==0.138.0",
     "httpx==0.28.1",
     "pydantic-settings==2.14.2",
     "uvicorn[standard]==0.49.0",
 ]
 
+[project.scripts]
+myretail-state-migrate = "myretail_api.migrations.cli:main"
+
 [project.optional-dependencies]
 dev = [
     "bandit==1.9.4",
     "pytest==9.1.1",
     "ruff==0.15.18",
+]
+migrations = [
+    "alembic==1.18.5",
 ]
 supply-chain = [
     "cyclonedx-bom==7.3.0",

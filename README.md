@@ -41,8 +41,11 @@ is cross-platform and hash-verified, while the application locks target Linux x8
 - `services/api/requirements-bootstrap.lock` contains pip, setuptools, wheel, Hatchling, and their
   exact build dependencies for local Windows setup;
 - `services/api/requirements.lock` contains the hash-locked runtime dependency graph;
+- `services/api/requirements-migrations.lock` contains the runtime graph plus the migration-only
+  Alembic toolchain;
 - `services/api/requirements-dev.lock` also contains test, build, and supply-chain tooling;
 - `services/api/sbom.cdx.json` is the reproducible CycloneDX runtime SBOM.
+- `services/api/sbom-migrations.cdx.json` is the separate reproducible migration artifact SBOM.
 
 CI installs the development lock with `--require-hashes`, installs the local API package with
 `--no-deps --no-build-isolation`, and blocks lock or SBOM drift. A future production API image

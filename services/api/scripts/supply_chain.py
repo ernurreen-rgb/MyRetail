@@ -25,8 +25,10 @@ PYPROJECT = API_DIR / "pyproject.toml"
 BOOTSTRAP_INPUT = API_DIR / "requirements-bootstrap.in"
 BOOTSTRAP_LOCK = API_DIR / "requirements-bootstrap.lock"
 RUNTIME_LOCK = API_DIR / "requirements.lock"
+MIGRATION_LOCK = API_DIR / "requirements-migrations.lock"
 DEV_LOCK = API_DIR / "requirements-dev.lock"
 SBOM = API_DIR / "sbom.cdx.json"
+MIGRATION_SBOM = API_DIR / "sbom-migrations.cdx.json"
 LOCK_REQUIREMENT = re.compile(r"^([A-Za-z0-9][A-Za-z0-9_.-]*)==([^\\\s]+)")
 
 
@@ -168,7 +170,10 @@ def marker_applies(requirement: Requirement, active_extras: set[str]) -> bool:
 
 
 def dependency_graph(
-    runtime_lock: Path, metadata_path: Path
+    runtime_lock: Path,
+    metadata_path: Path,
+    *,
+    root_extras: tuple[str, ...] = (),
 ) -> tuple[set[str], dict[str, set[str]]]:
     locked_versions = read_locked_versions(runtime_lock)
     distributions = {
@@ -197,9 +202,12 @@ def dependency_graph(
 
     root_dependencies: set[str] = set()
     active_extras: defaultdict[str, set[str]] = defaultdict(set)
-    for dependency in project["dependencies"]:
+    root_requirements = list(project["dependencies"])
+    for extra in root_extras:
+        root_requirements.extend(project["optional-dependencies"][extra])
+    for dependency in root_requirements:
         requirement = Requirement(dependency)
-        if marker_applies(requirement, set()):
+        if marker_applies(requirement, set(root_extras)):
             name = canonicalize_name(requirement.name)
             root_dependencies.add(name)
             active_extras[name].update(requirement.extras)
@@ -234,6 +242,8 @@ def complete_and_validate_sbom(
     destination: Path,
     runtime_lock: Path,
     metadata_path: Path,
+    *,
+    root_extras: tuple[str, ...] = (),
 ) -> None:
     document = json.loads(destination.read_text(encoding="utf-8"))
     component_refs = {
@@ -241,7 +251,11 @@ def complete_and_validate_sbom(
         for component in document["components"]
     }
     root_ref = document["metadata"]["component"]["bom-ref"]
-    root_dependencies, graph = dependency_graph(runtime_lock, metadata_path)
+    root_dependencies, graph = dependency_graph(
+        runtime_lock,
+        metadata_path,
+        root_extras=root_extras,
+    )
 
     locked_names = set(read_locked_versions(runtime_lock))
     if set(component_refs) != locked_names:
@@ -274,7 +288,13 @@ def complete_and_validate_sbom(
     destination.write_text(serialized, encoding="utf-8", newline="\n")
 
 
-def generate_sbom(runtime_lock: Path, destination: Path, metadata_path: Path) -> None:
+def generate_sbom(
+    runtime_lock: Path,
+    destination: Path,
+    metadata_path: Path,
+    *,
+    root_extras: tuple[str, ...] = (),
+) -> None:
     install_runtime_metadata(runtime_lock, metadata_path)
     run(
         [
@@ -299,7 +319,12 @@ def generate_sbom(runtime_lock: Path, destination: Path, metadata_path: Path) ->
             "--validate",
         ]
     )
-    complete_and_validate_sbom(destination, runtime_lock, metadata_path)
+    complete_and_validate_sbom(
+        destination,
+        runtime_lock,
+        metadata_path,
+        root_extras=root_extras,
+    )
 
 
 def diff_artifact(expected: Path, generated: Path) -> bool:
@@ -349,9 +374,12 @@ def main() -> int:
         temporary_dir = Path(temporary)
         bootstrap_lock = temporary_dir / BOOTSTRAP_LOCK.name
         runtime_lock = temporary_dir / RUNTIME_LOCK.name
+        migration_lock = temporary_dir / MIGRATION_LOCK.name
         dev_lock = temporary_dir / DEV_LOCK.name
         sbom = temporary_dir / SBOM.name
+        migration_sbom = temporary_dir / MIGRATION_SBOM.name
         runtime_metadata = temporary_dir / "runtime-site-packages"
+        migration_metadata = temporary_dir / "migration-site-packages"
 
         compile_lock(
             bootstrap_lock,
@@ -361,33 +389,50 @@ def main() -> int:
         )
         compile_lock(runtime_lock, RUNTIME_LOCK, upgrade=args.upgrade)
         compile_lock(
+            migration_lock,
+            MIGRATION_LOCK,
+            extras=("migrations",),
+            upgrade=args.upgrade,
+        )
+        compile_lock(
             dev_lock,
             DEV_LOCK,
-            extras=("dev", "supply-chain"),
+            extras=("dev", "migrations", "supply-chain"),
             include_editable_build_deps=True,
             upgrade=args.upgrade,
         )
         ensure_bootstrap_matches_dev(bootstrap_lock, dev_lock)
         generate_sbom(runtime_lock, sbom, runtime_metadata)
+        generate_sbom(
+            migration_lock,
+            migration_sbom,
+            migration_metadata,
+            root_extras=("migrations",),
+        )
 
         generated = (
             (BOOTSTRAP_LOCK, bootstrap_lock),
             (RUNTIME_LOCK, runtime_lock),
+            (MIGRATION_LOCK, migration_lock),
             (DEV_LOCK, dev_lock),
             (SBOM, sbom),
+            (MIGRATION_SBOM, migration_sbom),
         )
         if args.write:
             for destination, source in generated:
                 shutil.copyfile(source, destination)
             print(
-                "Updated requirements-bootstrap.lock, requirements.lock, "
-                "requirements-dev.lock, and sbom.cdx.json."
+                "Updated bootstrap, runtime, migration, and development locks plus "
+                "runtime and migration CycloneDX SBOMs."
             )
             return 0
 
         artifacts_match = [diff_artifact(expected, actual) for expected, actual in generated]
         if all(artifacts_match):
-            print("Python bootstrap/runtime/dev locks and CycloneDX SBOM are current.")
+            print(
+                "Python bootstrap/runtime/migration/dev locks and both CycloneDX "
+                "SBOMs are current."
+            )
             return 0
         return 1
 
