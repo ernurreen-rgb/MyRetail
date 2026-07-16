@@ -295,6 +295,18 @@ class DelayedRecoverySaleERPNextClient(StubPOSErpnextClient):
         return None
 
 
+class BlockingSaleBeforeCommitERPNextClient(StubPOSErpnextClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.submit_started = asyncio.Event()
+        self.release_submit = asyncio.Event()
+
+    async def create_pos_sales_invoice(self, **kwargs: object) -> str:
+        self.submit_started.set()
+        await self.release_submit.wait()
+        return await super().create_pos_sales_invoice(**kwargs)
+
+
 class BlockingCommittedSaleERPNextClient(StubPOSErpnextClient):
     def __init__(self) -> None:
         super().__init__()
@@ -933,7 +945,7 @@ async def test_sale_rejects_cash_discount_and_stock_conflicts(tmp_path: Path) ->
 
 @pytest.mark.anyio
 async def test_concurrent_last_unit_returns_one_success_and_one_conflict(tmp_path: Path) -> None:
-    erpnext = StubPOSErpnextClient()
+    erpnext = BlockingSaleBeforeCommitERPNextClient()
     app = make_app(erpnext, tmp_path)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
@@ -953,9 +965,15 @@ async def test_concurrent_last_unit_returns_one_success_and_one_conflict(tmp_pat
                 },
             )
 
-        responses = await asyncio.gather(sell_once(), sell_once())
+        first_task = asyncio.create_task(sell_once())
+        try:
+            await asyncio.wait_for(erpnext.submit_started.wait(), timeout=2)
+            second = await sell_once()
+        finally:
+            erpnext.release_submit.set()
+        first = await asyncio.wait_for(first_task, timeout=2)
 
-    statuses = sorted(response.status_code for response in responses)
+    statuses = sorted((first.status_code, second.status_code))
     assert statuses == [201, 409]
     assert erpnext.products["LAST"].available == "0.000"
     assert len(erpnext.sales) == 1
