@@ -2,9 +2,9 @@ STATE_SCHEMA = "myretail_state"
 STATE_APP_ROLE = "myretail_api"
 STATE_MIGRATOR_ROLE = "myretail_state_migrator"
 STATE_OWNER_ROLE = "myretail_state_owner"
-EXPECTED_STATE_SCHEMA_REVISION = "20260716_02"
+EXPECTED_STATE_SCHEMA_REVISION = "20260716_03"
 
-TENANT_STATE_TABLES = (
+MUTABLE_TENANT_STATE_TABLES = (
     "rls_canary",
     "idempotency_records",
     "idempotency_aliases",
@@ -13,6 +13,16 @@ TENANT_STATE_TABLES = (
     "pos_held_receipts",
     "pos_sales",
     "pos_returns",
+)
+
+APPEND_ONLY_TENANT_STATE_TABLES = (
+    "workflow_intent_aliases",
+    "pos_shift_cash_events",
+)
+
+TENANT_STATE_TABLES = (
+    *MUTABLE_TENANT_STATE_TABLES,
+    *APPEND_ONLY_TENANT_STATE_TABLES,
 )
 
 PREAUTH_STATE_TABLES = (

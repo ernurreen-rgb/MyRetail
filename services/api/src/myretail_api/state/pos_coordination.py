@@ -219,6 +219,50 @@ class SQLitePOSCoordinationRepository:
             else None
         )
 
+    async def attach_alias(
+        self,
+        *,
+        tenant_id: str,
+        operation: str,
+        principal_key: str,
+        idempotency_key: str,
+        intent_id: str,
+        business_hash: str,
+    ) -> WorkflowIntent:
+        row = await self._call(
+            self._store.attach_operation_intent_alias,
+            tenant=tenant_id,
+            operation=operation,
+            user_email=principal_key,
+            key=idempotency_key,
+            intent_id=intent_id,
+            business_hash=business_hash,
+        )
+        return _legacy_workflow_intent(row, owner_id=self._owner_id)
+
+    async def find_by_alias(
+        self,
+        *,
+        tenant_id: str,
+        operation: str,
+        principal_key: str,
+        idempotency_key: str,
+        business_hash: str,
+    ) -> WorkflowIntent | None:
+        row = await self._call(
+            self._store.find_operation_intent_by_alias,
+            tenant=tenant_id,
+            operation=operation,
+            user_email=principal_key,
+            key=idempotency_key,
+            business_hash=business_hash,
+        )
+        return (
+            _legacy_workflow_intent(row, owner_id=self._owner_id)
+            if row is not None
+            else None
+        )
+
     async def claim(
         self,
         *,
@@ -778,6 +822,110 @@ class PostgresPOSCoordinationRepository:
                 await transaction.rollback()
         return _workflow_intent(row) if row is not None else None
 
+    async def attach_alias(
+        self,
+        *,
+        tenant_id: str,
+        operation: str,
+        principal_key: str,
+        idempotency_key: str,
+        intent_id: str,
+        business_hash: str,
+    ) -> WorkflowIntent:
+        async with self._engine.begin() as connection:
+            await _set_tenant(connection, tenant_id)
+            await _advisory_locks(
+                connection,
+                "workflow:alias:"
+                f"{tenant_id}:{operation}:{principal_key}:{idempotency_key}",
+            )
+            intent = await _find_workflow(
+                connection,
+                tenant_id=tenant_id,
+                intent_id=intent_id,
+                for_update=False,
+            )
+            if intent is None or not (
+                intent["operation"] == operation
+                and intent["principal_key"] == principal_key
+                and intent["business_hash"] == business_hash
+            ):
+                raise POSStoreConflictError(
+                    "IDEMPOTENCY_CONFLICT",
+                    "Operation alias does not match its canonical intent",
+                )
+            await connection.execute(
+                text(
+                    """
+                    INSERT INTO myretail_state.workflow_intent_aliases (
+                        tenant_id, operation, principal_key, idempotency_key,
+                        intent_id, business_hash
+                    ) VALUES (
+                        :tenant_id, :operation, :principal_key, :idempotency_key,
+                        CAST(:intent_id AS uuid), :business_hash
+                    )
+                    ON CONFLICT (
+                        tenant_id, operation, principal_key, idempotency_key
+                    ) DO NOTHING
+                    """
+                ),
+                {
+                    "tenant_id": tenant_id,
+                    "operation": operation,
+                    "principal_key": principal_key,
+                    "idempotency_key": idempotency_key,
+                    "intent_id": intent_id,
+                    "business_hash": business_hash,
+                },
+            )
+            alias = await _find_workflow_alias(
+                connection,
+                tenant_id=tenant_id,
+                operation=operation,
+                principal_key=principal_key,
+                idempotency_key=idempotency_key,
+            )
+            if alias is None or not (
+                str(alias["intent_id"]) == intent_id
+                and alias["alias_business_hash"] == business_hash
+            ):
+                raise POSStoreConflictError(
+                    "IDEMPOTENCY_CONFLICT",
+                    "Idempotency alias is already bound to another operation",
+                )
+        return _workflow_intent(alias)
+
+    async def find_by_alias(
+        self,
+        *,
+        tenant_id: str,
+        operation: str,
+        principal_key: str,
+        idempotency_key: str,
+        business_hash: str,
+    ) -> WorkflowIntent | None:
+        async with self._engine.connect() as connection:
+            transaction = await connection.begin()
+            try:
+                await _set_tenant(connection, tenant_id)
+                row = await _find_workflow_alias(
+                    connection,
+                    tenant_id=tenant_id,
+                    operation=operation,
+                    principal_key=principal_key,
+                    idempotency_key=idempotency_key,
+                )
+            finally:
+                await transaction.rollback()
+        if row is None:
+            return None
+        if row["alias_business_hash"] != business_hash:
+            raise POSStoreConflictError(
+                "IDEMPOTENCY_CONFLICT",
+                "Idempotency key reused with another body",
+            )
+        return _workflow_intent(row)
+
     async def claim(
         self,
         *,
@@ -1239,6 +1387,42 @@ async def _find_workflow(
     result = await connection.execute(
         text(statement),
         {"tenant_id": tenant_id, "intent_id": intent_id},
+    )
+    return result.mappings().one_or_none()
+
+
+async def _find_workflow_alias(
+    connection: AsyncConnection,
+    *,
+    tenant_id: str,
+    operation: str,
+    principal_key: str,
+    idempotency_key: str,
+) -> Mapping[str, Any] | None:
+    result = await connection.execute(
+        text(
+            """
+            SELECT intent.*,
+                   alias.business_hash AS alias_business_hash,
+                   COALESCE(
+                       intent.lease_until <= clock_timestamp(), true
+                   ) AS lease_expired
+            FROM myretail_state.workflow_intent_aliases AS alias
+            JOIN myretail_state.workflow_intents AS intent
+              ON intent.tenant_id = alias.tenant_id
+             AND intent.intent_id = alias.intent_id
+            WHERE alias.tenant_id = :tenant_id
+              AND alias.operation = :operation
+              AND alias.principal_key = :principal_key
+              AND alias.idempotency_key = :idempotency_key
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "operation": operation,
+            "principal_key": principal_key,
+            "idempotency_key": idempotency_key,
+        },
     )
     return result.mappings().one_or_none()
 

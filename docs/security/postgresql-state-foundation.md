@@ -80,10 +80,12 @@ CI использует disposable PostgreSQL container с host `trust` толь
 
 ## Phase 6A.6 acceptance
 
-Текущий package-owned head — `20260716_02`. Startup дополнительно проверяет отсутствие
+Текущий package-owned head — `20260716_03`. Startup дополнительно проверяет отсутствие
 role memberships у `myretail_api`, точный owner schema/tables, точный table inventory и
-отсутствие elevated table grants. CI выполняет полный `upgrade → downgrade base → upgrade`
-round-trip и автоматическую сверку утверждённого OpenAPI fingerprint.
+отсутствие elevated table grants. Immutable `workflow_intent_aliases` и
+`pos_shift_cash_events` имеют только `SELECT/INSERT`; остальные tenant tables сохраняют
+необходимый DML. CI выполняет полный `upgrade → downgrade base → upgrade` round-trip и
+автоматическую сверку утверждённого OpenAPI fingerprint.
 
 Полная матрица evidence и граница Phase 6B описаны в
 `docs/security/postgresql-foundation-acceptance.md`. Production остаётся fail closed.

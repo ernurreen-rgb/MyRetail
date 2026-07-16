@@ -7,6 +7,13 @@ from uuid import UUID
 from myretail_api.idempotency import IdempotencyBeginResult, IdempotencyRecord
 
 JsonObject: TypeAlias = Mapping[str, Any]
+CashEventSourceType: TypeAlias = Literal["shift", "sale", "return"]
+CashEventEffectKind: TypeAlias = Literal[
+    "opening",
+    "sale",
+    "return",
+    "return_cancel",
+]
 IntentState: TypeAlias = Literal[
     "reserved",
     "erp_pending",
@@ -45,6 +52,24 @@ class WorkflowIntentClaim:
     acquired: bool
     intent: WorkflowIntent
     recovery_only: bool = False
+
+
+@dataclass(frozen=True)
+class POSCashEvent:
+    event_id: UUID
+    tenant_id: str
+    shift_id: str
+    source_type: CashEventSourceType
+    source_id: str
+    effect_kind: CashEventEffectKind
+    amount_delta: str
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class POSCashEventAppendResult:
+    created: bool
+    event: POSCashEvent
 
 
 @dataclass(frozen=True)
@@ -194,6 +219,27 @@ class WorkflowIntentRepository(Protocol):
         business_hash: str,
     ) -> WorkflowIntent | None: ...
 
+    async def attach_alias(
+        self,
+        *,
+        tenant_id: str,
+        operation: str,
+        principal_key: str,
+        idempotency_key: str,
+        intent_id: str,
+        business_hash: str,
+    ) -> WorkflowIntent: ...
+
+    async def find_by_alias(
+        self,
+        *,
+        tenant_id: str,
+        operation: str,
+        principal_key: str,
+        idempotency_key: str,
+        business_hash: str,
+    ) -> WorkflowIntent | None: ...
+
     async def claim(
         self,
         *,
@@ -263,6 +309,28 @@ class POSProjectionRepository(Protocol):
         projection_id: str,
         row: JsonObject,
     ) -> bool: ...
+
+
+class POSCashEventRepository(Protocol):
+    async def append_cash_event(
+        self,
+        *,
+        event_id: UUID,
+        tenant_id: str,
+        shift_id: str,
+        source_type: CashEventSourceType,
+        source_id: str,
+        effect_kind: CashEventEffectKind,
+        amount_delta: str,
+        created_at: datetime,
+    ) -> POSCashEventAppendResult: ...
+
+    async def list_cash_events(
+        self,
+        *,
+        tenant_id: str,
+        shift_id: str,
+    ) -> Sequence[POSCashEvent]: ...
 
 
 class LoginRateLimitRepository(Protocol):

@@ -149,6 +149,72 @@ async def assert_workflow_contract(
     assert not reserved.recovery_only
     assert reserved.intent.lease is not None
 
+    alias_key = str(uuid4())
+    aliased = await repository.attach_alias(
+        tenant_id=tenant_id,
+        operation="create_sale",
+        principal_key="cashier@example.test",
+        idempotency_key=alias_key,
+        intent_id=reserved.intent.intent_id,
+        business_hash=business_hash,
+    )
+    assert aliased.intent_id == reserved.intent.intent_id
+    attached_replay = await repository.attach_alias(
+        tenant_id=tenant_id,
+        operation="create_sale",
+        principal_key="cashier@example.test",
+        idempotency_key=alias_key,
+        intent_id=reserved.intent.intent_id,
+        business_hash=business_hash,
+    )
+    assert attached_replay.intent_id == reserved.intent.intent_id
+    alias_replay = await repository.find_by_alias(
+        tenant_id=tenant_id,
+        operation="create_sale",
+        principal_key="cashier@example.test",
+        idempotency_key=alias_key,
+        business_hash=business_hash,
+    )
+    assert alias_replay is not None
+    assert alias_replay.intent_id == reserved.intent.intent_id
+    with pytest.raises(POSStoreConflictError) as alias_conflict:
+        await repository.find_by_alias(
+            tenant_id=tenant_id,
+            operation="create_sale",
+            principal_key="cashier@example.test",
+            idempotency_key=alias_key,
+            business_hash=f"different-{uuid4()}",
+        )
+    assert alias_conflict.value.code == "IDEMPOTENCY_CONFLICT"
+
+    other_hash = f"hash-{uuid4()}"
+    other_intent = await repository.reserve(
+        tenant_id=tenant_id,
+        operation="create_sale",
+        scope_key=f"shift:{uuid4()}",
+        principal_key="cashier@example.test",
+        business_hash=other_hash,
+        external_marker=f"marker-{uuid4()}",
+        payload={"sale": {"id": "SALE-2"}},
+    )
+    assert other_intent.acquired
+    assert other_intent.intent.lease is not None
+    with pytest.raises(POSStoreConflictError) as alias_rebind_conflict:
+        await repository.attach_alias(
+            tenant_id=tenant_id,
+            operation="create_sale",
+            principal_key="cashier@example.test",
+            idempotency_key=alias_key,
+            intent_id=other_intent.intent.intent_id,
+            business_hash=other_hash,
+        )
+    assert alias_rebind_conflict.value.code == "IDEMPOTENCY_CONFLICT"
+    assert await repository.fail(
+        tenant_id=tenant_id,
+        intent_id=other_intent.intent.intent_id,
+        lease=other_intent.intent.lease,
+    )
+
     duplicate = await repository.reserve(
         tenant_id=tenant_id,
         operation="create_sale",
@@ -488,6 +554,34 @@ async def test_postgresql_scope_fencing_and_tenant_isolation_between_pools() -> 
         assert not waiting.acquired
         assert acquired.intent.intent_id == waiting.intent.intent_id
         assert acquired.intent.lease is not None
+        alias_key = str(uuid4())
+        first_alias, second_alias = await asyncio.gather(
+            first.attach_alias(
+                tenant_id=tenant_id,
+                operation="create_sale",
+                principal_key="cashier@example.test",
+                idempotency_key=alias_key,
+                intent_id=acquired.intent.intent_id,
+                business_hash=business_hash,
+            ),
+            second.attach_alias(
+                tenant_id=tenant_id,
+                operation="create_sale",
+                principal_key="cashier@example.test",
+                idempotency_key=alias_key,
+                intent_id=acquired.intent.intent_id,
+                business_hash=business_hash,
+            ),
+        )
+        assert first_alias.intent_id == acquired.intent.intent_id
+        assert second_alias.intent_id == acquired.intent.intent_id
+        assert await second.find_by_alias(
+            tenant_id=other_tenant,
+            operation="create_sale",
+            principal_key="cashier@example.test",
+            idempotency_key=alias_key,
+            business_hash=business_hash,
+        ) is None
         acquired_repository = first if owner.acquired else second
         takeover_repository = second if owner.acquired else first
         assert await acquired_repository.mark_recovery_required(
