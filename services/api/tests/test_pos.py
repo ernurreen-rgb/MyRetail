@@ -1272,6 +1272,132 @@ async def test_committed_close_recovers_from_projection_drift_with_frozen_snapsh
 
 
 @pytest.mark.anyio
+async def test_legacy_reserved_close_without_snapshot_never_creates_erp_closing(
+    tmp_path: Path,
+) -> None:
+    erpnext = StubPOSErpnextClient()
+    app = make_app(erpnext, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        shift = await open_shift(client, tmp_path)
+        body = {
+            "actual_cash": "10000.00",
+            "expected_updated_at": shift["updated_at"],
+        }
+        request_payload = {
+            "shift_id": shift["id"],
+            **ShiftCloseRequest(**body).model_dump(mode="json"),
+        }
+        legacy = POSStore(tmp_path / "pos.sqlite3").begin_operation_intent(
+            tenant="myretail",
+            operation="close_shift",
+            scope_id=f"shift:{shift['id']}",
+            user_email="cashier@example.kz",
+            business_hash=_request_hash("close_shift", request_payload),
+            external_key="legacy-close-without-snapshot",
+            payload={
+                "close": {
+                    "tenant": "myretail",
+                    "shift_id": shift["id"],
+                    "cashier_email": "cashier@example.kz",
+                    "expected_updated_at": shift["updated_at"],
+                    "actual_cash": "10000.00",
+                    "difference": "0.00",
+                    "closed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                }
+            },
+            expected_shift_updated_at=shift["updated_at"],
+            require_no_held_receipts=True,
+            lease_seconds=-1,
+        )
+        response = await client.post(
+            f"/pos/shifts/{shift['id']}/close",
+            headers=auth_headers(tmp_path, key=str(uuid4())),
+            json=body,
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "ERPNEXT_RECOVERY_PENDING"
+    assert erpnext.closings == []
+    with sqlite3.connect(tmp_path / "pos.sqlite3") as connection:
+        projected = connection.execute(
+            "SELECT status, erpnext_closing_id FROM pos_shifts WHERE id = ?",
+            (shift["id"],),
+        ).fetchone()
+        intent = connection.execute(
+            "SELECT state, fencing_token FROM pos_operation_intents WHERE id = ?",
+            (legacy.intent["id"],),
+        ).fetchone()
+    assert projected == ("open", None)
+    assert intent == ("recovery_required", 2)
+
+
+@pytest.mark.anyio
+async def test_legacy_pending_close_recovers_existing_erp_closing_without_snapshot(
+    tmp_path: Path,
+) -> None:
+    erpnext = RecoveringCloseERPNextClient()
+    app = make_app(erpnext, tmp_path)
+    store = POSStore(tmp_path / "pos.sqlite3")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        shift = await open_shift(client, tmp_path)
+        body = {
+            "actual_cash": "10000.00",
+            "expected_updated_at": shift["updated_at"],
+        }
+        request_payload = {
+            "shift_id": shift["id"],
+            **ShiftCloseRequest(**body).model_dump(mode="json"),
+        }
+        legacy = store.begin_operation_intent(
+            tenant="myretail",
+            operation="close_shift",
+            scope_id=f"shift:{shift['id']}",
+            user_email="cashier@example.kz",
+            business_hash=_request_hash("close_shift", request_payload),
+            external_key="legacy-pending-close",
+            payload={
+                "close": {
+                    "tenant": "myretail",
+                    "shift_id": shift["id"],
+                    "cashier_email": "cashier@example.kz",
+                    "expected_updated_at": shift["updated_at"],
+                    "actual_cash": "10000.00",
+                    "difference": "0.00",
+                    "closed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                }
+            },
+        )
+        token = int(legacy.intent["fencing_token"])
+        assert store.mark_operation_erp_pending(str(legacy.intent["id"]), token)
+        assert store.mark_operation_recovery_required(str(legacy.intent["id"]), token)
+        response = await client.post(
+            f"/pos/shifts/{shift['id']}/close",
+            headers=auth_headers(tmp_path, key=str(uuid4())),
+            json=body,
+        )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "closed"
+    assert erpnext.closings == []
+    with sqlite3.connect(tmp_path / "pos.sqlite3") as connection:
+        projected = connection.execute(
+            "SELECT status, erpnext_closing_id FROM pos_shifts WHERE id = ?",
+            (shift["id"],),
+        ).fetchone()
+        intent = connection.execute(
+            "SELECT state, erpnext_document_id, fencing_token "
+            "FROM pos_operation_intents WHERE id = ?",
+            (legacy.intent["id"],),
+        ).fetchone()
+    assert projected == ("closed", "CLOSE-RECOVERED")
+    assert intent == ("completed", "CLOSE-RECOVERED", 2)
+
+
+@pytest.mark.anyio
 async def test_sale_timeout_retry_with_new_key_recovers_without_second_invoice(
     tmp_path: Path,
 ) -> None:
