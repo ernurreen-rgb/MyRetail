@@ -39,7 +39,11 @@ from myretail_api.models.stock import (
 from myretail_api.routers import stock as stock_router_module
 from myretail_api.security import create_access_token
 from myretail_api.state.idempotency import SQLiteIdempotencyRepository
-from myretail_api.state.sessions import SQLiteSessionRepository
+from myretail_api.state.protocols import AuthSession
+from myretail_api.state.sessions import (
+    PostgresSessionRepository,
+    SQLiteSessionRepository,
+)
 from myretail_api.tenancy import build_isolated_tenant_route
 
 POSTGRES_APP_DATABASE_URL = os.environ.get("MYRETAIL_TEST_POSTGRES_APP_URL", "")
@@ -522,17 +526,19 @@ def auth_headers(
     header_tenant: str = "myretail",
     roles: list[str] | None = None,
     idempotency_key: str | None = None,
+    session: AuthSession | None = None,
 ) -> dict[str, str]:
     token_settings = make_test_settings(tmp_path)
     token_settings.tenant_slug = tenant
-    session = SQLiteSessionRepository(
-        token_settings.auth_session_db_path
-    ).issue_session_sync(
-        tenant_id=tenant,
-        email="damir@example.com",
-        route_version=token_settings.tenant_route_version,
-        ttl_seconds=token_settings.auth_token_ttl_seconds,
-    )
+    if session is None:
+        session = SQLiteSessionRepository(
+            token_settings.auth_session_db_path
+        ).issue_session_sync(
+            tenant_id=tenant,
+            email="damir@example.com",
+            route_version=token_settings.tenant_route_version,
+            ttl_seconds=token_settings.auth_token_ttl_seconds,
+        )
     token, _ = create_access_token(
         route=build_isolated_tenant_route(token_settings),
         user=AuthenticatedUser(
@@ -859,6 +865,13 @@ async def test_postgresql_two_api_pools_cancel_with_one_reversal(tmp_path: Path)
             base_url="http://second-postgresql-api",
         ) as second_client,
     ):
+        assert isinstance(first_app.state.session_repository, PostgresSessionRepository)
+        session = await first_app.state.session_repository.issue_session(
+            tenant_id=tenant,
+            email="damir@example.com",
+            route_version=first_app.state.tenant_route_snapshot.route_version,
+            ttl_seconds=first_app.state.tenant_route_snapshot.auth_token_ttl_seconds,
+        )
         created = await first_client.post(
             "/stock/movements",
             headers=auth_headers(
@@ -866,6 +879,7 @@ async def test_postgresql_two_api_pools_cancel_with_one_reversal(tmp_path: Path)
                 tenant=tenant,
                 header_tenant=tenant,
                 idempotency_key=str(uuid4()),
+                session=session,
             ),
             json={
                 "type": "receipt",
@@ -882,6 +896,7 @@ async def test_postgresql_two_api_pools_cancel_with_one_reversal(tmp_path: Path)
                     tenant=tenant,
                     header_tenant=tenant,
                     idempotency_key=str(uuid4()),
+                    session=session,
                 ),
                 json={"reason": "Wrong receipt"},
             )
@@ -895,6 +910,7 @@ async def test_postgresql_two_api_pools_cancel_with_one_reversal(tmp_path: Path)
                     tenant=tenant,
                     header_tenant=tenant,
                     idempotency_key=str(uuid4()),
+                    session=session,
                 ),
                 json={"reason": "Wrong receipt"},
             )
