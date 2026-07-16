@@ -5,8 +5,8 @@ from fastapi import Depends, Header, HTTPException, Request, status
 from myretail_api.clients.erpnext import ERPNextClient, ERPNextConfigurationError
 from myretail_api.config import Settings, get_settings
 from myretail_api.models.auth import TenantContext
-from myretail_api.pos_store import POSStore
 from myretail_api.security import AuthConfigurationError, TokenValidationError, parse_access_token
+from myretail_api.state.pos_repository import POSStateRepository
 from myretail_api.state.protocols import IdempotencyRepository
 
 
@@ -42,8 +42,14 @@ def _shared_idempotency_repository(request: Request) -> IdempotencyRepository:
     return repository
 
 
-def get_pos_store(settings: Annotated[Settings, Depends(get_settings)]) -> POSStore:
-    return POSStore(settings.pos_db_path)
+def get_pos_store(request: Request) -> POSStateRepository:
+    repository = getattr(request.app.state, "pos_state_repository", None)
+    if repository is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="POS state is not ready",
+        )
+    return repository
 
 
 def require_tenant_context(
