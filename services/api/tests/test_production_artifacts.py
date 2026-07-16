@@ -113,7 +113,13 @@ def test_drill_separates_application_and_migration_environments() -> None:
     assert "MYRETAIL_STATE_DATABASE_URL" not in migration
     assert application["MYRETAIL_STATE_PRODUCTION_ENABLEMENT"] == "controlled"
     assert application["MYRETAIL_STATE_POSTGRES_SSL_MODE"] == "verify-full"
+    assert application["MYRETAIL_TENANCY_MODE"] == "isolated_site"
+    assert application["MYRETAIL_TENANT_ID"] == drill.ISOLATED_TENANT_ID
+    assert application["MYRETAIL_TENANT_SLUG"] == drill.SENTINEL_TENANT
+    assert application["MYRETAIL_TENANT_ROUTE_VERSION"] == "1"
+    assert application["MYRETAIL_ERPNEXT_BASE_URL"].startswith("https://")
     assert migration["MYRETAIL_STATE_MIGRATION_SSL_MODE"] == "verify-full"
+    assert len(application["MYRETAIL_AUTH_SECRET"].encode()) >= 32
     assert len(application["MYRETAIL_AUTH_RATE_LIMIT_SECRET"].encode()) >= 32
 
 

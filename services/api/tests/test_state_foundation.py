@@ -1,4 +1,5 @@
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 from pydantic import SecretStr
@@ -156,6 +157,18 @@ def test_client_ip_proxy_policy_fails_closed_on_ambiguous_config(
 def production_postgresql_settings(**overrides: object) -> Settings:
     values: dict[str, object] = {
         "environment": "production",
+        "tenancy_mode": "isolated_site",
+        "tenant_id": UUID("018f76c8-bef9-7b89-8c55-72152d8bcf2a"),
+        "tenant_slug": "myretail-production",
+        "tenant_route_version": 1,
+        "auth_issuer": "https://api.myretail.example",
+        "auth_audience": "myretail-production",
+        "auth_secret": SecretStr(
+            "production-auth-secret-that-is-at-least-32-bytes"
+        ),
+        "erpnext_base_url": "https://erp.myretail.example",
+        "erpnext_api_key": SecretStr("production-erp-key"),
+        "erpnext_api_secret": SecretStr("production-erp-secret"),
         "state_backend": "postgresql",
         "state_database_url": SecretStr(
             "postgresql+asyncpg://myretail_api@db.internal/state"

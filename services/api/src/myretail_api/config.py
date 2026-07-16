@@ -3,9 +3,12 @@ from ipaddress import ip_network
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from myretail_api.tenancy import LOCAL_DEVELOPMENT_TENANT_ID
 
 API_ROOT = Path(__file__).resolve().parents[2]
 
@@ -32,8 +35,13 @@ class POSCashierAssignment(BaseModel):
 class Settings(BaseSettings):
     environment: Literal["development", "test", "production"] = "development"
     log_level: str = "INFO"
+    tenancy_mode: Literal["isolated_site"] = "isolated_site"
+    tenant_id: UUID = LOCAL_DEVELOPMENT_TENANT_ID
     tenant_slug: str = "myretail"
+    tenant_route_version: int = Field(default=1, ge=1)
     auth_secret: SecretStr | None = None
+    auth_issuer: str = "myretail-api"
+    auth_audience: str = "myretail"
     auth_token_ttl_seconds: int = Field(default=3600, gt=0, le=86_400)
     auth_rate_limit_attempts: int = Field(default=5, ge=1, le=100)
     auth_rate_limit_client_attempts: int = Field(default=50, ge=1, le=10_000)
@@ -43,7 +51,9 @@ class Settings(BaseSettings):
     auth_rate_limit_secret: SecretStr | None = None
     auth_client_ip_mode: Literal["direct", "trusted_proxy"] = "direct"
     auth_trusted_proxy_cidrs: list[str] = Field(default_factory=list)
-    erpnext_base_url: str = "http://myretail.localhost:8080"
+    erpnext_base_url: str = Field(
+        default="http://myretail.localhost:8080", repr=False
+    )
     erpnext_api_key: SecretStr | None = None
     erpnext_api_secret: SecretStr | None = None
     erpnext_timeout_seconds: float = 10.0
@@ -53,7 +63,9 @@ class Settings(BaseSettings):
     erpnext_api_user: str = "myretail-api@local.test"
     erpnext_pos_user: str = "myretail-api@local.test"
     erpnext_pos_user_map: dict[str, str] = Field(default_factory=dict)
-    erpnext_pos_credentials_map: dict[str, str] = Field(default_factory=dict)
+    erpnext_pos_credentials_map: dict[str, str] = Field(
+        default_factory=dict, repr=False
+    )
     pos_cashier_assignments: dict[str, POSCashierAssignment] = Field(default_factory=dict)
     default_currency: str = "KZT"
     stock_idempotency_db_path: Path = API_ROOT / "tmp" / "stock_idempotency.sqlite3"

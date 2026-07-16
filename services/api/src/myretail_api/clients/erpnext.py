@@ -61,6 +61,10 @@ from myretail_api.models.stock import (
     WarehouseRef,
     format_quantity,
 )
+from myretail_api.tenancy import (
+    ERPNextConnectionProfile,
+    build_erpnext_connection_profile,
+)
 
 ZERO_QUANTITY = Decimal("0.000")
 WRITE_OFF_REASONS = [
@@ -147,30 +151,37 @@ class StockQuantities:
 class ERPNextClient:
     def __init__(
         self,
-        settings: Settings,
+        settings: Settings | ERPNextConnectionProfile,
         *,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
-        if settings.erpnext_api_key is None or settings.erpnext_api_secret is None:
+        profile = (
+            settings
+            if isinstance(settings, ERPNextConnectionProfile)
+            else build_erpnext_connection_profile(settings)
+        )
+        if profile.api_key is None or profile.api_secret is None:
             raise ERPNextConfigurationError("ERPNext API credentials are not configured")
 
-        api_key = settings.erpnext_api_key.get_secret_value()
-        api_secret = settings.erpnext_api_secret.get_secret_value()
-        self._base_url = settings.erpnext_base_url.rstrip("/")
+        api_key = profile.api_key.get_secret_value()
+        api_secret = profile.api_secret.get_secret_value()
+        if not api_key or not api_secret:
+            raise ERPNextConfigurationError("ERPNext API credentials are not configured")
+        self._base_url = profile.base_url
         self._headers = {
             "Accept": "application/json",
             "Authorization": f"token {api_key}:{api_secret}",
         }
-        self._timeout = settings.erpnext_timeout_seconds
+        self._timeout = profile.timeout_seconds
         self._transport = transport
-        self._selling_price_list = settings.erpnext_selling_price_list
-        self._buying_price_list = settings.erpnext_buying_price_list
-        self._company = settings.erpnext_company
-        self._api_user = settings.erpnext_api_user
-        self._pos_user = settings.erpnext_pos_user
-        self._pos_user_map = settings.erpnext_pos_user_map
-        self._pos_credentials_map = settings.erpnext_pos_credentials_map
-        self._currency = settings.default_currency
+        self._selling_price_list = profile.selling_price_list
+        self._buying_price_list = profile.buying_price_list
+        self._company = profile.company
+        self._api_user = profile.api_user
+        self._pos_user = profile.pos_user
+        self._pos_user_map = profile.pos_user_map
+        self._pos_credentials_map = profile.pos_credentials_map
+        self._currency = profile.currency
 
     async def authenticate_user(self, *, email: str, password: str) -> ERPNextUser:
         try:

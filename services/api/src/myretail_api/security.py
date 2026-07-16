@@ -8,6 +8,7 @@ from typing import Any
 
 from myretail_api.config import POSCashierAssignment, Settings
 from myretail_api.models.auth import AuthenticatedUser, TenantContext
+from myretail_api.tenancy import IsolatedTenantRoute
 
 
 class AuthConfigurationError(RuntimeError):
@@ -24,7 +25,7 @@ MYRETAIL_ADMIN_ROLE = "MyRetail Admin"
 # Bump this value when a deployed authorization policy must invalidate every
 # token issued under the previous policy. The signed claim keeps rollout
 # invalidation independent from per-process memory or local state stores.
-AUTHORIZATION_POLICY_VERSION = 2
+AUTHORIZATION_POLICY_VERSION = 3
 
 
 def map_erpnext_roles(erpnext_roles: list[str], *, has_pos_assignment: bool = False) -> list[str]:
@@ -55,16 +56,19 @@ def get_pos_cashier_assignment(
 
 def create_access_token(
     *,
-    settings: Settings,
-    tenant: str,
+    route: IsolatedTenantRoute,
     user: AuthenticatedUser,
     now: datetime | None = None,
 ) -> tuple[str, int]:
-    secret = _auth_secret(settings)
+    secret = _auth_secret(route)
     issued_at = now or datetime.now(UTC)
-    expires_at = issued_at + timedelta(seconds=settings.auth_token_ttl_seconds)
+    expires_at = issued_at + timedelta(seconds=route.auth_token_ttl_seconds)
     payload = {
-        "tenant": tenant,
+        "iss": route.auth_issuer,
+        "aud": route.auth_audience,
+        "tenant_id": str(route.tenant_id),
+        "tenant": route.tenant_slug,
+        "route_version": route.route_version,
         "email": user.email,
         "full_name": user.full_name,
         "roles": user.roles,
@@ -76,16 +80,16 @@ def create_access_token(
     encoded_payload = _encode_json(payload)
     signing_input = f"{encoded_header}.{encoded_payload}"
     signature = _sign(signing_input, secret)
-    return f"{signing_input}.{signature}", settings.auth_token_ttl_seconds
+    return f"{signing_input}.{signature}", route.auth_token_ttl_seconds
 
 
 def parse_access_token(
     token: str,
     *,
-    settings: Settings,
+    route: IsolatedTenantRoute,
     now: datetime | None = None,
 ) -> TenantContext:
-    secret = _auth_secret(settings)
+    secret = _auth_secret(route)
     parts = token.split(".")
     if len(parts) != 3:
         raise TokenValidationError("Malformed token")
@@ -108,6 +112,16 @@ def parse_access_token(
     ):
         raise TokenValidationError("Token authorization policy is no longer valid")
 
+    if _str_claim(payload, "iss") != route.auth_issuer:
+        raise TokenValidationError("Token issuer is not valid for this deployment")
+    if _str_claim(payload, "aud") != route.auth_audience:
+        raise TokenValidationError("Token audience is not valid for this deployment")
+    if _str_claim(payload, "tenant_id") != str(route.tenant_id):
+        raise TokenValidationError("Token tenant identity is not valid for this deployment")
+    route_version = _int_claim(payload, "route_version")
+    if route_version != route.route_version:
+        raise TokenValidationError("Token route version is no longer valid")
+
     tenant = _str_claim(payload, "tenant")
     email = _str_claim(payload, "email")
     roles = payload.get("roles")
@@ -122,10 +136,10 @@ def parse_access_token(
     return TenantContext(tenant=tenant, user=user)
 
 
-def _auth_secret(settings: Settings) -> str:
-    if settings.auth_secret is None or not settings.auth_secret.get_secret_value():
+def _auth_secret(route: IsolatedTenantRoute) -> str:
+    if route.auth_secret is None or not route.auth_secret.get_secret_value():
         raise AuthConfigurationError("Auth secret is not configured")
-    return settings.auth_secret.get_secret_value()
+    return route.auth_secret.get_secret_value()
 
 
 def _encode_json(value: dict[str, Any]) -> str:
@@ -170,6 +184,6 @@ def _str_claim(payload: dict[str, Any], name: str) -> str:
 
 def _int_claim(payload: dict[str, Any], name: str) -> int:
     value = payload.get(name)
-    if not isinstance(value, int):
+    if not isinstance(value, int) or isinstance(value, bool):
         raise TokenValidationError(f"Invalid {name} claim")
     return value

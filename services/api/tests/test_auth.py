@@ -31,6 +31,7 @@ from myretail_api.security import (
     map_erpnext_roles,
     parse_access_token,
 )
+from myretail_api.tenancy import build_isolated_tenant_route
 
 
 class SuccessfulAuthClient:
@@ -497,9 +498,10 @@ def auth_headers(
     tenant: str = "myretail",
     header_tenant: str = "myretail",
 ) -> dict[str, str]:
+    token_settings = make_test_settings()
+    token_settings.tenant_slug = tenant
     token, _ = create_access_token(
-        settings=make_test_settings(),
-        tenant=tenant,
+        route=build_isolated_tenant_route(token_settings),
         user=AuthenticatedUser(
             email="damir@example.com",
             full_name="Damir",
@@ -515,8 +517,7 @@ def auth_headers(
 def test_tokens_from_previous_authorization_policy_are_rejected() -> None:
     settings = make_test_settings()
     token, _ = create_access_token(
-        settings=settings,
-        tenant="myretail",
+        route=build_isolated_tenant_route(settings),
         user=AuthenticatedUser(
             email="legacy-admin@example.com",
             full_name="Legacy Admin",
@@ -539,7 +540,10 @@ def test_tokens_from_previous_authorization_policy_are_rejected() -> None:
     )
 
     with pytest.raises(TokenValidationError, match="authorization policy"):
-        parse_access_token(f"{signing_input}.{signature}", settings=settings)
+        parse_access_token(
+            f"{signing_input}.{signature}",
+            route=build_isolated_tenant_route(settings),
+        )
 
 
 def _encode_token_part(value: bytes) -> str:
