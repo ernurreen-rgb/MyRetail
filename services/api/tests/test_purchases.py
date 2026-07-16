@@ -41,6 +41,7 @@ from myretail_api.models.purchases import (
 from myretail_api.models.stock import AuditUser, Warehouse, WarehouseRef
 from myretail_api.routers import purchases as purchases_router_module
 from myretail_api.security import create_access_token
+from myretail_api.state.idempotency import SQLiteIdempotencyRepository
 
 
 class StubPurchasesERPNextClient:
@@ -626,7 +627,9 @@ def auth_headers(
 
 def make_app(erpnext_client: object, tmp_path: Path) -> object:
     settings = make_test_settings(tmp_path)
-    store = IdempotencyStore(settings.stock_idempotency_db_path)
+    store = SQLiteIdempotencyRepository(
+        IdempotencyStore(settings.stock_idempotency_db_path)
+    )
     app = create_app()
     app.dependency_overrides[get_erpnext_client] = lambda: erpnext_client
     app.dependency_overrides[get_settings] = lambda: settings

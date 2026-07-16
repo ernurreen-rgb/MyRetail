@@ -10,7 +10,13 @@ from myretail_api.config import (
     get_settings,
 )
 from myretail_api.main import create_app
+from myretail_api.state.idempotency import SQLiteIdempotencyRepository
 from myretail_api.state.schema import EXPECTED_STATE_SCHEMA_REVISION
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    return "asyncio"
 
 
 def isolated_settings(**overrides: object) -> Settings:
@@ -122,11 +128,20 @@ def test_create_app_binds_one_settings_instance_to_app_and_dependencies() -> Non
 
 
 @pytest.mark.anyio
-async def test_sqlite_lifespan_does_not_create_postgresql_pool() -> None:
-    app = create_app(isolated_settings(environment="test"))
+async def test_sqlite_lifespan_does_not_create_postgresql_pool(tmp_path: Path) -> None:
+    app = create_app(
+        isolated_settings(
+            environment="test",
+            stock_idempotency_db_path=tmp_path / "idempotency.sqlite3",
+        )
+    )
 
     async with app.router.lifespan_context(app):
         assert app.state.postgres_state_runtime is None
+        assert isinstance(
+            app.state.shared_idempotency_repository,
+            SQLiteIdempotencyRepository,
+        )
 
 
 def test_expected_revision_is_package_owned_not_environment_overridable() -> None:

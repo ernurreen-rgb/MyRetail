@@ -31,7 +31,6 @@ from myretail_api.idempotency import (
     IdempotencyCompletedScopeConflictError,
     IdempotencyConflictError,
     IdempotencyRecord,
-    StockIdempotencyStore,
 )
 from myretail_api.models.auth import TenantContext
 from myretail_api.models.stock import (
@@ -43,6 +42,7 @@ from myretail_api.models.stock import (
     StockMovementList,
     StockOptions,
 )
+from myretail_api.state.protocols import IdempotencyRepository
 
 router = APIRouter(prefix="/stock", tags=["stock"])
 T = TypeVar("T")
@@ -160,7 +160,7 @@ async def create_stock_movement(
     movement: StockMovementCreate,
     client: Annotated[ERPNextClient, Depends(get_erpnext_client)],
     tenant_context: Annotated[TenantContext, Depends(require_stock_writer)],
-    store: Annotated[StockIdempotencyStore, Depends(get_stock_idempotency_store)],
+    store: Annotated[IdempotencyRepository, Depends(get_stock_idempotency_store)],
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> JSONResponse:
     key = _require_idempotency_key(idempotency_key)
@@ -196,7 +196,7 @@ async def cancel_stock_movement(
     request: StockMovementCancelRequest,
     client: Annotated[ERPNextClient, Depends(get_erpnext_client)],
     tenant_context: Annotated[TenantContext, Depends(require_stock_writer)],
-    store: Annotated[StockIdempotencyStore, Depends(get_stock_idempotency_store)],
+    store: Annotated[IdempotencyRepository, Depends(get_stock_idempotency_store)],
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> JSONResponse:
     key = _require_idempotency_key(idempotency_key)
@@ -374,7 +374,7 @@ def _require_idempotency_key(idempotency_key: str | None) -> str:
 
 
 async def _idempotent_stock_response(
-    store: StockIdempotencyStore,
+    store: IdempotencyRepository,
     *,
     tenant: str,
     key: str,
@@ -384,7 +384,7 @@ async def _idempotent_stock_response(
     recover: Callable[[], Awaitable[T | None]],
     scope_key: str | None = None,
 ) -> JSONResponse:
-    begin = _begin_idempotency(
+    begin = await _begin_idempotency(
         store,
         tenant=tenant,
         key=key,
@@ -418,7 +418,7 @@ async def _idempotent_stock_response(
         )
         if record is not None:
             return JSONResponse(status_code=record.status_code, content=record.response_body)
-        begin = _begin_idempotency(
+        begin = await _begin_idempotency(
             store,
             tenant=tenant,
             key=key,
@@ -451,7 +451,7 @@ async def _idempotent_stock_response(
     try:
         result = await _call_erpnext(execute())
     except ERPNextAmbiguousCreateError:
-        _mark_stock_recovery(
+        await _mark_stock_recovery(
             store,
             tenant,
             storage_key,
@@ -464,7 +464,7 @@ async def _idempotent_stock_response(
             while asyncio.get_running_loop().time() < deadline:
                 recovered = await _call_erpnext(recover())
                 if recovered is not None:
-                    return _complete_stock_response(
+                    return await _complete_stock_response(
                         store=store,
                         tenant=tenant,
                         key=storage_key,
@@ -475,7 +475,7 @@ async def _idempotent_stock_response(
                     )
                 await asyncio.sleep(STOCK_RECOVERY_POLL_SECONDS)
         except Exception:
-            _mark_stock_recovery(
+            await _mark_stock_recovery(
                 store,
                 tenant,
                 storage_key,
@@ -484,7 +484,7 @@ async def _idempotent_stock_response(
                 lease_seconds=0,
             )
             raise
-        return _pending_stock_response(
+        return await _pending_stock_response(
             store=store,
             tenant=tenant,
             key=storage_key,
@@ -493,7 +493,7 @@ async def _idempotent_stock_response(
         )
     except Exception as exc:
         if isinstance(exc, HTTPException) and exc.status_code >= 500:
-            _mark_stock_recovery(
+            await _mark_stock_recovery(
                 store,
                 tenant,
                 storage_key,
@@ -504,7 +504,7 @@ async def _idempotent_stock_response(
             try:
                 recovered = await _call_erpnext(recover())
             except Exception as recovery_exc:
-                _mark_stock_recovery(
+                await _mark_stock_recovery(
                     store,
                     tenant,
                     storage_key,
@@ -514,7 +514,7 @@ async def _idempotent_stock_response(
                 )
                 raise exc from recovery_exc
             if recovered is not None:
-                return _complete_stock_response(
+                return await _complete_stock_response(
                     store=store,
                     tenant=tenant,
                     key=storage_key,
@@ -523,7 +523,7 @@ async def _idempotent_stock_response(
                     status_code=status_code,
                     result=recovered,
                 )
-            _mark_stock_recovery(
+            await _mark_stock_recovery(
                 store,
                 tenant,
                 storage_key,
@@ -532,7 +532,7 @@ async def _idempotent_stock_response(
                 lease_seconds=0,
             )
             raise
-        store.release(
+        await store.release(
             tenant=tenant,
             key=storage_key,
             request_hash=request_hash,
@@ -540,7 +540,7 @@ async def _idempotent_stock_response(
         )
         raise
 
-    return _complete_stock_response(
+    return await _complete_stock_response(
         store=store,
         tenant=tenant,
         key=storage_key,
@@ -553,7 +553,7 @@ async def _idempotent_stock_response(
 
 async def _recover_stock_or_pending(
     *,
-    store: StockIdempotencyStore,
+    store: IdempotencyRepository,
     tenant: str,
     key: str,
     request_hash: str,
@@ -564,7 +564,7 @@ async def _recover_stock_or_pending(
     try:
         recovered = await _call_erpnext(recover())
     except Exception:
-        _mark_stock_recovery(
+        await _mark_stock_recovery(
             store,
             tenant,
             key,
@@ -574,7 +574,7 @@ async def _recover_stock_or_pending(
         )
         raise
     if recovered is not None:
-        return _complete_stock_response(
+        return await _complete_stock_response(
             store=store,
             tenant=tenant,
             key=key,
@@ -583,7 +583,7 @@ async def _recover_stock_or_pending(
             status_code=status_code,
             result=recovered,
         )
-    return _pending_stock_response(
+    return await _pending_stock_response(
         store=store,
         tenant=tenant,
         key=key,
@@ -592,9 +592,9 @@ async def _recover_stock_or_pending(
     )
 
 
-def _complete_stock_response(
+async def _complete_stock_response(
     *,
-    store: StockIdempotencyStore,
+    store: IdempotencyRepository,
     tenant: str,
     key: str,
     request_hash: str,
@@ -603,7 +603,7 @@ def _complete_stock_response(
     result: object,
 ) -> JSONResponse:
     response_body = jsonable_encoder(result)
-    if not store.complete(
+    if not await store.complete(
         tenant=tenant,
         key=key,
         request_hash=request_hash,
@@ -619,15 +619,15 @@ def _complete_stock_response(
     return JSONResponse(status_code=status_code, content=response_body)
 
 
-def _pending_stock_response(
+async def _pending_stock_response(
     *,
-    store: StockIdempotencyStore,
+    store: IdempotencyRepository,
     tenant: str,
     key: str,
     request_hash: str,
     fencing_token: int,
 ) -> JSONResponse:
-    _mark_stock_recovery(
+    await _mark_stock_recovery(
         store,
         tenant,
         key,
@@ -641,8 +641,8 @@ def _pending_stock_response(
     )
 
 
-def _mark_stock_recovery(
-    store: StockIdempotencyStore,
+async def _mark_stock_recovery(
+    store: IdempotencyRepository,
     tenant: str,
     key: str,
     request_hash: str,
@@ -650,7 +650,7 @@ def _mark_stock_recovery(
     *,
     lease_seconds: float,
 ) -> None:
-    if store.mark_recovery_required(
+    if await store.mark_recovery_required(
         tenant=tenant,
         key=key,
         request_hash=request_hash,
@@ -665,8 +665,8 @@ def _mark_stock_recovery(
     )
 
 
-def _begin_idempotency(
-    store: StockIdempotencyStore,
+async def _begin_idempotency(
+    store: IdempotencyRepository,
     *,
     tenant: str,
     key: str,
@@ -674,7 +674,7 @@ def _begin_idempotency(
     scope_key: str | None = None,
 ) -> IdempotencyBeginResult:
     try:
-        return store.begin(
+        return await store.begin(
             tenant=tenant,
             key=key,
             request_hash=request_hash,
@@ -695,15 +695,14 @@ def _begin_idempotency(
 
 
 async def _wait_idempotency(
-    store: StockIdempotencyStore,
+    store: IdempotencyRepository,
     *,
     tenant: str,
     key: str,
     request_hash: str,
 ) -> IdempotencyRecord | None:
     try:
-        return await asyncio.to_thread(
-            store.wait_for_completed,
+        return await store.wait_for_completed(
             tenant=tenant,
             key=key,
             request_hash=request_hash,
@@ -716,14 +715,14 @@ async def _wait_idempotency(
         ) from exc
 
 
-def _load_idempotency_record(
-    store: StockIdempotencyStore,
+async def _load_idempotency_record(
+    store: IdempotencyRepository,
     tenant: str,
     key: str,
     request_hash: str,
 ) -> object | None:
     try:
-        begin = store.begin(tenant=tenant, key=key, request_hash=request_hash)
+        begin = await store.begin(tenant=tenant, key=key, request_hash=request_hash)
         return begin.record
     except IdempotencyConflictError as exc:
         raise _api_error(

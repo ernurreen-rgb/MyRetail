@@ -4,6 +4,8 @@ from datetime import datetime
 from typing import Any, Literal, Protocol, TypeAlias
 from uuid import UUID
 
+from myretail_api.idempotency import IdempotencyBeginResult, IdempotencyRecord
+
 JsonObject: TypeAlias = Mapping[str, Any]
 IntentState: TypeAlias = Literal[
     "reserved",
@@ -20,20 +22,6 @@ class FencedLease:
     owner_id: UUID
     fencing_token: int
     lease_until: datetime
-
-
-@dataclass(frozen=True)
-class StoredResponse:
-    status_code: int
-    body: JsonObject
-
-
-@dataclass(frozen=True)
-class IdempotencyDecision:
-    action: Literal["execute", "wait", "recover", "replay"]
-    record_id: UUID
-    lease: FencedLease | None = None
-    response: StoredResponse | None = None
 
 
 @dataclass(frozen=True)
@@ -60,41 +48,59 @@ class IdempotencyRepository(Protocol):
     async def begin(
         self,
         *,
-        tenant_id: str,
-        namespace: str,
-        operation_key: str,
-        principal_key: str,
-        idempotency_key: str,
+        tenant: str,
+        key: str,
         request_hash: str,
-        scope_key: str | None,
-        lease_owner: UUID,
-    ) -> IdempotencyDecision: ...
+        scope_key: str | None = None,
+        lease_seconds: float = 60.0,
+    ) -> IdempotencyBeginResult: ...
 
-    async def get_completed(self, *, tenant_id: str, record_id: UUID) -> StoredResponse | None: ...
+    async def wait_for_completed(
+        self,
+        *,
+        tenant: str,
+        key: str,
+        request_hash: str,
+        timeout_seconds: float = 30.0,
+        poll_seconds: float = 0.05,
+    ) -> IdempotencyRecord | None: ...
+
+    async def get_completed(
+        self,
+        *,
+        tenant: str,
+        key: str,
+        request_hash: str,
+    ) -> IdempotencyRecord | None: ...
 
     async def complete(
         self,
         *,
-        tenant_id: str,
-        record_id: UUID,
-        lease: FencedLease,
-        response: StoredResponse,
+        tenant: str,
+        key: str,
+        request_hash: str,
+        fencing_token: int,
+        status_code: int,
+        response_body: dict[str, object],
     ) -> bool: ...
 
     async def mark_recovery_required(
         self,
         *,
-        tenant_id: str,
-        record_id: UUID,
-        lease: FencedLease,
+        tenant: str,
+        key: str,
+        request_hash: str,
+        fencing_token: int,
+        lease_seconds: float = 60.0,
     ) -> bool: ...
 
     async def release(
         self,
         *,
-        tenant_id: str,
-        record_id: UUID,
-        lease: FencedLease,
+        tenant: str,
+        key: str,
+        request_hash: str,
+        fencing_token: int,
     ) -> bool: ...
 
 
