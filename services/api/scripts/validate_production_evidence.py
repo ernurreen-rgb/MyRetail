@@ -420,7 +420,7 @@ class Validator:
         self._timestamp(value.get("completed_at"), "smoke.completed_at")
         self._integer(value.get("api_replicas"), "smoke.api_replicas", minimum=2)
         environment = self._string(value.get("erpnext_environment"), "smoke.erpnext_environment")
-        if environment is not None and environment.lower() in {"prod", "production"}:
+        if environment is not None and environment.casefold() != "production-like":
             self.errors.add("smoke.erpnext_environment.must_be_production_like")
         scenarios = value.get("scenarios")
         if not isinstance(scenarios, list):

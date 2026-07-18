@@ -64,7 +64,7 @@ async def run_monitor(settings: Settings) -> RecoveryHealth:
             try:
                 await connection.execute(
                     text("SELECT set_config('myretail.tenant_id', :tenant_id, true)"),
-                    {"tenant_id": str(route.tenant_id)},
+                    {"tenant_id": route.tenant_slug},
                 )
                 row = (
                     await connection.execute(

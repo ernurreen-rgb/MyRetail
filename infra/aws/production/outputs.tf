@@ -4,7 +4,7 @@ output "aws_account_id" {
 }
 
 output "web_url" {
-  description = "Public production URL. It remains without healthy targets while traffic_enabled is false."
+  description = "Public production URL. HTTPS returns a fixed 503 while traffic_enabled is false."
   value       = local.web_origin
 }
 
@@ -90,10 +90,15 @@ output "backup_vault_name" {
 
 output "backup_restore_role_arn" {
   description = "Role used by controlled isolated restore jobs."
-  value       = aws_iam_role.backup.arn
+  value       = data.aws_iam_role.backup.arn
 }
 
 output "traffic_enabled" {
   description = "Effective fail-closed traffic latch."
   value       = var.traffic_enabled
+}
+
+output "runtime_enabled" {
+  description = "Private two-replica runtime latch used for monitored smoke before traffic approval."
+  value       = var.runtime_enabled
 }

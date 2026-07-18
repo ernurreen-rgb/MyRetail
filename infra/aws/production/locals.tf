@@ -3,7 +3,18 @@ locals {
   private_api_base_url = "http://api.myretail.internal:8000"
   rds_ca_bundle_path   = "/etc/ssl/certs/aws-rds-global-bundle.pem"
   production_revision  = "20260716_05"
+  placeholder_digest   = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  runtime_images_ready = alltrue([
+    for image in [
+      var.api_image,
+      var.database_bootstrap_image,
+      var.migration_image,
+      var.web_image,
+    ] : !endswith(image, local.placeholder_digest)
+  ])
+  runtime_ready = var.monitoring_enabled && local.runtime_images_ready
   traffic_evidence_ready = (
+    var.runtime_enabled &&
     var.monitoring_enabled &&
     try(length(var.production_evidence_manifest_sha256) == 64, false) &&
     try(startswith(var.traffic_approval_url, "https://"), false) &&

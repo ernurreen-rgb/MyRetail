@@ -64,6 +64,22 @@ def test_complete_production_manifest_passes() -> None:
     evidence.validate_manifest(production_manifest())
 
 
+@pytest.mark.parametrize(
+    "environment",
+    ["local", "development", "prod", "production", "unknown"],
+)
+def test_production_manifest_requires_explicit_production_like_erpnext(
+    environment: str,
+) -> None:
+    manifest = production_manifest()
+    manifest["smoke"]["erpnext_environment"] = environment
+
+    with pytest.raises(evidence.EvidenceError) as caught:
+        evidence.validate_manifest(manifest)
+
+    assert "smoke.erpnext_environment.must_be_production_like" in caught.value.paths
+
+
 def test_schema_version_rejects_boolean_substitution() -> None:
     manifest = production_manifest()
     manifest["schema_version"] = True
