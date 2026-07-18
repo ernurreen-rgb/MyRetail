@@ -12,11 +12,13 @@ function loginRequest({
   url = LOGIN_URL,
   contentType = "application/json",
   fetchSite,
+  forwardedFor,
   origin = new URL(url).origin,
 }: {
   url?: string;
   contentType?: string;
   fetchSite?: "same-origin" | "cross-site";
+  forwardedFor?: string;
   origin?: string;
 } = {}) {
   return new Request(url, {
@@ -26,6 +28,7 @@ function loginRequest({
       Origin: origin,
       "Sec-Fetch-Site":
         fetchSite ?? (origin === new URL(url).origin ? "same-origin" : "cross-site"),
+      ...(forwardedFor === undefined ? {} : { "X-Forwarded-For": forwardedFor }),
     },
     body:
       contentType === "application/json"
@@ -266,6 +269,70 @@ describe("POST /api/auth/login", () => {
       }),
     );
   });
+
+  it.each([
+    ["203.0.113.66, 198.51.100.24", "198.51.100.24"],
+    ["2001:db8:ffff::66, 2001:db8::24", "2001:db8::24"],
+  ])(
+    "forwards only the ALB-appended client IP from %s",
+    async (forwardedFor, expectedClientIp) => {
+      process.env.MYRETAIL_API_URL = "http://api.test";
+      const fetchMock = vi.fn().mockResolvedValue(
+        Response.json({
+          access_token: "signed-token",
+          token_type: "bearer",
+          expires_in: 3_600,
+          tenant: "myretail",
+          user: {
+            email: "owner@example.com",
+            full_name: "Owner",
+            roles: ["Owner"],
+          },
+        }),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+
+      const response = await login(loginRequest({ forwardedFor }));
+
+      expect(response.status).toBe(200);
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://api.test/auth/login",
+        expect.objectContaining({
+          headers: {
+            "Content-Type": "application/json",
+            "X-Forwarded-For": expectedClientIp,
+          },
+        }),
+      );
+    },
+  );
+
+  it.each(["198.51.100.24, not-an-ip", "198.51.100.24, "])(
+    "does not forward a malformed ALB client address from %s",
+    async (forwardedFor) => {
+      process.env.MYRETAIL_API_URL = "http://api.test";
+      const fetchMock = vi.fn().mockResolvedValue(
+        Response.json({
+          access_token: "signed-token",
+          token_type: "bearer",
+          expires_in: 3_600,
+          tenant: "myretail",
+          user: {
+            email: "owner@example.com",
+            full_name: "Owner",
+            roles: ["Owner"],
+          },
+        }),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+
+      const response = await login(loginRequest({ forwardedFor }));
+
+      expect(response.status).toBe(200);
+      const [, options] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(options.headers).toEqual({ "Content-Type": "application/json" });
+    },
+  );
 
   it("returns 504 when the backend login times out", async () => {
     const timeoutError = Object.assign(new Error("timed out"), { name: "TimeoutError" });

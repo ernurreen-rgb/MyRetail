@@ -100,6 +100,8 @@ resource "aws_lb" "web" {
   enable_deletion_protection = true
   drop_invalid_header_fields = true
   desync_mitigation_mode     = "strictest"
+  enable_xff_client_port     = false
+  xff_header_processing_mode = "append"
 }
 
 resource "aws_lb_target_group" "web" {

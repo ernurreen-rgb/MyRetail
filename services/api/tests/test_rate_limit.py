@@ -320,6 +320,19 @@ def test_trusted_proxy_mode_resolves_first_untrusted_hop_from_right() -> None:
     assert resolve_login_client_ip(request, settings) == "198.51.100.20"
 
 
+def test_trusted_bff_peer_keeps_sanitized_clients_in_distinct_buckets() -> None:
+    settings = Settings(
+        _env_file=None,
+        auth_client_ip_mode="trusted_proxy",
+        auth_trusted_proxy_cidrs=["10.42.16.0/20"],
+    )
+    first = make_request(peer="10.42.16.8", forwarded_for="198.51.100.20")
+    second = make_request(peer="10.42.16.8", forwarded_for="198.51.100.21")
+
+    assert resolve_login_client_ip(first, settings) == "198.51.100.20"
+    assert resolve_login_client_ip(second, settings) == "198.51.100.21"
+
+
 def test_untrusted_peer_or_malformed_forwarded_chain_is_ignored() -> None:
     settings = Settings(
         _env_file=None,

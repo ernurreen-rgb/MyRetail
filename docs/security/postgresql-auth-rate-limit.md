@@ -31,8 +31,10 @@ Pre-auth таблицы являются утверждённым исключе
 
 ## Политика client IP и trusted proxy
 
-По умолчанию `MYRETAIL_AUTH_CLIENT_IP_MODE=direct`: приложение использует только
-непосредственный ASGI peer и игнорирует `X-Forwarded-For`.
+Для local dev/test по умолчанию используется `MYRETAIL_AUTH_CLIENT_IP_MODE=direct`:
+приложение использует только непосредственный ASGI peer и игнорирует
+`X-Forwarded-For`. Production startup теперь fail closed, если не задан явный
+`trusted_proxy`; глобальные сети `0.0.0.0/0` и `::/0` в allowlist запрещены.
 
 Trusted proxy включается только одновременно с:
 
@@ -46,6 +48,14 @@ Resolver принимает `X-Forwarded-For` только от peer из allowl
 32 адресами и идёт справа налево до первого недоверенного hop. Для недоверенного peer,
 пустой или некорректной цепочки используется direct peer. Пустой allowlist, неверный CIDR
 или CIDR при direct mode блокируют startup.
+
+В AWS production boundary public ALB явно зафиксирован в режиме XFF `append`, без
+добавления client port. Next.js BFF берёт только крайний справа IP, добавленный ALB,
+проверяет его как IPv4/IPv6 и передаёт private API одну очищенную запись. Любые
+пользовательские XFF-prefix отбрасываются. API доверяет только CIDR private application
+subnets, а security group допускает соединение на API port только от web security group.
+Если ALB header отсутствует или повреждён, BFF не передаёт его, и API безопасно использует
+peer web task вместо доверия неподтверждённому адресу.
 
 ## Граница фазы
 

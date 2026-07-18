@@ -116,6 +116,21 @@ run "private_runtime_supports_two_replica_smoke_without_public_traffic" {
     condition     = aws_cloudwatch_metric_alarm.api_running_tasks.actions_enabled
     error_message = "Runtime alert delivery must be testable before public traffic."
   }
+
+  assert {
+    condition     = aws_lb.web.xff_header_processing_mode == "append" && !aws_lb.web.enable_xff_client_port
+    error_message = "The public ALB must append a port-free authoritative client IP."
+  }
+
+  assert {
+    condition     = one([for item in local.common_api_environment : item.value if item.name == "MYRETAIL_AUTH_CLIENT_IP_MODE"]) == "trusted_proxy"
+    error_message = "Production API must resolve login client IP through the explicit trusted-proxy boundary."
+  }
+
+  assert {
+    condition     = tolist(jsondecode(one([for item in local.common_api_environment : item.value if item.name == "MYRETAIL_AUTH_TRUSTED_PROXY_CIDRS"]))) == tolist(var.app_subnet_cidrs)
+    error_message = "Only private application subnet peers may supply the sanitized client IP."
+  }
 }
 
 run "traffic_rejects_missing_evidence" {

@@ -15,6 +15,9 @@ in a shared account:
   Backup continuous PITR is not supported for RDS Multi-AZ DB clusters);
 - two-or-more private ECS/Fargate API and web replicas during the monitored smoke stage;
 - private API discovery at `api.myretail.internal`; only the Next.js BFF is public through HTTPS;
+- an explicit ALB `X-Forwarded-For` append boundary: the BFF forwards only the validated
+  ALB-added client address, and the API trusts proxy metadata only from private application
+  subnet peers reachable through the web security group;
 - Secrets Manager containers for auth, application database, migration database and ERPNext
   credentials; secret values never enter Terraform variables or state;
 - immutable, KMS-encrypted ECR repositories and CloudWatch/SNS operational signals;

@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 
 import { DEFAULT_TENANT, isLoginResponse, type LoginFormValues } from "@/lib/auth";
+import { getAlbForwardedClientIp } from "@/lib/client-ip";
 import { buildApiUrl } from "@/lib/config";
 import {
   getExpectedOrigin,
@@ -10,6 +11,7 @@ import {
 import { setAuthCookies } from "@/lib/session";
 
 export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
 const LOGIN_TIMEOUT_MS = 10_000;
 
 type ValidatedLoginValues = LoginFormValues;
@@ -182,11 +184,17 @@ export async function POST(request: Request) {
   let apiResponse: Response;
 
   try {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+    const clientIp = getAlbForwardedClientIp(request);
+    if (clientIp) {
+      headers["X-Forwarded-For"] = clientIp;
+    }
+
     apiResponse = await fetch(buildApiUrl("/auth/login"), {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
+      headers,
       body: JSON.stringify(values),
       cache: "no-store",
       signal: AbortSignal.timeout(LOGIN_TIMEOUT_MS),
