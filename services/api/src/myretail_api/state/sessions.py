@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -17,6 +17,10 @@ from myretail_api.state.protocols import (
     AuthSession,
     SessionRevocationReason,
 )
+
+SESSION_ACTIVE_LIMIT = 10
+SESSION_TERMINAL_LIMIT = 1_000
+SESSION_TERMINAL_RETENTION_DAYS = 90
 
 
 class SessionStateError(RuntimeError):
@@ -105,9 +109,13 @@ class SQLiteSessionRepository:
                         strftime(
                             '%Y-%m-%dT%H:%M:%f+00:00',
                             julianday('now') + (? / 86400.0)
-                        ) AS expires_at
+                        ) AS expires_at,
+                        strftime(
+                            '%Y-%m-%dT%H:%M:%f+00:00',
+                            julianday('now') - ?
+                        ) AS terminal_cutoff
                     """,
-                    (ttl_seconds,),
+                    (ttl_seconds, SESSION_TERMINAL_RETENTION_DAYS),
                 ).fetchone()
                 if timestamps is None:
                     raise SessionStateError("Authentication session clock is unavailable")
@@ -129,6 +137,14 @@ class SQLiteSessionRepository:
                         timestamps["issued_at"],
                         timestamps["issued_at"],
                     ),
+                )
+                _enforce_sqlite_session_policy(
+                    connection,
+                    tenant_id=tenant_id,
+                    principal_id=str(principal["principal_id"]),
+                    new_session_id=str(session_id),
+                    db_now=str(timestamps["issued_at"]),
+                    terminal_cutoff=str(timestamps["terminal_cutoff"]),
                 )
                 connection.commit()
                 return AuthSession(
@@ -373,56 +389,208 @@ class SQLiteSessionRepository:
         try:
             with self._connect() as connection:
                 connection.execute("PRAGMA journal_mode = WAL")
-                connection.executescript(
+                connection.execute("BEGIN IMMEDIATE")
+                _create_sqlite_principals_table(connection)
+                session_schema = connection.execute(
                     """
-                    CREATE TABLE IF NOT EXISTS auth_principals (
-                        tenant_id TEXT NOT NULL,
-                        principal_id TEXT NOT NULL,
-                        normalized_email TEXT NOT NULL,
-                        auth_epoch INTEGER NOT NULL DEFAULT 1 CHECK (auth_epoch > 0),
-                        disabled_at TEXT,
-                        revoked_before TEXT,
-                        created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL,
-                        PRIMARY KEY (tenant_id, principal_id),
-                        UNIQUE (tenant_id, normalized_email)
-                    );
-
-                    CREATE TABLE IF NOT EXISTS auth_sessions (
-                        tenant_id TEXT NOT NULL,
-                        session_id TEXT NOT NULL,
-                        principal_id TEXT NOT NULL,
-                        auth_epoch INTEGER NOT NULL CHECK (auth_epoch > 0),
-                        route_version INTEGER NOT NULL CHECK (route_version > 0),
-                        issued_at TEXT NOT NULL,
-                        expires_at TEXT NOT NULL,
-                        revoked_at TEXT,
-                        revocation_reason TEXT CHECK (
-                            revocation_reason IS NULL OR revocation_reason IN (
-                                'logout', 'admin_revoke', 'role_change',
-                                'route_change', 'security_incident'
-                            )
-                        ),
-                        revoked_by_principal_id TEXT,
-                        created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL,
-                        PRIMARY KEY (tenant_id, session_id),
-                        FOREIGN KEY (tenant_id, principal_id)
-                            REFERENCES auth_principals (tenant_id, principal_id)
-                            ON DELETE RESTRICT,
-                        FOREIGN KEY (tenant_id, revoked_by_principal_id)
-                            REFERENCES auth_principals (tenant_id, principal_id)
-                            ON DELETE RESTRICT,
-                        CHECK (expires_at > issued_at)
-                    );
-
-                    CREATE INDEX IF NOT EXISTS auth_sessions_active_principal
-                    ON auth_sessions (tenant_id, principal_id, expires_at)
-                    WHERE revoked_at IS NULL;
+                    SELECT sql FROM sqlite_master
+                    WHERE type = 'table' AND name = 'auth_sessions'
                     """
-                )
+                ).fetchone()
+                if session_schema is None:
+                    _create_sqlite_sessions_table(connection)
+                elif "session_limit" not in str(session_schema["sql"]):
+                    _upgrade_sqlite_sessions_table(connection)
+                _create_sqlite_session_indexes(connection)
+                if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                    raise SessionStateError(
+                        "Authentication session state violates referential integrity"
+                    )
+                connection.commit()
         except sqlite3.Error as exc:
             raise SessionStateError("Authentication session state is unavailable") from exc
+
+
+def _create_sqlite_principals_table(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS auth_principals (
+            tenant_id TEXT NOT NULL,
+            principal_id TEXT NOT NULL,
+            normalized_email TEXT NOT NULL,
+            auth_epoch INTEGER NOT NULL DEFAULT 1 CHECK (auth_epoch > 0),
+            disabled_at TEXT,
+            revoked_before TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, principal_id),
+            UNIQUE (tenant_id, normalized_email)
+        )
+        """
+    )
+
+
+def _create_sqlite_sessions_table(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE auth_sessions (
+            tenant_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            principal_id TEXT NOT NULL,
+            auth_epoch INTEGER NOT NULL CHECK (auth_epoch > 0),
+            route_version INTEGER NOT NULL CHECK (route_version > 0),
+            issued_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            revoked_at TEXT,
+            revocation_reason TEXT CHECK (
+                revocation_reason IS NULL OR revocation_reason IN (
+                    'logout', 'admin_revoke', 'role_change',
+                    'route_change', 'security_incident', 'session_limit'
+                )
+            ),
+            revoked_by_principal_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, session_id),
+            FOREIGN KEY (tenant_id, principal_id)
+                REFERENCES auth_principals (tenant_id, principal_id)
+                ON DELETE RESTRICT,
+            FOREIGN KEY (tenant_id, revoked_by_principal_id)
+                REFERENCES auth_principals (tenant_id, principal_id)
+                ON DELETE RESTRICT,
+            CHECK (expires_at > issued_at),
+            CHECK (
+                (revoked_at IS NULL AND revocation_reason IS NULL)
+                OR (revoked_at IS NOT NULL AND revocation_reason IS NOT NULL)
+            )
+        )
+        """
+    )
+
+
+def _create_sqlite_session_indexes(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS auth_sessions_active_principal
+        ON auth_sessions (tenant_id, principal_id, expires_at)
+        WHERE revoked_at IS NULL
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS auth_sessions_terminal_history
+        ON auth_sessions (
+            tenant_id,
+            principal_id,
+            COALESCE(revoked_at, expires_at) DESC,
+            issued_at DESC,
+            session_id DESC
+        )
+        """
+    )
+
+
+def _upgrade_sqlite_sessions_table(connection: sqlite3.Connection) -> None:
+    connection.execute("DROP INDEX IF EXISTS auth_sessions_active_principal")
+    connection.execute("DROP INDEX IF EXISTS auth_sessions_terminal_history")
+    connection.execute("ALTER TABLE auth_sessions RENAME TO auth_sessions_legacy")
+    _create_sqlite_sessions_table(connection)
+    connection.execute(
+        """
+        INSERT INTO auth_sessions (
+            tenant_id, session_id, principal_id, auth_epoch, route_version,
+            issued_at, expires_at, revoked_at, revocation_reason,
+            revoked_by_principal_id, created_at, updated_at
+        )
+        SELECT
+            tenant_id, session_id, principal_id, auth_epoch, route_version,
+            issued_at, expires_at, revoked_at, revocation_reason,
+            revoked_by_principal_id, created_at, updated_at
+        FROM auth_sessions_legacy
+        """
+    )
+    connection.execute("DROP TABLE auth_sessions_legacy")
+
+
+def _enforce_sqlite_session_policy(
+    connection: sqlite3.Connection,
+    *,
+    tenant_id: str,
+    principal_id: str,
+    new_session_id: str,
+    db_now: str,
+    terminal_cutoff: str,
+) -> None:
+    connection.execute(
+        """
+        UPDATE auth_sessions
+        SET revoked_at = ?,
+            revocation_reason = 'session_limit',
+            revoked_by_principal_id = NULL,
+            updated_at = ?
+        WHERE tenant_id = ?
+          AND principal_id = ?
+          AND session_id IN (
+              SELECT session_id
+              FROM auth_sessions
+              WHERE tenant_id = ?
+                AND principal_id = ?
+                AND session_id <> ?
+                AND revoked_at IS NULL
+                AND expires_at > ?
+              ORDER BY issued_at DESC, session_id DESC
+              LIMIT -1 OFFSET ?
+          )
+        """,
+        (
+            db_now,
+            db_now,
+            tenant_id,
+            principal_id,
+            tenant_id,
+            principal_id,
+            new_session_id,
+            db_now,
+            SESSION_ACTIVE_LIMIT - 1,
+        ),
+    )
+    connection.execute(
+        """
+        DELETE FROM auth_sessions
+        WHERE tenant_id = ?
+          AND principal_id = ?
+          AND (revoked_at IS NOT NULL OR expires_at <= ?)
+          AND COALESCE(revoked_at, expires_at) < ?
+        """,
+        (tenant_id, principal_id, db_now, terminal_cutoff),
+    )
+    connection.execute(
+        """
+        DELETE FROM auth_sessions
+        WHERE tenant_id = ?
+          AND principal_id = ?
+          AND session_id IN (
+              SELECT session_id
+              FROM auth_sessions
+              WHERE tenant_id = ?
+                AND principal_id = ?
+                AND (revoked_at IS NOT NULL OR expires_at <= ?)
+              ORDER BY
+                  COALESCE(revoked_at, expires_at) DESC,
+                  issued_at DESC,
+                  session_id DESC
+              LIMIT -1 OFFSET ?
+          )
+        """,
+        (
+            tenant_id,
+            principal_id,
+            tenant_id,
+            principal_id,
+            db_now,
+            SESSION_TERMINAL_LIMIT,
+        ),
+    )
 
 
 class PostgresSessionRepository:
@@ -489,6 +657,10 @@ class PostgresSessionRepository:
                     raise SessionPrincipalDisabledError(
                         "Authentication principal is disabled"
                     )
+                db_now = await connection.scalar(text("SELECT clock_timestamp()"))
+                if not isinstance(db_now, datetime):
+                    raise SessionStateError("Authentication session clock is unavailable")
+                expires_at = db_now + timedelta(seconds=ttl_seconds)
                 row = (
                     await connection.execute(
                         text(
@@ -502,10 +674,8 @@ class PostgresSessionRepository:
                                 CAST(:principal_id AS uuid),
                                 :auth_epoch,
                                 :route_version,
-                                clock_timestamp(),
-                                clock_timestamp()
-                                    + CAST(:ttl_seconds AS double precision)
-                                      * interval '1 second'
+                                :issued_at,
+                                :expires_at
                             )
                             RETURNING tenant_id, session_id, principal_id, auth_epoch,
                                       route_version, issued_at, expires_at, revoked_at
@@ -517,10 +687,18 @@ class PostgresSessionRepository:
                             "principal_id": str(principal["principal_id"]),
                             "auth_epoch": int(principal["auth_epoch"]),
                             "route_version": route_version,
-                            "ttl_seconds": ttl_seconds,
+                            "issued_at": db_now,
+                            "expires_at": expires_at,
                         },
                     )
                 ).mappings().one()
+                await _enforce_postgres_session_policy(
+                    connection,
+                    tenant_id=tenant_id,
+                    principal_id=str(principal["principal_id"]),
+                    new_session_id=str(session_id),
+                    db_now=db_now,
+                )
             return _postgres_session(row, normalized_email=normalized_email)
         except (SessionStateError, SessionPrincipalDisabledError):
             raise
@@ -700,6 +878,96 @@ async def _set_tenant(connection: AsyncConnection, tenant_id: str) -> None:
     await connection.execute(
         text("SELECT set_config('myretail.tenant_id', :tenant_id, true)"),
         {"tenant_id": tenant_id},
+    )
+
+
+async def _enforce_postgres_session_policy(
+    connection: AsyncConnection,
+    *,
+    tenant_id: str,
+    principal_id: str,
+    new_session_id: str,
+    db_now: datetime,
+) -> None:
+    await connection.execute(
+        text(
+            """
+            WITH evicted AS (
+                SELECT session_id
+                FROM myretail_state.auth_sessions
+                WHERE tenant_id = :tenant_id
+                  AND principal_id = CAST(:principal_id AS uuid)
+                  AND session_id <> CAST(:new_session_id AS uuid)
+                  AND revoked_at IS NULL
+                  AND expires_at > :db_now
+                ORDER BY issued_at DESC, session_id DESC
+                OFFSET :retained_other_sessions
+            )
+            UPDATE myretail_state.auth_sessions AS session
+            SET revoked_at = :db_now,
+                revocation_reason = 'session_limit',
+                revoked_by_principal_id = NULL,
+                updated_at = :db_now
+            FROM evicted
+            WHERE session.tenant_id = :tenant_id
+              AND session.principal_id = CAST(:principal_id AS uuid)
+              AND session.session_id = evicted.session_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "principal_id": principal_id,
+            "new_session_id": new_session_id,
+            "db_now": db_now,
+            "retained_other_sessions": SESSION_ACTIVE_LIMIT - 1,
+        },
+    )
+    await connection.execute(
+        text(
+            """
+            DELETE FROM myretail_state.auth_sessions
+            WHERE tenant_id = :tenant_id
+              AND principal_id = CAST(:principal_id AS uuid)
+              AND (revoked_at IS NOT NULL OR expires_at <= :db_now)
+              AND COALESCE(revoked_at, expires_at) < :terminal_cutoff
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "principal_id": principal_id,
+            "db_now": db_now,
+            "terminal_cutoff": db_now
+            - timedelta(days=SESSION_TERMINAL_RETENTION_DAYS),
+        },
+    )
+    await connection.execute(
+        text(
+            """
+            WITH surplus AS (
+                SELECT session_id
+                FROM myretail_state.auth_sessions
+                WHERE tenant_id = :tenant_id
+                  AND principal_id = CAST(:principal_id AS uuid)
+                  AND (revoked_at IS NOT NULL OR expires_at <= :db_now)
+                ORDER BY
+                    COALESCE(revoked_at, expires_at) DESC,
+                    issued_at DESC,
+                    session_id DESC
+                OFFSET :terminal_limit
+            )
+            DELETE FROM myretail_state.auth_sessions AS session
+            USING surplus
+            WHERE session.tenant_id = :tenant_id
+              AND session.principal_id = CAST(:principal_id AS uuid)
+              AND session.session_id = surplus.session_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "principal_id": principal_id,
+            "db_now": db_now,
+            "terminal_limit": SESSION_TERMINAL_LIMIT,
+        },
     )
 
 

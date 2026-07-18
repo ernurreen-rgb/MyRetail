@@ -7,7 +7,7 @@
 Phase 7C переводит `POST /pos/returns/{return_id}/cancel` на durable workflow с
 одинаковыми гарантиями SQLite/PostgreSQL. HTTP endpoint, request/response schemas,
 публичные состояния и утверждённые error codes не меняются. Новая migration не нужна:
-packaged PostgreSQL head теперь `20260716_05`; return backfill остаётся revision `20260716_04`.
+packaged PostgreSQL head теперь `20260718_06`; return backfill остаётся revision `20260716_04`.
 
 Отмена cash return допустима только пока исходная смена открыта. Для закрытой смены
 сохраняется fail-closed `409 POS_OPENING_OUTDATED` до отдельного утверждённого settlement

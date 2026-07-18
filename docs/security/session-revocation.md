@@ -22,6 +22,28 @@ Migration `20260716_05` добавляет tenant-scoped таблицы:
 context и минимальный DML grant приложения. JWT, подписи, cookies, пароли, API keys,
 headers и raw IP в state не сохраняются.
 
+Migration `20260718_06` добавляет bounded-retention policy MR-SEC-029 без изменения
+публичного HTTP/OpenAPI/JWT-контракта:
+
+- после успешного login у пары tenant + principal остаётся не более 10 активных
+  сессий: новая сессия сохраняется, из предыдущих сохраняются 9 самых новых;
+- вытесненные сессии атомарно получают внутреннюю причину `session_limit`,
+  `revoked_by_principal_id` остаётся `NULL`, а `auth_epoch` и `revoked_before` не
+  меняются;
+- terminal session определяется как revoked или expired; её timestamp равен
+  `COALESCE(revoked_at, expires_at)`;
+- при login удаляются terminal rows старше 90 дней, затем сохраняются максимум
+  1000 самых новых terminal rows этого principal;
+- после commit login жёсткая граница для principal равна 10 active + 1000 terminal
+  rows. Principal tombstone, `auth_epoch`, `revoked_before` и `disabled_at` не
+  удаляются.
+
+Операции выдачи, вытеснения и retention выполняются в одной транзакции. SQLite
+использует `BEGIN IMMEDIATE`; PostgreSQL сериализует выдачу блокировкой строки
+principal. Ошибка блокировки, cleanup или storage откатывает и новую сессию, и
+вытеснение. Downgrade на revision без `session_limit` fail closed, пока такие audit
+rows существуют.
+
 ## API и граница отзыва
 
 - `POST /auth/logout` проверяет подпись token отдельным путём, не зависящим от
@@ -48,4 +70,7 @@ Token не отражается в ответе и не логируется.
 Acceptance покрывает отзыв одной сессии без влияния на вторую, массовый отзыв,
 повторный logout, отсутствие existence leak, fail-closed state outage, два экземпляра
 приложения на общем state, tenant A/B/unset RLS, migration round-trip, OpenAPI
-fingerprint и BFF cookie ordering.
+fingerprint и BFF cookie ordering. Для MR-SEC-029 дополнительно проверяются
+последовательная и конкурентная выдача через два process/pool, детерминированное
+вытеснение, rollback при lock/storage failure, границы 90 дней/1000 rows, сохранение
+principal tombstone и изоляция других principal/tenant.

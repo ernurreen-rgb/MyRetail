@@ -359,6 +359,47 @@ async def test_roles_ownership_rls_and_revision_match_contract() -> None:
             "DELETE": False,
         }
 
+        session_reason_constraint = await connection.fetchval(
+            """
+            SELECT pg_get_constraintdef(constraint_info.oid)
+            FROM pg_constraint AS constraint_info
+            JOIN pg_class AS table_class
+              ON table_class.oid = constraint_info.conrelid
+            JOIN pg_namespace AS namespace
+              ON namespace.oid = table_class.relnamespace
+            WHERE namespace.nspname = $1
+              AND table_class.relname = 'auth_sessions'
+              AND constraint_info.conname = 'auth_sessions_revocation_reason_check'
+            """,
+            STATE_SCHEMA,
+        )
+        assert session_reason_constraint is not None
+        assert "session_limit" in str(session_reason_constraint)
+
+        session_history_index = await connection.fetchrow(
+            """
+            SELECT index_class.relname AS index_name,
+                   index_info.indisvalid,
+                   index_info.indisready,
+                   pg_get_indexdef(index_info.indexrelid) AS index_definition
+            FROM pg_index AS index_info
+            JOIN pg_class AS index_class ON index_class.oid = index_info.indexrelid
+            JOIN pg_class AS table_class ON table_class.oid = index_info.indrelid
+            JOIN pg_namespace AS namespace ON namespace.oid = table_class.relnamespace
+            WHERE namespace.nspname = $1
+              AND table_class.relname = 'auth_sessions'
+              AND index_class.relname = 'auth_sessions_terminal_history'
+            """,
+            STATE_SCHEMA,
+        )
+        assert session_history_index is not None
+        assert session_history_index["indisvalid"]
+        assert session_history_index["indisready"]
+        index_definition = str(session_history_index["index_definition"])
+        assert "COALESCE(revoked_at, expires_at) DESC" in index_definition
+        assert "issued_at DESC" in index_definition
+        assert "session_id DESC" in index_definition
+
         assert (
             await connection.fetchval("SELECT version_num FROM public.alembic_version")
             == EXPECTED_STATE_SCHEMA_REVISION

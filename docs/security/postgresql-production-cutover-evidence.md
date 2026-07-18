@@ -34,7 +34,7 @@ credential-bearing URL, database DSN, token, password и private key откло�
    является workload control-plane authority этого account. Protected `AWS_ACCOUNT_ID` сверяется
    с STS до любого plan/apply.
 2. Зафиксировать release commit и immutable digest API/migration images. Оба artifact должны
-   относиться к одной версии, migration head — `20260716_05`.
+   относиться к одной версии, migration head — `20260718_06`.
 3. Bootstrap IAM выполняется break-glass/admin identity. GitHub OIDC deployment role не создаёт и
    не изменяет IAM roles: production root только читает и передаёт точные pre-provisioned roles
    разрешённым AWS services через `iam:PassedToService`.
