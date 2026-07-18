@@ -208,6 +208,90 @@ def headers(
     return result
 
 
+async def project_open_shift(
+    repository: PostgresPOSRepository,
+    *,
+    tenant: str,
+) -> tuple[str, str]:
+    shift_id = f"SHIFT-{uuid4()}"
+    opened_at = "2026-07-18T12:00:00Z"
+    opening = await repository.begin_operation_intent(
+        tenant=tenant,
+        operation="open_shift",
+        scope_id="register:POS-1",
+        user_email="cashier@example.test",
+        business_hash=f"open-{uuid4()}",
+        payload={
+            "shift": {
+                "id": shift_id,
+                "tenant": tenant,
+                "register_id": "POS-1",
+                "register_name": "Main register",
+                "warehouse_id": "WH-1",
+                "warehouse_name": "Main warehouse",
+                "cashier_email": "cashier@example.test",
+                "cashier_full_name": "Cashier",
+                "opening_cash": "10000.00",
+                "opened_at": opened_at,
+                "updated_at": opened_at,
+            }
+        },
+    )
+    shift = await repository.materialize_open_shift_intent(
+        tenant,
+        str(opening.intent["id"]),
+        int(opening.intent["fencing_token"]),
+        f"OPEN-{uuid4()}",
+    )
+    return shift_id, str(shift["updated_at"])
+
+
+def held_receipt_row(
+    *,
+    tenant: str,
+    shift_id: str,
+    held_id: str,
+    label: str = "Held before close",
+) -> dict[str, str]:
+    timestamp = "2026-07-18T12:01:00Z"
+    return {
+        "id": held_id,
+        "tenant": tenant,
+        "shift_id": shift_id,
+        "label": label,
+        "lines_json": "[]",
+        "subtotal": "0.00",
+        "discount_total": "0.00",
+        "grand_total": "0.00",
+        "created_by_email": "cashier@example.test",
+        "created_by_full_name": "Cashier",
+        "created_at": timestamp,
+        "updated_at": timestamp,
+    }
+
+
+async def wait_for_workflow_advisory_lock(
+    runtime: PostgresStateRuntime,
+    *,
+    tenant: str,
+    shift_id: str,
+) -> None:
+    lock_key = f"workflow:scope:{tenant}:shift:{shift_id}"
+    for _ in range(100):
+        async with runtime.engine.begin() as connection:
+            acquired = await connection.scalar(
+                text(
+                    "SELECT pg_try_advisory_xact_lock("
+                    "hashtextextended(:lock_key, 0))"
+                ),
+                {"lock_key": lock_key},
+            )
+        if acquired is False:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("Close reservation did not acquire its workflow advisory lock")
+
+
 @pytest.mark.anyio
 @pytest.mark.skipif(not APP_DATABASE_URL, reason="PostgreSQL test URL is not configured")
 async def test_postgresql_request_path_is_shared_and_exact_once_across_two_pools(
@@ -561,6 +645,206 @@ async def test_postgresql_request_path_is_shared_and_exact_once_across_two_pools
             assert isinstance(frozen_shift, Shift)
             assert frozen_shift.sales_total == "200.00"
             assert frozen_shift.expected_cash == "10200.00"
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(not APP_DATABASE_URL, reason="PostgreSQL test URL is not configured")
+async def test_postgresql_close_scope_blocks_held_mutations_across_two_pools(
+    tmp_path: Path,
+) -> None:
+    tenant = f"held-close-{uuid4()}"
+    settings = postgres_settings(tenant=tenant, tmp_path=tmp_path)
+    first_runtime = await PostgresStateRuntime.start(settings)
+    second_runtime = await PostgresStateRuntime.start(settings)
+    first = PostgresPOSRepository(first_runtime.engine)
+    second = PostgresPOSRepository(second_runtime.engine)
+    try:
+        shift_id, updated_at = await project_open_shift(first, tenant=tenant)
+        close_claim = await first.begin_operation_intent(
+            tenant=tenant,
+            operation="close_shift",
+            scope_id=f"shift:{shift_id}",
+            user_email="cashier@example.test",
+            business_hash=f"close-{uuid4()}",
+            payload={"close": {"tenant": tenant, "shift_id": shift_id}},
+            expected_shift_updated_at=updated_at,
+            require_no_held_receipts=True,
+        )
+
+        blocked_held_id = f"HELD-{uuid4()}"
+        with pytest.raises(POSStoreConflictError) as create_error:
+            await second.upsert_held_receipt(
+                held_receipt_row(
+                    tenant=tenant,
+                    shift_id=shift_id,
+                    held_id=blocked_held_id,
+                )
+            )
+        assert create_error.value.code == "SHIFT_CHANGED"
+        assert await second.list_open_held_receipts(tenant, shift_id) == []
+
+        assert await first.fail_operation_intent(
+            tenant,
+            str(close_claim.intent["id"]),
+            int(close_claim.intent["fencing_token"]),
+        )
+        held_id = f"HELD-{uuid4()}"
+        held = await second.upsert_held_receipt(
+            held_receipt_row(
+                tenant=tenant,
+                shift_id=shift_id,
+                held_id=held_id,
+            )
+        )
+        active_claim = await first.begin_operation_intent(
+            tenant=tenant,
+            operation="create_sale",
+            scope_id=f"shift:{shift_id}",
+            user_email="cashier@example.test",
+            business_hash=f"sale-{uuid4()}",
+            payload={"sale": {"tenant": tenant, "shift_id": shift_id}},
+            expected_shift_updated_at=updated_at,
+        )
+        changed = held_receipt_row(
+            tenant=tenant,
+            shift_id=shift_id,
+            held_id=held_id,
+            label="Mutation after reservation",
+        )
+        changed["updated_at"] = "2026-07-18T12:02:00Z"
+
+        with pytest.raises(POSStoreConflictError) as update_error:
+            await second.update_held_receipt(
+                changed,
+                expected_updated_at=str(held["updated_at"]),
+            )
+        with pytest.raises(POSStoreConflictError) as delete_error:
+            await second.delete_held_receipt(tenant, held_id)
+
+        assert update_error.value.code == "SHIFT_CHANGED"
+        assert delete_error.value.code == "SHIFT_CHANGED"
+        unchanged = await first.get_held_receipt(tenant, held_id)
+        assert unchanged is not None
+        assert unchanged["label"] == "Held before close"
+        assert await first.fail_operation_intent(
+            tenant,
+            str(active_claim.intent["id"]),
+            int(active_claim.intent["fencing_token"]),
+        )
+    finally:
+        await second_runtime.close()
+        await first_runtime.close()
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(not APP_DATABASE_URL, reason="PostgreSQL test URL is not configured")
+async def test_postgresql_held_commit_blocks_concurrent_close_across_two_pools(
+    tmp_path: Path,
+) -> None:
+    tenant = f"held-first-{uuid4()}"
+    settings = postgres_settings(tenant=tenant, tmp_path=tmp_path)
+    first_runtime = await PostgresStateRuntime.start(settings)
+    second_runtime = await PostgresStateRuntime.start(settings)
+    first = PostgresPOSRepository(first_runtime.engine)
+    second = PostgresPOSRepository(second_runtime.engine)
+    held_connection = await first_runtime.engine.connect()
+    held_transaction = await held_connection.begin()
+    close_task: asyncio.Task[object] | None = None
+    try:
+        shift_id, updated_at = await project_open_shift(first, tenant=tenant)
+        held_id = f"HELD-{uuid4()}"
+        held = held_receipt_row(
+            tenant=tenant,
+            shift_id=shift_id,
+            held_id=held_id,
+        )
+        await held_connection.execute(
+            text("SELECT set_config('myretail.tenant_id', :tenant, true)"),
+            {"tenant": tenant},
+        )
+        await held_connection.execute(
+            text(
+                "SELECT status FROM myretail_state.pos_shifts "
+                "WHERE tenant_id = :tenant AND shift_id = :shift_id FOR UPDATE"
+            ),
+            {"tenant": tenant, "shift_id": shift_id},
+        )
+        await held_connection.execute(
+            text(
+                """
+                INSERT INTO myretail_state.pos_held_receipts (
+                    tenant_id, held_receipt_id, shift_id, label, lines,
+                    subtotal, discount_total, grand_total, created_by_email,
+                    created_by_full_name, status, created_at, updated_at
+                ) VALUES (
+                    :tenant, :id, :shift_id, :label, CAST(:lines_json AS jsonb),
+                    :subtotal, :discount_total, :grand_total, :created_by_email,
+                    :created_by_full_name, 'open', clock_timestamp(),
+                    clock_timestamp()
+                )
+                """
+            ),
+            held,
+        )
+
+        close_task = asyncio.create_task(
+            second.begin_operation_intent(
+                tenant=tenant,
+                operation="close_shift",
+                scope_id=f"shift:{shift_id}",
+                user_email="cashier@example.test",
+                business_hash=f"close-{uuid4()}",
+                payload={"close": {"tenant": tenant, "shift_id": shift_id}},
+                expected_shift_updated_at=updated_at,
+                require_no_held_receipts=True,
+            )
+        )
+        await wait_for_workflow_advisory_lock(
+            first_runtime,
+            tenant=tenant,
+            shift_id=shift_id,
+        )
+        await held_transaction.commit()
+        held_transaction = None
+
+        with pytest.raises(POSStoreConflictError) as close_error:
+            await close_task
+        assert close_error.value.code == "SHIFT_HAS_HELD_RECEIPTS"
+        assert [row["id"] for row in await first.list_open_held_receipts(tenant, shift_id)] == [
+            held_id
+        ]
+
+        async with first_runtime.engine.begin() as connection:
+            await connection.execute(
+                text("SELECT set_config('myretail.tenant_id', :tenant, true)"),
+                {"tenant": tenant},
+            )
+            active_intents = await connection.scalar(
+                text(
+                    "SELECT count(*) FROM myretail_state.workflow_intents "
+                    "WHERE tenant_id = :tenant AND scope_key = :scope_key "
+                    "AND state IN ('reserved', 'erp_pending', 'recovery_required', "
+                    "'materialized')"
+                ),
+                {"tenant": tenant, "scope_key": f"shift:{shift_id}"},
+            )
+            await connection.execute(
+                text("SELECT set_config('myretail.tenant_id', 'other-tenant', true)")
+            )
+            other_tenant_held = await connection.scalar(
+                text("SELECT count(*) FROM myretail_state.pos_held_receipts")
+            )
+        assert int(active_intents or 0) == 0
+        assert int(other_tenant_held or 0) == 0
+    finally:
+        if held_transaction is not None:
+            await held_transaction.rollback()
+        if close_task is not None and not close_task.done():
+            close_task.cancel()
+            await asyncio.gather(close_task, return_exceptions=True)
+        await held_connection.close()
+        await second_runtime.close()
+        await first_runtime.close()
 
 
 @pytest.mark.anyio
