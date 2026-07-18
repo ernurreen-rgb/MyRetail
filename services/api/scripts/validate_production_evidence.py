@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-EXPECTED_MIGRATION_REVISION = "20260716_05"
+EXPECTED_MIGRATION_REVISION = "20260718_06"
 MAX_MANIFEST_BYTES = 256 * 1024
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")

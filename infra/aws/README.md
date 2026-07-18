@@ -55,7 +55,7 @@ Terraform and the AWS provider are exact-pinned in both roots. The S3 backend us
      `erpnext_pos_credentials_map`, `pos_cashier_assignments`.
 6. Run the one-shot database-bootstrap task. It connects through the RDS-managed master secret,
    creates the no-login owner plus separate migrator/application roles, and never logs passwords.
-7. Run the migration task and require revision `20260716_05`, then run the application-role
+7. Run the migration task and require revision `20260718_06`, then run the application-role
    preflight task. Keep their stopped-task status and CloudWatch logs as release evidence.
 8. Set `monitoring_enabled = true` and `runtime_enabled = true`. This starts two private API/web
    replicas while the public HTTPS listener continues to return a fixed `503`. Prove provider
@@ -106,7 +106,7 @@ The workflows intentionally separate duties:
 - `AWS production images` publishes all four Linux/amd64 artifacts under the commit SHA and retains
   a non-secret digest manifest as a GitHub artifact.
 - `AWS production runtime bootstrap` initializes only missing secret versions, refuses partially
-  initialized database credentials, runs role bootstrap, migration `20260716_05`, application-role
+  initialized database credentials, runs role bootstrap, migration `20260718_06`, application-role
   preflight and the recovery monitor, and records the stopped ECS task ARNs in the job summary.
 
 Required environment variables are `AWS_REGION`, `AWS_ROLE_ARN`, `TF_STATE_BUCKET`,

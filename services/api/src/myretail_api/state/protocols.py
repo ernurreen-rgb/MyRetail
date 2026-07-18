@@ -28,6 +28,7 @@ SessionRevocationReason: TypeAlias = Literal[
     "role_change",
     "route_change",
     "security_incident",
+    "session_limit",
 ]
 
 

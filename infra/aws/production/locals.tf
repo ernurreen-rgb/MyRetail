@@ -2,7 +2,7 @@ locals {
   web_origin           = "https://${var.web_domain_name}"
   private_api_base_url = "http://api.myretail.internal:8000"
   rds_ca_bundle_path   = "/etc/ssl/certs/aws-rds-global-bundle.pem"
-  production_revision  = "20260716_05"
+  production_revision  = "20260718_06"
   placeholder_digest   = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
   runtime_images_ready = alltrue([
     for image in [
