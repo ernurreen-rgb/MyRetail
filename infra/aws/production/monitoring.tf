@@ -135,7 +135,7 @@ resource "aws_cloudwatch_event_rule" "state_monitor" {
 resource "aws_cloudwatch_event_target" "state_monitor" {
   rule     = aws_cloudwatch_event_rule.state_monitor.name
   arn      = aws_ecs_cluster.main.arn
-  role_arn = aws_iam_role.events_ecs.arn
+  role_arn = data.aws_iam_role.events_ecs.arn
 
   ecs_target {
     task_definition_arn = aws_ecs_task_definition.monitor.arn
@@ -252,7 +252,7 @@ resource "aws_cloudwatch_metric_alarm" "api_running_tasks" {
   statistic           = "Minimum"
   threshold           = var.api_desired_count
   treat_missing_data  = "breaching"
-  actions_enabled     = var.traffic_enabled
+  actions_enabled     = var.runtime_enabled
   alarm_actions       = [aws_sns_topic.operations.arn]
   ok_actions          = [aws_sns_topic.operations.arn]
 
@@ -274,7 +274,7 @@ resource "aws_cloudwatch_metric_alarm" "web_running_tasks" {
   statistic           = "Minimum"
   threshold           = var.web_desired_count
   treat_missing_data  = "breaching"
-  actions_enabled     = var.traffic_enabled
+  actions_enabled     = var.runtime_enabled
   alarm_actions       = [aws_sns_topic.operations.arn]
   ok_actions          = [aws_sns_topic.operations.arn]
 
@@ -296,7 +296,7 @@ resource "aws_cloudwatch_metric_alarm" "alb_target_5xx" {
   statistic           = "Sum"
   threshold           = 5
   treat_missing_data  = "notBreaching"
-  actions_enabled     = var.traffic_enabled
+  actions_enabled     = var.runtime_enabled
   alarm_actions       = [aws_sns_topic.operations.arn]
   ok_actions          = [aws_sns_topic.operations.arn]
 

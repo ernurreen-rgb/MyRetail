@@ -9,13 +9,13 @@ variable "aws_region" {
 }
 
 variable "name_prefix" {
-  description = "Lowercase resource prefix, unique within the AWS account and region."
+  description = "Immutable resource prefix bound to the pre-provisioned bootstrap IAM roles."
   type        = string
   default     = "myretail-production"
 
   validation {
-    condition     = can(regex("^[a-z][a-z0-9-]{2,31}$", var.name_prefix))
-    error_message = "name_prefix must contain 3-32 lowercase letters, digits, or hyphens."
+    condition     = var.name_prefix == "myretail-production"
+    error_message = "name_prefix is fixed to myretail-production by the bootstrap IAM boundary."
   }
 }
 
@@ -301,6 +301,12 @@ variable "monitoring_enabled" {
   default     = false
 }
 
+variable "runtime_enabled" {
+  description = "Start private API/web replicas for monitored smoke while public traffic remains closed."
+  type        = bool
+  default     = false
+}
+
 variable "database_connections_alarm_threshold" {
   description = "Connection count treated as application pool saturation evidence."
   type        = number
@@ -373,7 +379,7 @@ variable "erpnext_rotation_lambda_arn" {
 }
 
 variable "traffic_enabled" {
-  description = "Fail-closed latch. Keep false through provisioning, migration, restore, alerts, and smoke."
+  description = "Public fail-closed latch. Enable only after private runtime smoke and full evidence approval."
   type        = bool
   default     = false
 }

@@ -21,6 +21,14 @@ mock_provider "aws" {
       user_id    = "terraform-test"
     }
   }
+
+  mock_data "aws_iam_role" {
+    defaults = {
+      arn  = "arn:aws:iam::111122223333:role/myretail-production-test"
+      id   = "myretail-production-test"
+      name = "myretail-production-test"
+    }
+  }
 }
 
 variables {
@@ -62,17 +70,51 @@ run "traffic_stays_closed_by_default" {
 
   assert {
     condition     = aws_ecs_service.api.desired_count == 0
-    error_message = "API tasks must remain at zero before traffic approval."
+    error_message = "API tasks must remain at zero before private runtime approval."
   }
 
   assert {
     condition     = aws_ecs_service.web.desired_count == 0
-    error_message = "Web tasks must remain at zero before traffic approval."
+    error_message = "Web tasks must remain at zero before private runtime approval."
+  }
+
+  assert {
+    condition     = aws_lb_listener.https.default_action[0].type == "fixed-response"
+    error_message = "Public HTTPS must fail closed before traffic approval."
   }
 
   assert {
     condition     = aws_cloudwatch_event_rule.state_monitor.state == "DISABLED"
     error_message = "The scheduled monitor must wait until runtime secrets and migrations are ready."
+  }
+}
+
+run "private_runtime_supports_two_replica_smoke_without_public_traffic" {
+  command = plan
+
+  variables {
+    monitoring_enabled = true
+    runtime_enabled    = true
+  }
+
+  assert {
+    condition     = aws_ecs_service.api.desired_count == 2
+    error_message = "Private smoke must run the approved API replica floor."
+  }
+
+  assert {
+    condition     = aws_ecs_service.web.desired_count == 2
+    error_message = "Private smoke must run the approved web replica floor."
+  }
+
+  assert {
+    condition     = aws_lb_listener.https.default_action[0].type == "fixed-response"
+    error_message = "Starting private runtime must not open public HTTPS."
+  }
+
+  assert {
+    condition     = aws_cloudwatch_metric_alarm.api_running_tasks.actions_enabled
+    error_message = "Runtime alert delivery must be testable before public traffic."
   }
 }
 
@@ -91,6 +133,7 @@ run "traffic_opens_only_with_complete_evidence" {
 
   variables {
     monitoring_enabled                  = true
+    runtime_enabled                     = true
     traffic_enabled                     = true
     production_evidence_manifest_sha256 = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
     traffic_approval_url                = "https://app.notion.com/approved-cutover"
@@ -113,5 +156,10 @@ run "traffic_opens_only_with_complete_evidence" {
   assert {
     condition     = aws_cloudwatch_event_rule.state_monitor.state == "ENABLED"
     error_message = "The scheduled monitor must be enabled before traffic."
+  }
+
+  assert {
+    condition     = aws_lb_listener.https.default_action[0].type == "forward"
+    error_message = "Approved traffic must forward only after the complete evidence gate."
   }
 }

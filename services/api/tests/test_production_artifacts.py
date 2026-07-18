@@ -106,6 +106,68 @@ def test_dockerfile_pins_build_frontend_and_base_and_separates_targets() -> None
     assert "COPY ." not in dockerfile
 
 
+def test_aws_deployment_role_cannot_create_or_mutate_iam_roles() -> None:
+    bootstrap = (REPOSITORY_ROOT / "infra" / "aws" / "bootstrap" / "main.tf").read_text(
+        encoding="utf-8"
+    )
+    production_iam = (
+        REPOSITORY_ROOT / "infra" / "aws" / "production" / "iam.tf"
+    ).read_text(encoding="utf-8")
+
+    assert 'name                 = "myretail-deployment-github-oidc"' in bootstrap
+    assert "role/myretail-production-*" not in bootstrap
+    for forbidden_action in (
+        '"iam:AttachRolePolicy"',
+        '"iam:CreateRole"',
+        '"iam:DeleteRolePermissionsBoundary"',
+        '"iam:PutRolePermissionsBoundary"',
+        '"iam:PutRolePolicy"',
+        '"iam:UpdateAssumeRolePolicy"',
+    ):
+        assert forbidden_action not in bootstrap
+    assert bootstrap.count('variable = "iam:PassedToService"') == 4
+    assert 'resource "aws_iam_role"' not in production_iam
+    assert production_iam.count('data "aws_iam_role"') == 6
+
+
+def test_aws_deployment_role_cannot_read_or_write_runtime_secret_values() -> None:
+    bootstrap = (REPOSITORY_ROOT / "infra" / "aws" / "bootstrap" / "main.tf").read_text(
+        encoding="utf-8"
+    )
+    deployment_policy = bootstrap.split(
+        'data "aws_iam_policy_document" "github_production" {', maxsplit=1
+    )[1].split('resource "aws_iam_role_policy" "github_production" {', maxsplit=1)[0]
+
+    assert '"secretsmanager:*"' not in deployment_policy
+    assert '"secretsmanager:GetSecretValue"' not in deployment_policy
+    assert '"secretsmanager:BatchGetSecretValue"' not in deployment_policy
+    assert '"secretsmanager:PutSecretValue"' not in deployment_policy
+    assert '"secretsmanager:UpdateSecretVersionStage"' not in deployment_policy
+    assert '"kms:*"' not in deployment_policy
+    assert deployment_policy.count('"kms:Decrypt"') == 1
+    assert deployment_policy.count('"kms:Encrypt"') == 1
+
+
+def test_aws_apply_consumes_a_prior_immutable_reviewed_plan() -> None:
+    workflow = (
+        REPOSITORY_ROOT / ".github" / "workflows" / "aws-production.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "plan_run_id:" in workflow
+    assert "actions: read" in workflow
+    assert "Verify dedicated production account boundary" in workflow
+    assert "actual_account_id" in workflow
+    assert '"${actual_account_id}" != "${AWS_ACCOUNT_ID}"' in workflow
+    assert "production-plan-${{ github.run_id }}" in workflow
+    assert "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c" in workflow
+    assert "run-id: ${{ inputs.plan_run_id }}" in workflow
+    assert "Verify reviewed plan provenance and digest" in workflow
+    assert "sha256sum --check --strict" in workflow
+    assert "cmp --silent" in workflow
+    assert "Apply the exact reviewed plan" in workflow
+    assert workflow.count("terraform -chdir=infra/aws/production plan") == 1
+
+
 @pytest.mark.parametrize(
     "prefix",
     ["../escape", "Uppercase", "contains_space", "a" * 41, "-leading"],

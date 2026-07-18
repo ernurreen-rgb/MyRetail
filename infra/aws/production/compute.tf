@@ -1,6 +1,25 @@
+resource "terraform_data" "runtime_gate" {
+  input = {
+    enabled         = var.runtime_enabled
+    images_ready    = local.runtime_images_ready
+    monitoring      = var.monitoring_enabled
+    api_replicas    = var.api_desired_count
+    web_replicas    = var.web_desired_count
+    schema_revision = local.production_revision
+  }
+
+  lifecycle {
+    precondition {
+      condition     = !var.runtime_enabled || local.runtime_ready
+      error_message = "Private runtime requires immutable published images and monitoring before two-replica smoke."
+    }
+  }
+}
+
 resource "terraform_data" "traffic_gate" {
   input = {
     enabled                  = var.traffic_enabled
+    runtime_enabled          = var.runtime_enabled
     evidence_manifest        = var.production_evidence_manifest_sha256
     approval_url             = var.traffic_approval_url
     evidence_requirements    = local.traffic_evidence_ready
@@ -128,10 +147,30 @@ resource "aws_lb_listener" "https" {
   certificate_arn   = var.certificate_arn
   ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
 
-  default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.web.arn
+  dynamic "default_action" {
+    for_each = var.traffic_enabled ? [true] : []
+
+    content {
+      type             = "forward"
+      target_group_arn = aws_lb_target_group.web.arn
+    }
   }
+
+  dynamic "default_action" {
+    for_each = var.traffic_enabled ? [] : [true]
+
+    content {
+      type = "fixed-response"
+
+      fixed_response {
+        content_type = "text/plain"
+        message_body = "Production traffic is not approved"
+        status_code  = "503"
+      }
+    }
+  }
+
+  depends_on = [terraform_data.traffic_gate]
 }
 
 resource "aws_route53_record" "web" {
@@ -152,8 +191,8 @@ resource "aws_ecs_task_definition" "api" {
   network_mode             = "awsvpc"
   cpu                      = 512
   memory                   = 1024
-  execution_role_arn       = aws_iam_role.ecs_execution.arn
-  task_role_arn            = aws_iam_role.api_task.arn
+  execution_role_arn       = data.aws_iam_role.ecs_execution.arn
+  task_role_arn            = data.aws_iam_role.api_task.arn
 
   runtime_platform {
     cpu_architecture        = "X86_64"
@@ -208,8 +247,8 @@ resource "aws_ecs_task_definition" "web" {
   network_mode             = "awsvpc"
   cpu                      = 512
   memory                   = 1024
-  execution_role_arn       = aws_iam_role.ecs_execution.arn
-  task_role_arn            = aws_iam_role.web_task.arn
+  execution_role_arn       = data.aws_iam_role.ecs_execution.arn
+  task_role_arn            = data.aws_iam_role.web_task.arn
 
   runtime_platform {
     cpu_architecture        = "X86_64"
@@ -260,8 +299,8 @@ resource "aws_ecs_task_definition" "migration" {
   network_mode             = "awsvpc"
   cpu                      = 512
   memory                   = 1024
-  execution_role_arn       = aws_iam_role.ecs_execution.arn
-  task_role_arn            = aws_iam_role.migration_task.arn
+  execution_role_arn       = data.aws_iam_role.ecs_execution.arn
+  task_role_arn            = data.aws_iam_role.migration_task.arn
 
   runtime_platform {
     cpu_architecture        = "X86_64"
@@ -300,8 +339,8 @@ resource "aws_ecs_task_definition" "database_bootstrap" {
   network_mode             = "awsvpc"
   cpu                      = 512
   memory                   = 1024
-  execution_role_arn       = aws_iam_role.ecs_execution.arn
-  task_role_arn            = aws_iam_role.migration_task.arn
+  execution_role_arn       = data.aws_iam_role.ecs_execution.arn
+  task_role_arn            = data.aws_iam_role.migration_task.arn
 
   runtime_platform {
     cpu_architecture        = "X86_64"
@@ -344,8 +383,8 @@ resource "aws_ecs_task_definition" "preflight" {
   network_mode             = "awsvpc"
   cpu                      = 512
   memory                   = 1024
-  execution_role_arn       = aws_iam_role.ecs_execution.arn
-  task_role_arn            = aws_iam_role.api_task.arn
+  execution_role_arn       = data.aws_iam_role.ecs_execution.arn
+  task_role_arn            = data.aws_iam_role.api_task.arn
 
   runtime_platform {
     cpu_architecture        = "X86_64"
@@ -384,8 +423,8 @@ resource "aws_ecs_task_definition" "monitor" {
   network_mode             = "awsvpc"
   cpu                      = 512
   memory                   = 1024
-  execution_role_arn       = aws_iam_role.ecs_execution.arn
-  task_role_arn            = aws_iam_role.api_task.arn
+  execution_role_arn       = data.aws_iam_role.ecs_execution.arn
+  task_role_arn            = data.aws_iam_role.api_task.arn
 
   runtime_platform {
     cpu_architecture        = "X86_64"
@@ -422,7 +461,7 @@ resource "aws_ecs_service" "api" {
   name                               = "api"
   cluster                            = aws_ecs_cluster.main.id
   task_definition                    = aws_ecs_task_definition.api.arn
-  desired_count                      = var.traffic_enabled ? var.api_desired_count : 0
+  desired_count                      = var.runtime_enabled ? var.api_desired_count : 0
   launch_type                        = "FARGATE"
   platform_version                   = "1.4.0"
   enable_execute_command             = false
@@ -446,14 +485,14 @@ resource "aws_ecs_service" "api" {
     container_port = 8000
   }
 
-  depends_on = [terraform_data.traffic_gate]
+  depends_on = [terraform_data.runtime_gate]
 }
 
 resource "aws_ecs_service" "web" {
   name                               = "web"
   cluster                            = aws_ecs_cluster.main.id
   task_definition                    = aws_ecs_task_definition.web.arn
-  desired_count                      = var.traffic_enabled ? var.web_desired_count : 0
+  desired_count                      = var.runtime_enabled ? var.web_desired_count : 0
   launch_type                        = "FARGATE"
   platform_version                   = "1.4.0"
   enable_execute_command             = false
@@ -478,5 +517,5 @@ resource "aws_ecs_service" "web" {
     container_port   = 3000
   }
 
-  depends_on = [aws_lb_listener.https, terraform_data.traffic_gate]
+  depends_on = [aws_lb_listener.https, terraform_data.runtime_gate]
 }

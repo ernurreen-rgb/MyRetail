@@ -85,6 +85,7 @@ jobs:
             terraform -chdir="${root}" init -backend=false -input=false -lockfile=readonly
             terraform -chdir="${root}" validate -no-color
           done
+          terraform -chdir=infra/aws/bootstrap test -no-color
           terraform -chdir=infra/aws/production test -no-color
       - name: Validate GitHub Actions workflows
         shell: bash

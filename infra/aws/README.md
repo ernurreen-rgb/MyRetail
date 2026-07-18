@@ -4,14 +4,16 @@ Status: deployable infrastructure baseline, intentionally fail-closed. This dire
 claim that a live environment exists. `traffic_enabled` defaults to `false`, so the first apply
 creates no running API or web tasks.
 
-The baseline is one isolated tenant per stack:
+The baseline is one isolated tenant per stack in a dedicated MyRetail production AWS account. The
+Terraform deployment role is workload control-plane authority for that account and must not be used
+in a shared account:
 
 - three-AZ VPC with public ALB/NAT, private ECS and isolated database subnets;
 - RDS PostgreSQL 18 Multi-AZ DB cluster with encryption, forced TLS, automated backup/PITR,
   deletion protection and PostgreSQL log export;
 - a vault-locked daily AWS Backup snapshot and failure event in addition to native RDS PITR (AWS
   Backup continuous PITR is not supported for RDS Multi-AZ DB clusters);
-- two-or-more ECS/Fargate API and web replicas after cutover approval;
+- two-or-more private ECS/Fargate API and web replicas during the monitored smoke stage;
 - private API discovery at `api.myretail.internal`; only the Next.js BFF is public through HTTPS;
 - Secrets Manager containers for auth, application database, migration database and ERPNext
   credentials; secret values never enter Terraform variables or state;
@@ -23,18 +25,21 @@ Terraform and the AWS provider are exact-pinned in both roots. The S3 backend us
 
 ## Roots
 
-- `bootstrap/` creates the versioned, encrypted S3 state bucket and its KMS key. Run this root once
-  with a trusted break-glass/admin identity. Both resources have `prevent_destroy`.
+- `bootstrap/` creates the versioned, encrypted S3 state bucket, its KMS key, the GitHub OIDC
+  deployment role and all fixed runtime/service IAM roles. Run this root only with a trusted
+  break-glass/admin identity. The deployment role can read/pass the exact pre-provisioned roles but
+  cannot create, mutate or pass arbitrary IAM roles.
 - `production/` creates the tenant stack. Copy `backend.hcl.example` and
   `terraform.tfvars.example` outside the repository, fill non-secret identifiers, and keep the
   resulting files out of Git.
 
 ## Controlled order
 
-1. Configure a protected GitHub `production` environment and an AWS IAM role trusted only through
-   GitHub OIDC for this repository/environment. Do not create long-lived AWS access keys.
-2. Apply `bootstrap/`, record its bucket and KMS outputs, then initialize `production/` with the
-   private backend file.
+1. Apply `bootstrap/` with a trusted break-glass/admin identity. Record its state/KMS/OIDC outputs;
+   do not create long-lived deployment access keys.
+2. Configure a protected GitHub `production` environment with required reviewers. Set the dedicated
+   account as `AWS_ACCOUNT_ID` and the exact bootstrap OIDC role as `AWS_ROLE_ARN`, then initialize
+   `production/` with the private backend.
 3. Apply `production/` with `traffic_enabled = false`. Placeholder image digests are allowed only
    for this zero-task bootstrap apply.
 4. Build and push the API, migration, database-bootstrap and web images to the created ECR
@@ -49,9 +54,11 @@ Terraform and the AWS provider are exact-pinned in both roots. The S3 backend us
    creates the no-login owner plus separate migrator/application roles, and never logs passwords.
 7. Run the migration task and require revision `20260716_05`, then run the application-role
    preflight task. Keep their stopped-task status and CloudWatch logs as release evidence.
-8. Prove provider backup/PITR with an isolated restore, deliver and test every required alert, run
-   two-replica production-like smoke/reconciliation against the separate ERPNext site, and validate
-   the external Phase 6B.3 evidence manifest in production mode.
+8. Set `monitoring_enabled = true` and `runtime_enabled = true`. This starts two private API/web
+   replicas while the public HTTPS listener continues to return a fixed `503`. Prove provider
+   backup/PITR with an isolated restore, deliver/test every required alert, run production-like
+   smoke/reconciliation against the separate ERPNext site, and validate the external Phase 6B.3
+   evidence manifest in production mode.
 9. Only after manual review, configure all four rotation Lambda ARNs, the manifest SHA256 and stable
    HTTPS approval URL. Then set `traffic_enabled = true`. Terraform rejects a cutover missing any
    of those inputs.
@@ -87,9 +94,12 @@ environment as `AWS_ROLE_ARN`; configure required reviewers before allowing appl
 
 The workflows intentionally separate duties:
 
-- `AWS production Terraform` creates a plan or applies the exact saved plan. The first apply can use
-  zero-task placeholder digests; a traffic-enabled plan rejects them. When release images tagged by
-  the current commit exist in ECR, the workflow resolves their immutable digests automatically.
+- `AWS production Terraform` creates an immutable seven-day plan artifact containing the binary
+  plan, human-readable review and provenance/digest metadata. Applying requires a separate workflow
+  run, the successful plan run ID and another protected-environment approval. Apply verifies the
+  source workflow/main commit/account/backend and artifact digest, renders the plan again, and never
+  creates a replacement plan. The first zero-runtime plan may use placeholder digests; a
+  runtime-enabled plan rejects them.
 - `AWS production images` publishes all four Linux/amd64 artifacts under the commit SHA and retains
   a non-secret digest manifest as a GitHub artifact.
 - `AWS production runtime bootstrap` initializes only missing secret versions, refuses partially
@@ -100,7 +110,8 @@ Required environment variables are `AWS_REGION`, `AWS_ROLE_ARN`, `TF_STATE_BUCKE
 `TF_STATE_KMS_KEY_ARN`, `AVAILABILITY_ZONES_JSON`, `TENANT_ID`, `TENANT_SLUG`,
 `WEB_DOMAIN_NAME`, `ROUTE53_ZONE_ID`, `CERTIFICATE_ARN`, `ERPNEXT_BASE_URL`,
 `ERPNEXT_COMPANY`, `ERPNEXT_API_USER` and `ERPNEXT_POS_USER`. After the runtime workflow passes,
-set `MONITORING_ENABLED=true` and apply again.
+set `MONITORING_ENABLED=true`, create/review a plan with `runtime_enabled=true`, and apply that exact
+plan by its run ID. Public traffic stays closed until a later independently reviewed plan.
 
 The runtime workflow also requires protected secrets `ERPNEXT_API_KEY`, `ERPNEXT_API_SECRET`,
 `ERPNEXT_POS_USER_MAP_JSON`, `ERPNEXT_POS_CREDENTIALS_MAP_JSON` and

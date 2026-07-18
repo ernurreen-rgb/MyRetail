@@ -13,6 +13,7 @@ from sqlalchemy import text
 
 from myretail_api.config import Settings
 from myretail_api.main import create_app
+from myretail_api.state.monitor import run_monitor
 from myretail_api.state.postgres import PostgresStateRuntime, StateStartupError
 from myretail_api.state.schema import (
     APPEND_ONLY_TENANT_STATE_TABLES,
@@ -151,6 +152,47 @@ async def test_rls_hides_unset_and_cross_tenant_canary_rows() -> None:
                 await transaction.rollback()
     finally:
         await runtime.close()
+
+
+@pytest.mark.anyio
+async def test_recovery_monitor_uses_canonical_tenant_slug() -> None:
+    tenant_slug = f"monitor-{uuid4().hex}"
+    foreign_tenant_slug = f"foreign-{uuid4().hex}"
+    own_record_id = uuid4()
+    foreign_record_id = uuid4()
+    settings = postgres_settings().model_copy(update={"tenant_slug": tenant_slug})
+
+    async with admin_connection() as connection:
+        await connection.executemany(
+            f"""
+            INSERT INTO {STATE_SCHEMA}.idempotency_records (
+                record_id, tenant_id, namespace, operation_key,
+                idempotency_key, request_hash, state, updated_at
+            )
+            VALUES ($1, $2, 'monitor-regression', 'recover', $3, $4,
+                    'recovery_required', clock_timestamp() - interval '5 seconds')
+            """,
+            [
+                (own_record_id, tenant_slug, str(own_record_id), "a" * 64),
+                (
+                    foreign_record_id,
+                    foreign_tenant_slug,
+                    str(foreign_record_id),
+                    "b" * 64,
+                ),
+            ],
+        )
+    try:
+        health = await run_monitor(settings)
+        assert health.pending_count == 1
+        assert health.oldest_age_seconds >= 5
+    finally:
+        async with admin_connection() as connection:
+            await connection.execute(
+                f"DELETE FROM {STATE_SCHEMA}.idempotency_records "
+                "WHERE record_id = ANY($1::uuid[])",
+                [own_record_id, foreign_record_id],
+            )
 
 
 @pytest.mark.anyio

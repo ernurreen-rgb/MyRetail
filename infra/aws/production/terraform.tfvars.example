@@ -24,5 +24,8 @@ alarm_email = null
 # Enable only after runtime secrets exist and migration/preflight pass.
 monitoring_enabled = false
 
-# Keep false until migration, restore drill, alarm delivery, rotation and smoke evidence pass.
+# Start two private API/web replicas only after secrets, migration, preflight and monitoring pass.
+runtime_enabled = false
+
+# Keep false until private runtime smoke, restore, alarm delivery, rotation and approval pass.
 traffic_enabled = false
