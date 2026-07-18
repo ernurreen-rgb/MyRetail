@@ -138,6 +138,8 @@ def test_postgresql_auth_rate_limit_requires_dedicated_secret() -> None:
         ("trusted_proxy", [], "requires a non-empty CIDR"),
         ("direct", ["10.0.0.0/8"], "require explicit trusted_proxy"),
         ("trusted_proxy", ["not-a-network"], "invalid network"),
+        ("trusted_proxy", ["0.0.0.0/0"], "must not trust a global network"),
+        ("trusted_proxy", ["::/0"], "must not trust a global network"),
     ],
 )
 def test_client_ip_proxy_policy_fails_closed_on_ambiguous_config(
@@ -177,6 +179,8 @@ def production_postgresql_settings(**overrides: object) -> Settings:
         "auth_rate_limit_secret": SecretStr(
             "production-rate-limit-secret-at-least-32-bytes"
         ),
+        "auth_client_ip_mode": "trusted_proxy",
+        "auth_trusted_proxy_cidrs": ["10.42.16.0/20"],
     }
     values.update(overrides)
     return isolated_settings(**values)
@@ -197,6 +201,20 @@ def test_production_postgresql_controlled_enablement_accepts_safe_config() -> No
     app = create_app(settings)
 
     assert app.state.settings is settings
+
+
+def test_production_login_rate_limit_rejects_direct_client_ip_mode() -> None:
+    settings = production_postgresql_settings(
+        state_production_enablement="controlled",
+        auth_client_ip_mode="direct",
+        auth_trusted_proxy_cidrs=[],
+    )
+
+    with pytest.raises(
+        InvalidAuthRateLimitSettingsError,
+        match="requires an explicit trusted proxy boundary",
+    ):
+        create_app(settings)
 
 
 def test_production_postgresql_controlled_enablement_still_requires_verify_full() -> None:

@@ -145,6 +145,14 @@ def validate_state_foundation_settings(settings: Settings) -> None:
 
 
 def validate_auth_rate_limit_settings(settings: Settings) -> None:
+    if (
+        settings.environment == "production"
+        and settings.auth_client_ip_mode != "trusted_proxy"
+    ):
+        raise InvalidAuthRateLimitSettingsError(
+            "Production login rate limiting requires an explicit trusted proxy boundary"
+        )
+
     if settings.auth_client_ip_mode == "direct":
         if settings.auth_trusted_proxy_cidrs:
             raise InvalidAuthRateLimitSettingsError(
@@ -157,11 +165,15 @@ def validate_auth_rate_limit_settings(settings: Settings) -> None:
 
     for cidr in settings.auth_trusted_proxy_cidrs:
         try:
-            ip_network(cidr, strict=False)
+            network = ip_network(cidr, strict=False)
         except ValueError:
             raise InvalidAuthRateLimitSettingsError(
                 "Trusted proxy CIDR allowlist contains an invalid network"
             ) from None
+        if network.prefixlen == 0:
+            raise InvalidAuthRateLimitSettingsError(
+                "Trusted proxy CIDR allowlist must not trust a global network"
+            )
 
     if settings.state_backend != "postgresql":
         return

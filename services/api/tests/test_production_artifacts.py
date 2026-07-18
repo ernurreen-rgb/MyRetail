@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -184,6 +185,7 @@ def test_drill_separates_application_and_migration_environments() -> None:
         migration_image="migration:test",
         build_images=False,
     )
+    instance._trusted_proxy_cidrs = ("172.28.0.0/16",)
 
     application = instance._application_environment()
     migration = instance._migration_environment()
@@ -192,6 +194,10 @@ def test_drill_separates_application_and_migration_environments() -> None:
     assert "MYRETAIL_STATE_DATABASE_URL" not in migration
     assert application["MYRETAIL_STATE_PRODUCTION_ENABLEMENT"] == "controlled"
     assert application["MYRETAIL_STATE_POSTGRES_SSL_MODE"] == "verify-full"
+    assert application["MYRETAIL_AUTH_CLIENT_IP_MODE"] == "trusted_proxy"
+    assert json.loads(application["MYRETAIL_AUTH_TRUSTED_PROXY_CIDRS"]) == [
+        "172.28.0.0/16"
+    ]
     assert application["MYRETAIL_TENANCY_MODE"] == "isolated_site"
     assert application["MYRETAIL_TENANT_ID"] == drill.ISOLATED_TENANT_ID
     assert application["MYRETAIL_TENANT_SLUG"] == drill.SENTINEL_TENANT
@@ -200,6 +206,60 @@ def test_drill_separates_application_and_migration_environments() -> None:
     assert migration["MYRETAIL_STATE_MIGRATION_SSL_MODE"] == "verify-full"
     assert len(application["MYRETAIL_AUTH_SECRET"].encode()) >= 32
     assert len(application["MYRETAIL_AUTH_RATE_LIMIT_SECRET"].encode()) >= 32
+
+
+def test_drill_reads_only_exact_owned_network_subnets(monkeypatch) -> None:
+    instance = drill.ProductionStateDrill(
+        names=drill.names_for_prefix("myretail-phase6b2-network"),
+        api_image="api:test",
+        migration_image="migration:test",
+        build_images=False,
+    )
+
+    def fake_docker(*args, **kwargs):
+        assert args == (
+            "network",
+            "inspect",
+            instance.names.network,
+            "--format",
+            "{{json .IPAM.Config}}",
+        )
+        assert kwargs["stage"] == "inspect internal network subnets"
+        return drill.CommandResult(
+            returncode=0,
+            stdout='[{"Subnet":"172.29.0.0/16"},{"Subnet":"fd00:29::/64"}]',
+            stderr="",
+        )
+
+    monkeypatch.setattr(drill, "docker", fake_docker)
+
+    assert instance._inspect_trusted_proxy_cidrs() == (
+        "172.29.0.0/16",
+        "fd00:29::/64",
+    )
+
+
+@pytest.mark.parametrize(
+    "ipam",
+    ["not-json", "[]", '[{"Subnet":"0.0.0.0/0"}]', '[{"Gateway":"172.29.0.1"}]'],
+)
+def test_drill_rejects_missing_or_unsafe_network_subnets(monkeypatch, ipam: str) -> None:
+    instance = drill.ProductionStateDrill(
+        names=drill.names_for_prefix("myretail-phase6b2-network"),
+        api_image="api:test",
+        migration_image="migration:test",
+        build_images=False,
+    )
+    monkeypatch.setattr(
+        drill,
+        "docker",
+        lambda *args, **kwargs: drill.CommandResult(
+            returncode=0, stdout=ipam, stderr=""
+        ),
+    )
+
+    with pytest.raises(drill.DrillError, match="internal network subnets"):
+        instance._inspect_trusted_proxy_cidrs()
 
 
 def test_drill_command_failure_redacts_subprocess_output(monkeypatch) -> None:
@@ -279,6 +339,12 @@ def test_partial_resource_creation_cleans_only_resources_already_owned(monkeypat
     def fake_docker(*args, **kwargs):
         docker_calls.append((*args, kwargs))
         if args[:2] == ("network", "inspect"):
+            if args[-1] == "{{json .IPAM.Config}}":
+                return drill.CommandResult(
+                    returncode=0,
+                    stdout='[{"Subnet":"172.29.0.0/16"}]',
+                    stderr="",
+                )
             return drill.CommandResult(
                 returncode=0,
                 stdout=instance._ownership_token,
@@ -321,6 +387,12 @@ def test_volume_creation_race_never_claims_or_removes_foreign_volume(monkeypatch
     def fake_docker(*args, **kwargs):
         docker_calls.append((*args, kwargs))
         if args[:2] == ("network", "inspect"):
+            if args[-1] == "{{json .IPAM.Config}}":
+                return drill.CommandResult(
+                    returncode=0,
+                    stdout='[{"Subnet":"172.29.0.0/16"}]',
+                    stderr="",
+                )
             return drill.CommandResult(
                 returncode=0,
                 stdout=instance._ownership_token,

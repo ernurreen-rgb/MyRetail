@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
+import json
 import os
 import re
 import secrets
@@ -152,6 +154,7 @@ class ProductionStateDrill:
         self._network_owned = False
         self._tls_volume_owned = False
         self._data_volume_owned = False
+        self._trusted_proxy_cidrs: tuple[str, ...] = ()
         self._ownership_token = secrets.token_hex(16)
         self._auth_key = secrets.token_urlsafe(32)
         self._rate_limit_key = secrets.token_urlsafe(32)
@@ -382,6 +385,9 @@ class ProductionStateDrill:
             stage="create internal network",
         )
         self._network_owned = True
+        if not self._resource_is_still_owned("network", self.names.network):
+            raise DrillError("create internal network: ownership collision")
+        self._trusted_proxy_cidrs = self._inspect_trusted_proxy_cidrs()
         docker(
             "volume",
             "create",
@@ -404,6 +410,30 @@ class ProductionStateDrill:
         if not self._resource_is_still_owned("volume", self.names.data_volume):
             raise DrillError("create data volume: ownership collision")
         self._data_volume_owned = True
+
+    def _inspect_trusted_proxy_cidrs(self) -> tuple[str, ...]:
+        result = docker(
+            "network",
+            "inspect",
+            self.names.network,
+            "--format",
+            "{{json .IPAM.Config}}",
+            stage="inspect internal network subnets",
+        )
+        try:
+            configs = json.loads(result.stdout)
+            raw_subnets = [config["Subnet"] for config in configs]
+            networks = {
+                str(ipaddress.ip_network(subnet, strict=True))
+                for subnet in raw_subnets
+            }
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            raise DrillError("inspect internal network subnets: invalid IPAM data") from None
+        if not networks or any(
+            ipaddress.ip_network(network).prefixlen == 0 for network in networks
+        ):
+            raise DrillError("inspect internal network subnets: unsafe CIDR boundary")
+        return tuple(sorted(networks))
 
     def _resources_are_absent(self) -> bool:
         checks = (
@@ -604,11 +634,17 @@ rm -f /tls/ca.key /tls/ca.srl /tls/server.csr /tmp/server.cnf
         }
 
     def _application_environment(self, *, host: str | None = None) -> dict[str, str]:
+        if not self._trusted_proxy_cidrs:
+            raise DrillError("application environment: trusted proxy subnet unavailable")
         return {
             "MYRETAIL_AUTH_AUDIENCE": "myretail-production-drill",
+            "MYRETAIL_AUTH_CLIENT_IP_MODE": "trusted_proxy",
             "MYRETAIL_AUTH_ISSUER": "https://api.production-drill.invalid",
             "MYRETAIL_AUTH_RATE_LIMIT_SECRET": self._rate_limit_key,
             "MYRETAIL_AUTH_SECRET": self._auth_key,
+            "MYRETAIL_AUTH_TRUSTED_PROXY_CIDRS": json.dumps(
+                self._trusted_proxy_cidrs, separators=(",", ":")
+            ),
             "MYRETAIL_ENVIRONMENT": "production",
             "MYRETAIL_ERPNEXT_API_KEY": self._erp_api_key,
             "MYRETAIL_ERPNEXT_API_SECRET": self._erp_api_secret,

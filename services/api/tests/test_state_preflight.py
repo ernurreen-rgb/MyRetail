@@ -34,6 +34,8 @@ def controlled_settings() -> Settings:
         auth_rate_limit_secret=SecretStr(
             "production-rate-limit-secret-at-least-32-bytes"
         ),
+        auth_client_ip_mode="trusted_proxy",
+        auth_trusted_proxy_cidrs=["10.42.16.0/20"],
     )
 
 

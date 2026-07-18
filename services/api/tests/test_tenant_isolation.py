@@ -73,6 +73,8 @@ def production_values() -> dict[str, object]:
         "auth_rate_limit_secret": SecretStr(
             "production-rate-limit-secret-at-least-32-bytes"
         ),
+        "auth_client_ip_mode": "trusted_proxy",
+        "auth_trusted_proxy_cidrs": ["10.42.16.0/20"],
         "state_backend": "postgresql",
         "state_production_enablement": "controlled",
         "state_database_url": SecretStr(
@@ -190,6 +192,8 @@ def test_production_environment_values_count_as_explicit_route_config(
         "MYRETAIL_AUTH_RATE_LIMIT_SECRET": (
             "production-rate-limit-secret-at-least-32-bytes"
         ),
+        "MYRETAIL_AUTH_CLIENT_IP_MODE": "trusted_proxy",
+        "MYRETAIL_AUTH_TRUSTED_PROXY_CIDRS": '["10.42.16.0/20"]',
         "MYRETAIL_ERPNEXT_BASE_URL": "https://erp-a.internal.example",
         "MYRETAIL_ERPNEXT_API_KEY": "production-erp-key-a",
         "MYRETAIL_ERPNEXT_API_SECRET": "production-erp-secret-a",
