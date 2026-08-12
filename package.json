@@ -19,7 +19,7 @@
     "node": ">=20.9.0"
   },
   "devDependencies": {
-    "postcss": "8.5.15"
+    "postcss": "8.5.23"
   },
   "overrides": {
     "next": {
